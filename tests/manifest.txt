@@ -50,6 +50,7 @@ test-poll                      # diff=skip
 test-eventfd
 test-signalfd
 test-epoll
+test-epoll-edge
 test-timerfd
 test-large-io-boundary
 

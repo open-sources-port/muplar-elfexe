@@ -775,32 +775,40 @@ int64_t sys_epoll_ctl(guest_t *g, int epfd, int op, int fd, uint64_t event_gva)
 
     /* For MOD, remove old registrations first if they exist in kqueue.
      * EPOLLRDHUP alone registers EVFILT_READ (see ADD path), so check both
-     * EPOLLIN and EPOLLRDHUP (same logic as CTL_DEL).
-     * Skip deletion if oneshot_armed (kqueue already removed it).
+     * EPOLLIN and EPOLLRDHUP (same logic as CTL_DEL). Always attempt the
+     * deletes even when oneshot_armed: with multi-filter EPOLLONESHOT, only
+     * the filter that fired was removed by EV_ONESHOT; the other filter is
+     * still registered and must be cleaned. Issue each delete in its own
+     * kevent call so an ENOENT on one filter does not abort the other —
+     * with a single batched call and NULL eventlist, kevent stops at the
+     * first failed change and leaks the survivor.
      */
-    if (op == LINUX_EPOLL_CTL_MOD && reg->active && !reg->oneshot_armed) {
-        struct kevent del[2];
-        int ndel = 0;
+    if (op == LINUX_EPOLL_CTL_MOD && reg->active) {
+        struct kevent del;
         if (reg->events & (LINUX_EPOLLIN | LINUX_EPOLLRDHUP)) {
-            EV_SET(&del[ndel], target_ref.fd, EVFILT_READ, EV_DELETE, 0, 0,
-                   NULL);
-            ndel++;
+            EV_SET(&del, target_ref.fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
+            kevent(epoll_ref.fd, &del, 1, NULL, 0, NULL);
         }
         if (reg->events & LINUX_EPOLLOUT) {
-            EV_SET(&del[ndel], target_ref.fd, EVFILT_WRITE, EV_DELETE, 0, 0,
-                   NULL);
-            ndel++;
+            EV_SET(&del, target_ref.fd, EVFILT_WRITE, EV_DELETE, 0, 0, NULL);
+            kevent(epoll_ref.fd, &del, 1, NULL, 0, NULL);
         }
-        kevent(epoll_ref.fd, del, ndel, NULL, 0, NULL);
     }
 
     /* Build kevent changes */
     struct kevent changes[2];
     int nchanges = 0;
-    /* EPOLLET maps to EV_CLEAR. Semantic gap: Linux suppresses readiness
-     * after a short read until new data arrives; kqueue EV_CLEAR re-arms
-     * on the next kevent() call even if data remains. Correct applications
-     * drain to EAGAIN and are unaffected.
+
+    /* EPOLLET maps to EV_CLEAR. Idle re-poll, full drain, and post-drain
+     * new-data edges all match Linux EPOLLET. Narrow divergence: a partial read
+     * (without draining to EAGAIN) is a data-count state change that re-arms
+     * kqueue, so the next kevent fires while Linux EPOLLET stays silent.
+     * Distinguishing "partial-read remainder" from "drained-then-refilled"
+     * would require a unified drain signal across every data-consuming path
+     * (read / recv* / splice / ...) feeding back into this layer, which the
+     * epoll/kqueue bridge does not maintain. Apps that follow the documented
+     * EPOLLET contract (drain to EAGAIN) are unaffected; tests/test-epoll-
+     * edge.c locks in that contract.
      */
     uint16_t kflags = EV_ADD;
     if (ev.events & LINUX_EPOLLET)
@@ -975,6 +983,15 @@ int64_t sys_epoll_pwait(guest_t *g,
     for (int i = 0; i < nready && nout < maxevents; i++) {
         int gfd = (int) (uintptr_t) kevents[i].udata;
         if (!RANGE_CHECK(gfd, 0, FD_TABLE_SIZE) || !inst->regs[gfd].active)
+            continue;
+
+        /* EPOLLONESHOT semantics: once any event fired and was reported, the
+         * fd stays disarmed until EPOLL_CTL_MOD re-arms it. With multi-filter
+         * registrations (e.g. EPOLLIN | EPOLLOUT), EV_ONESHOT only removed the
+         * filter that fired; surviving filters can still fire later and would
+         * be reported here without this guard.
+         */
+        if (inst->regs[gfd].oneshot_armed)
             continue;
 
         epoll_reg_t *reg = &inst->regs[gfd];
