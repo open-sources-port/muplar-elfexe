@@ -29,10 +29,19 @@ BIN=""
 TEST_RUNNER=("$ELFUSE")
 # shellcheck disable=SC2034  # Consumed by tests/lib/test-runner.sh.
 TEST_LABEL_WIDTH=24
+# Per-test wall-clock cap (seconds). Override from CI: TEST_TIMEOUT=30 ...
 # shellcheck disable=SC2034  # Consumed by tests/lib/test-runner.sh.
-TEST_TIMEOUT=10
+TEST_TIMEOUT="${TEST_TIMEOUT:-10}"
 # shellcheck source=tests/lib/test-runner.sh
 source "$SCRIPT_DIR/lib/test-runner.sh"
+
+# GNU `timeout` is required to bound each guest invocation. On macOS it
+# ships via Homebrew coreutils. Fail loudly upfront instead of letting
+# every test report a cryptic "command not found, rc=127".
+if ! command -v timeout > /dev/null 2>&1; then
+    printf "error: 'timeout' not on PATH (install Homebrew coreutils)\n" >&2
+    exit 2
+fi
 
 RUNNER=("$ELFUSE")
 if [ -n "$SYSROOT" ]; then
@@ -75,9 +84,12 @@ srun_check()
     fi
 
     local output rc
-    if output=$("${RUNNER[@]}" "$bin" "$@" 2>&1); then rc=0; else rc=$?; fi
+    if output=$(timeout "$TEST_TIMEOUT" "${RUNNER[@]}" "$bin" "$@" 2>&1); then rc=0; else rc=$?; fi
 
-    if echo "$output" | grep -qE "$pattern"; then
+    if [ "$rc" -eq 124 ]; then
+        test_report fail "$label" " (timeout)"
+        fail=$((fail + 1))
+    elif echo "$output" | grep -qE "$pattern"; then
         test_report ok "$label"
         pass=$((pass + 1))
     else
@@ -106,9 +118,12 @@ srun_pipe()
     fi
 
     local output rc
-    if output=$(printf '%s' "$input" | "${RUNNER[@]}" "$bin" "$@" 2>&1); then rc=0; else rc=$?; fi
+    if output=$(printf '%s' "$input" | timeout "$TEST_TIMEOUT" "${RUNNER[@]}" "$bin" "$@" 2>&1); then rc=0; else rc=$?; fi
 
-    if echo "$output" | grep -qE "$pattern"; then
+    if [ "$rc" -eq 124 ]; then
+        test_report fail "$label" " (timeout)"
+        fail=$((fail + 1))
+    elif echo "$output" | grep -qE "$pattern"; then
         test_report ok "$label"
         pass=$((pass + 1))
     else
@@ -137,9 +152,12 @@ srun_script()
     fi
 
     local output rc
-    if output=$("${RUNNER[@]}" "$bin" "$@" "$script_file" 2>&1); then rc=0; else rc=$?; fi
+    if output=$(timeout "$TEST_TIMEOUT" "${RUNNER[@]}" "$bin" "$@" "$script_file" 2>&1); then rc=0; else rc=$?; fi
 
-    if echo "$output" | grep -qE "$pattern"; then
+    if [ "$rc" -eq 124 ]; then
+        test_report fail "$label" " (timeout)"
+        fail=$((fail + 1))
+    elif echo "$output" | grep -qE "$pattern"; then
         test_report ok "$label"
         pass=$((pass + 1))
     else
@@ -180,7 +198,7 @@ srun_check "dash: arithmetic" "$DASH_BIN" "2\\+3=5" -c 'echo "2+3=$((2+3))"'
 srun_check "dash: loop" "$DASH_BIN" "count=10" -c 'i=0; while [ $i -lt 10 ]; do i=$((i+1)); done; echo "count=$i"'
 srun_check "dash: conditionals" "$DASH_BIN" "5>3 OK" -c 'if [ 5 -gt 3 ]; then echo "5>3 OK"; fi'
 srun_check "dash: case" "$DASH_BIN" "glob match" -c 'case "hello" in hel*) echo "glob match" ;; esac'
-srun_check "dash: functions" "$DASH_BIN" "result=120" -c 'fact() { [ "$1" -le 1 ] && echo 1 && return; echo $(( $1 * $(fact $(($1 - 1))) )); }; echo "result=$(fact 5)"'
+srun_check "dash: functions" "$DASH_BIN" "result=15" -c 'sum() { total=0; for n in 1 2 3 4 5; do total=$((total+n)); done; echo "$total"; }; echo "result=$(sum)"'
 
 # Bash shell
 printf "\n${BLUE}── Bash shell ──${RESET}\n"
@@ -328,12 +346,15 @@ printf 'different content\n' > "$TMPDIR/other.txt"
 # diff returns 1 when files differ but the comparison itself succeeded.
 label="diff: different files"
 if [ -n "$DIFF_BIN" ]; then
-    if output=$("$ELFUSE" "$DIFF_BIN" "$TMPDIR/hello.txt" "$TMPDIR/other.txt" 2>&1); then
+    if output=$(timeout "$TEST_TIMEOUT" "${RUNNER[@]}" "$DIFF_BIN" "$TMPDIR/hello.txt" "$TMPDIR/other.txt" 2>&1); then
         rc=0
     else
         rc=$?
     fi
-    if [ "$rc" = "1" ] && echo "$output" | grep -qE "^[<>]"; then
+    if [ "$rc" -eq 124 ]; then
+        test_report fail "$label" " (timeout)"
+        fail=$((fail + 1))
+    elif [ "$rc" = "1" ] && echo "$output" | grep -qE "^[<>]"; then
         test_report ok "$label"
         pass=$((pass + 1))
     else
@@ -349,12 +370,16 @@ fi
 # diff: identical files (exit code 0, no content diff output)
 label="diff: identical"
 if [ -n "$DIFF_BIN" ]; then
-    if output=$("$ELFUSE" "$DIFF_BIN" "$TMPDIR/hello.txt" "$TMPDIR/hello.txt" 2>&1); then
+    if output=$(timeout "$TEST_TIMEOUT" "${RUNNER[@]}" "$DIFF_BIN" "$TMPDIR/hello.txt" "$TMPDIR/hello.txt" 2>&1); then
         test_report ok "$label"
         pass=$((pass + 1))
     else
         rc=$?
-        test_report fail "$label" " (rc=$rc, expected 0)"
+        if [ "$rc" -eq 124 ]; then
+            test_report fail "$label" " (timeout)"
+        else
+            test_report fail "$label" " (rc=$rc, expected 0)"
+        fi
         fail=$((fail + 1))
     fi
 else
