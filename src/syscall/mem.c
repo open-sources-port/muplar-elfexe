@@ -32,16 +32,19 @@ pthread_mutex_t mmap_lock = PTHREAD_MUTEX_INITIALIZER; /* Lock order: 1 */
 
 /* Gap-finding allocator for mmap.
  *
- * find_free_gap_inner() scans guest_t.regions[] (sorted) for the first free
- * gap of length bytes within [min_addr, max_addr). Replaces a bump
- * allocator so munmap'd ranges become reusable (critical for runtimes that
- * reserve, trim, and re-reserve in the same address window).
+ * find_free_gap_inner() scans guest_t.regions[] (sorted) for the first free gap
+ * of length bytes within [min_addr, max_addr). Replaces a bump allocator so
+ * munmap'd ranges become reusable (critical for runtimes that reserve, trim,
+ * and re-reserve in the same address window).
  *
- * The cached hints below amortize the O(n) scan to O(1) for sequential
- * allocations: after each success, the hint is set to the end of the
- * allocation. munmap resets the hint when freeing a region before it.
+ * Per-guest hints (mmap_rw_gap_hint / mmap_rx_gap_hint in guest_t) amortize the
+ * O(n) scan to O(1) for sequential allocations: after each success the hint is
+ * set to the end of the allocation. munmap/mremap rewinds the hint when a lower
+ * address is freed. Stored in guest_t so multiple guest instances in one
+ * process (test harnesses, future multi-VM use) cannot cross-pollute each
+ * other's allocator state. Reset to 0 by guest_init, guest_init_from_shm (via
+ * memset), and guest_reset.
  */
-static uint64_t mmap_rw_gap_hint = 0, mmap_rx_gap_hint = 0;
 
 typedef struct {
     uint64_t start, end;
@@ -103,16 +106,6 @@ static int dup_region_backing_fd(const guest_region_t *region)
     return dup(region->backing_fd);
 }
 
-/* Reset mmap gap hints after execve. Without this, the gap-finder starts
- * searching past the previous binary's allocations, wasting address space
- * and potentially causing issues with the new dynamic linker.
- */
-void mmap_reset_hints(void)
-{
-    mmap_rw_gap_hint = 0;
-    mmap_rx_gap_hint = 0;
-}
-
 static uint64_t find_free_gap_inner(const guest_t *g,
                                     uint64_t length,
                                     uint64_t min_addr,
@@ -152,14 +145,14 @@ static uint64_t find_free_gap_inner(const guest_t *g,
  * mmap activity. A miss falls back to the region base so holes reopened by
  * munmap are still reusable.
  */
-static uint64_t find_free_gap(const guest_t *g,
+static uint64_t find_free_gap(guest_t *g,
                               uint64_t length,
                               uint64_t min_addr,
                               uint64_t max_addr)
 {
     /* RX and RW mappings advance independently, so keep separate hints. */
     uint64_t *hint =
-        (min_addr < MMAP_BASE) ? &mmap_rx_gap_hint : &mmap_rw_gap_hint;
+        (min_addr < MMAP_BASE) ? &g->mmap_rx_gap_hint : &g->mmap_rw_gap_hint;
 
     /* Try cached hint first (only if within the valid range) */
     if (*hint >= min_addr && *hint < max_addr) {
@@ -771,10 +764,10 @@ int64_t sys_mremap(guest_t *g,
         memset((uint8_t *) g->host_base + tail_off, 0, tail_end - tail_off);
         guest_region_remove(g, tail_off, tail_end);
         guest_invalidate_ptes(g, tail_off, tail_end);
-        if (tail_off < mmap_rw_gap_hint)
-            mmap_rw_gap_hint = tail_off;
-        if (tail_off < mmap_rx_gap_hint)
-            mmap_rx_gap_hint = tail_off;
+        if (tail_off < g->mmap_rw_gap_hint)
+            g->mmap_rw_gap_hint = tail_off;
+        if (tail_off < g->mmap_rx_gap_hint)
+            g->mmap_rx_gap_hint = tail_off;
         return (int64_t) old_addr;
     }
 
@@ -844,10 +837,10 @@ int64_t sys_mremap(guest_t *g,
             memset((uint8_t *) g->host_base + old_off, 0, old_size);
             guest_region_remove(g, old_off, old_off + old_size);
             guest_invalidate_ptes(g, old_off, old_off + old_size);
-            if (old_off < mmap_rw_gap_hint)
-                mmap_rw_gap_hint = old_off;
-            if (old_off < mmap_rx_gap_hint)
-                mmap_rx_gap_hint = old_off;
+            if (old_off < g->mmap_rw_gap_hint)
+                g->mmap_rw_gap_hint = old_off;
+            if (old_off < g->mmap_rx_gap_hint)
+                g->mmap_rx_gap_hint = old_off;
         }
 
         if (guest_region_add_ex_owned(
@@ -987,10 +980,10 @@ int64_t sys_mremap(guest_t *g,
         memset((uint8_t *) g->host_base + old_off, 0, old_size);
         guest_region_remove(g, old_off, old_off + old_size);
         guest_invalidate_ptes(g, old_off, old_off + old_size);
-        if (old_off < mmap_rw_gap_hint)
-            mmap_rw_gap_hint = old_off;
-        if (old_off < mmap_rx_gap_hint)
-            mmap_rx_gap_hint = old_off;
+        if (old_off < g->mmap_rw_gap_hint)
+            g->mmap_rw_gap_hint = old_off;
+        if (old_off < g->mmap_rx_gap_hint)
+            g->mmap_rx_gap_hint = old_off;
 
         /* Track new region */
         if (guest_region_add_ex_owned(
@@ -1211,10 +1204,10 @@ int64_t sys_munmap(guest_t *g, uint64_t addr, uint64_t length)
                 memset((uint8_t *) g->host_base + zstart, 0, zend - zstart);
             }
             guest_region_remove(g, unmap_off, end);
-            if (unmap_off < mmap_rw_gap_hint)
-                mmap_rw_gap_hint = unmap_off;
-            if (unmap_off < mmap_rx_gap_hint)
-                mmap_rx_gap_hint = unmap_off;
+            if (unmap_off < g->mmap_rw_gap_hint)
+                g->mmap_rw_gap_hint = unmap_off;
+            if (unmap_off < g->mmap_rx_gap_hint)
+                g->mmap_rx_gap_hint = unmap_off;
         }
     }
     return 0;

@@ -36,8 +36,8 @@ static int cached_ngroups = -1;
 static const linux_utsname_t cached_uname = {
     .sysname = "Linux",
     .nodename = "elfuse",
-    /* Kernel version: match the lima aarch64 VM kernel to avoid
-     * version-gated feature detection mismatches in userspace.
+    /* Kernel version: match the lima aarch64 VM kernel to avoid version-gated
+     * feature detection mismatches in userspace.
      */
     .release = "6.17.0-20-generic",
     .version = "#20-Ubuntu SMP PREEMPT_DYNAMIC",
@@ -45,6 +45,16 @@ static const linux_utsname_t cached_uname = {
     .domainname = "(none)",
 };
 static const uint8_t cached_affinity_mask[256] = {1}, zero_block[256] = {0};
+
+/* sysinfo cache.
+ *
+ * Process-scoped by intent: the cache mirrors the host's view (totalram from
+ * sysctl(HW_MEMSIZE), free pages from host_statistics64, getloadavg). Even if
+ * multiple guest_t instances ever coexist in one process they share the same
+ * host stats, so a single rwlock-protected cache refreshed at most once per
+ * second is the right shape. Audited under TODO "Static state testability
+ * audit" -- intentionally NOT moved into guest_t.
+ */
 static pthread_once_t sysinfo_once = PTHREAD_ONCE_INIT;
 static pthread_rwlock_t sysinfo_lock = PTHREAD_RWLOCK_INITIALIZER;
 static time_t cached_boottime_sec = 0;

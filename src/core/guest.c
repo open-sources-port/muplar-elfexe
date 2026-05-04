@@ -796,6 +796,8 @@ void guest_reset(guest_t *g)
     g->mmap_end = MMAP_INITIAL_END;
     g->mmap_rx_next = MMAP_RX_BASE;
     g->mmap_rx_end = MMAP_RX_INITIAL_END;
+    g->mmap_rw_gap_hint = 0;
+    g->mmap_rx_gap_hint = 0;
     g->ttbr0 = 0;
     g->need_tlbi = false;
 

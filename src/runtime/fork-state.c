@@ -285,7 +285,6 @@ int fork_ipc_recv_fd_table(int ipc_fd, guest_t *g)
     }
 
     syscall_init();
-    mmap_reset_hints();
 
     if (num_fds > FD_TABLE_SIZE) {
         log_error("fork-child: num_fds %u exceeds FD_TABLE_SIZE", num_fds);

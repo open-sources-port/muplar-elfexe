@@ -127,22 +127,32 @@ typedef struct {
 typedef struct {
     void *host_base; /* Host pointer to allocated guest memory */
     int shm_fd; /* File fd backing host_base for CoW fork (-1 if MAP_ANON) */
+
     uint64_t guest_size; /* Total size (determined by IPA capacity) */
     uint64_t ipa_base;   /* IPA base for hv_vm_map (GUEST_IPA_BASE) */
     uint64_t mmap_limit; /* Max mmap address (computed from guest_size) */
-    uint64_t
-        interp_base; /* Dynamic linker load base (computed from guest_size) */
+
+    uint64_t interp_base;  /* Dynamic linker load base (from guest_size) */
     uint64_t pt_pool_next; /* Next free page table page in pool */
     uint64_t brk_base;     /* Initial brk (set after ELF load) */
     uint64_t brk_current;  /* Current brk position */
     uint64_t stack_base;   /* Bottom of stack region (dynamic, above brk) */
     uint64_t stack_top;    /* Top of stack (stack grows down from here) */
-    uint64_t mmap_next;    /* RW mmap high-water mark for fork IPC snapshots */
-    uint64_t mmap_end;     /* Current page-table-covered RW mmap limit */
+
+    uint64_t mmap_next; /* RW mmap high-water mark for fork IPC snapshots */
+    uint64_t mmap_end;  /* Current page-table-covered RW mmap limit */
     /* RX mmap high-water mark serialized through fork IPC. */
     uint64_t mmap_rx_next;
     uint64_t mmap_rx_end; /* Current page-table-covered RX mmap limit */
-    uint64_t ttbr0;       /* TTBR0 value (IPA of L0 page table) */
+    /* Gap-finder allocator hints. First free GPA past the last successful mmap
+     * in each region; munmap and mremap rewind the hint when a lower address is
+     * freed. mprotect does not, since permission changes do not free address
+     * space. Per-guest so multi-guest test harnesses (or any future second VM
+     * in the same process) cannot cross-pollute each other's allocator state.
+     */
+    uint64_t mmap_rw_gap_hint, mmap_rx_gap_hint;
+
+    uint64_t ttbr0; /* TTBR0 value (IPA of L0 page table) */
     bool need_tlbi; /* Signal shim to flush TLB after page table changes */
     hv_vcpu_t vcpu; /* vCPU handle */
     hv_vcpu_exit_t *exit; /* vCPU exit info */

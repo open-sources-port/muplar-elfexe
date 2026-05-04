@@ -447,7 +447,6 @@ int64_t sys_execve(hv_vcpu_t vcpu,
      * kernel exec failure after its point of no return.
      */
     guest_reset(g);
-    mmap_reset_hints();
 
     /* The replacement image must not inherit process-wide shutdown requests
      * from the old thread group.
