@@ -86,6 +86,9 @@ test-cow-fork
 [section] O_CLOEXEC tests
 test-cloexec
 
+[section] O_PATH semantics tests
+test-opath
+
 [section] Guard page / mmap edge cases
 test-guard-page
 

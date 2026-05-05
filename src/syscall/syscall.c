@@ -1013,8 +1013,9 @@ static int64_t sc_flock(guest_t *g,
     (void) x5;
     (void) verbose;
     host_fd_ref_t host_ref;
-    if (host_fd_ref_open((int) x0, &host_ref) < 0)
-        return -LINUX_EBADF;
+    int64_t err = host_fd_ref_open_io((int) x0, &host_ref);
+    if (err < 0)
+        return err;
     int64_t ret = flock(host_ref.fd, (int) x1) < 0 ? linux_errno() : 0;
     host_fd_ref_close(&host_ref);
     return ret;
@@ -1038,8 +1039,9 @@ static int64_t sc_fsync_common(guest_t *g,
     (void) x5;
     (void) verbose;
     host_fd_ref_t host_ref;
-    if (host_fd_ref_open((int) x0, &host_ref) < 0)
-        return -LINUX_EBADF;
+    int64_t err = host_fd_ref_open_io((int) x0, &host_ref);
+    if (err < 0)
+        return err;
     int64_t ret = (fsync(host_ref.fd) < 0) ? linux_errno() : 0;
     host_fd_ref_close(&host_ref);
     return ret;
