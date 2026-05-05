@@ -461,19 +461,22 @@ static int64_t host_fd_ref_open_checked(int guest_fd,
                                         host_fd_ref_t *ref,
                                         bool check_write_seal)
 {
-    fd_entry_t snap;
-    if (!fd_snapshot(guest_fd, &snap))
-        return -LINUX_EBADF;
-    if (snap.type == FD_PATH)
-        return -LINUX_EBADF;
-    if (check_write_seal && (snap.seals & LINUX_F_SEAL_WRITE))
-        return -LINUX_EPERM;
-    return host_fd_ref_open(guest_fd, ref) < 0 ? -LINUX_EBADF : 0;
+    if (check_write_seal) {
+        fd_entry_t snap;
+        if (!fd_snapshot(guest_fd, &snap))
+            return -LINUX_EBADF;
+        if (snap.type == FD_PATH)
+            return -LINUX_EBADF;
+        if (snap.seals & LINUX_F_SEAL_WRITE)
+            return -LINUX_EPERM;
+        return host_fd_ref_open(guest_fd, ref) < 0 ? -LINUX_EBADF : 0;
+    }
+    return host_fd_ref_open_io(guest_fd, ref);
 }
 
 static int64_t host_fd_ref_open_regular_io(int guest_fd, host_fd_ref_t *ref)
 {
-    return host_fd_ref_open_checked(guest_fd, ref, false);
+    return host_fd_ref_open_io(guest_fd, ref);
 }
 
 static int64_t proc_try_writev_intercept(int fd,

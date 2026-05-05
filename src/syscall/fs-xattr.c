@@ -219,8 +219,12 @@ int64_t sys_fsetxattr(guest_t *g,
                       int flags)
 {
     host_fd_ref_t host_ref;
-    if (host_fd_ref_open(fd, &host_ref) < 0)
-        return -LINUX_EBADF;
+    /* Linux: fsetxattr on an O_PATH fd returns EBADF (the descriptor lacks the
+     * write reference required by mnt_want_write_file).
+     */
+    int64_t err = host_fd_ref_open_io(fd, &host_ref);
+    if (err < 0)
+        return err;
 
     char name[LINUX_XATTR_NAME_MAX + 1];
     if (guest_read_str(g, name_gva, name, sizeof(name)) < 0) {
@@ -229,7 +233,7 @@ int64_t sys_fsetxattr(guest_t *g,
     }
 
     void *buf;
-    int64_t err = xattr_alloc_buf(size, &buf);
+    err = xattr_alloc_buf(size, &buf);
     if (err < 0) {
         host_fd_ref_close(&host_ref);
         return err;
@@ -284,8 +288,12 @@ int64_t sys_flistxattr(guest_t *g, int fd, uint64_t list_gva, uint64_t size)
 int64_t sys_fremovexattr(guest_t *g, int fd, uint64_t name_gva)
 {
     host_fd_ref_t host_ref;
-    if (host_fd_ref_open(fd, &host_ref) < 0)
-        return -LINUX_EBADF;
+    /* Linux: fremovexattr on an O_PATH fd returns EBADF, same reason as
+     * fsetxattr above.
+     */
+    int64_t err = host_fd_ref_open_io(fd, &host_ref);
+    if (err < 0)
+        return err;
 
     char name[LINUX_XATTR_NAME_MAX + 1];
     if (guest_read_str(g, name_gva, name, sizeof(name)) < 0) {

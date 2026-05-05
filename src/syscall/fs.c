@@ -706,6 +706,12 @@ int64_t sys_getdents64(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
         return -LINUX_EBADF;
     if (fd_table[fd].type == FD_CLOSED)
         return -LINUX_EBADF;
+    /* Linux: getdents on an O_PATH fd returns EBADF, even when the underlying
+     * inode is a directory. The early gate keeps the next NOTDIR fallback
+     * specific to non-directory regular fds.
+     */
+    if (fd_table[fd].type == FD_PATH)
+        return -LINUX_EBADF;
 
     DIR *dir = (DIR *) fd_table[fd].dir;
     if (!dir)
@@ -910,8 +916,9 @@ int64_t sys_pipe2(guest_t *g, uint64_t fds_gva, int linux_flags)
 int64_t sys_lseek(int fd, int64_t offset, int whence)
 {
     host_fd_ref_t host_ref;
-    if (host_fd_ref_open(fd, &host_ref) < 0)
-        return -LINUX_EBADF;
+    int64_t err = host_fd_ref_open_io(fd, &host_ref);
+    if (err < 0)
+        return err;
 
     off_t ret = lseek(host_ref.fd, offset, whence);
     host_fd_ref_close(&host_ref);
@@ -1433,18 +1440,22 @@ int64_t sys_faccessat(guest_t *g,
 
 int64_t sys_ftruncate(int fd, int64_t length)
 {
+    fd_entry_t snap;
+    if (!fd_snapshot(fd, &snap))
+        return -LINUX_EBADF;
+    /* Linux: ftruncate on an O_PATH fd returns EBADF. */
+    if (snap.type == FD_PATH)
+        return -LINUX_EBADF;
+
+    /* Enforce memfd seals on truncate. */
+    int seals = snap.seals;
+    if (seals & LINUX_F_SEAL_WRITE)
+        return -LINUX_EPERM;
+
     host_fd_ref_t host_ref;
     if (host_fd_ref_open(fd, &host_ref) < 0)
         return -LINUX_EBADF;
 
-    /* Enforce memfd seals on truncate.
-     * fd_to_host above already validated fd is in range.
-     */
-    int seals = fd_table[fd].seals;
-    if (seals & LINUX_F_SEAL_WRITE) {
-        host_fd_ref_close(&host_ref);
-        return -LINUX_EPERM;
-    }
     if (seals & (LINUX_F_SEAL_SHRINK | LINUX_F_SEAL_GROW)) {
         struct stat st;
         if (fstat(host_ref.fd, &st) == 0) {

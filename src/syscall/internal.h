@@ -235,6 +235,30 @@ static inline int host_dirfd_ref_open(guest_fd_t dirfd, host_fd_ref_t *ref)
     return host_fd_ref_open(dirfd, ref);
 }
 
+/* Open a host fd reference, rejecting O_PATH (FD_PATH) entries with -EBADF.
+ * Use this for syscalls that operate on the underlying file -- read/write,
+ * lseek, ftruncate, fsync/fdatasync, flock, fsetxattr/fremovexattr, ioctl, etc.
+ * Linux returns EBADF on those calls when the fd was opened O_PATH; the host fd
+ * here is a plain O_RDONLY descriptor, so without this gate the host call would
+ * silently succeed and diverge from Linux semantics.
+ *
+ * Calls that are explicitly allowed on O_PATH (fstat, fstatfs, fchdir, close,
+ * dup, fcntl get/set CLOEXEC, *at() dirfd) keep using host_{fd,dirfd}_ref_open
+ * helpers above.
+ */
+static inline int64_t host_fd_ref_open_io(guest_fd_t guest_fd,
+                                          host_fd_ref_t *ref)
+{
+    fd_entry_t snap;
+    if (!fd_snapshot(guest_fd, &snap))
+        return -LINUX_EBADF;
+    if (snap.type == FD_PATH)
+        return -LINUX_EBADF;
+    if (host_fd_ref_open(guest_fd, ref) < 0)
+        return -LINUX_EBADF;
+    return 0;
+}
+
 /* Read a guest path string with small-buffer optimization.
  *
  * Tries the stack-allocated short_buf first; falls back to long_buf for

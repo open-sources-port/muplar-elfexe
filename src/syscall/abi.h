@@ -161,19 +161,19 @@
 #define SYS_copy_file_range 285
 #define SYS_statx 291
 #define SYS_rseq 293
-/* xattr syscalls */
-#define SYS_lgetxattr 9
-#define SYS_lsetxattr 6
-#define SYS_getxattr 8
+/* xattr syscalls (numbers match aarch64 asm-generic/unistd.h) */
 #define SYS_setxattr 5
+#define SYS_lsetxattr 6
+#define SYS_fsetxattr 7
+#define SYS_getxattr 8
+#define SYS_lgetxattr 9
+#define SYS_fgetxattr 10
 #define SYS_listxattr 11
 #define SYS_llistxattr 12
+#define SYS_flistxattr 13
 #define SYS_removexattr 14
 #define SYS_lremovexattr 15
-#define SYS_fgetxattr 16
-#define SYS_fsetxattr 7
-#define SYS_flistxattr 13
-#define SYS_fremovexattr 18
+#define SYS_fremovexattr 16
 /* chroot */
 #define SYS_chroot 51
 /* network batch I/O */
