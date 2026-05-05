@@ -1445,10 +1445,9 @@ static int64_t sc_futex_waitv(guest_t *g,
                               uint64_t x5,
                               bool verbose)
 {
-    (void) x4;
     (void) x5;
     (void) verbose;
-    return sys_futex_waitv(g, x0, (uint32_t) x1, (uint32_t) x2, x3);
+    return sys_futex_waitv(g, x0, (uint32_t) x1, (uint32_t) x2, x3, (int) x4);
 }
 
 /* Generated dispatch table. */

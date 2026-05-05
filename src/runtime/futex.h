@@ -51,13 +51,16 @@ int64_t sys_futex(guest_t *g,
 int futex_wake_one(guest_t *g, uint64_t uaddr);
 
 /* futex_waitv (SYS 449): batch wait on multiple futex addresses.
+ * clockid selects the timeout clock (Linux CLOCK_REALTIME=0 or
+ * CLOCK_MONOTONIC=1); ignored when timeout_gva==0.
  * Returns the index of the woken futex, or negative errno.
  */
 int64_t sys_futex_waitv(guest_t *g,
                         uint64_t waiters_gva,
                         uint32_t nr_futexes,
                         uint32_t flags,
-                        uint64_t timeout_gva);
+                        uint64_t timeout_gva,
+                        int clockid);
 
 /* Walk the robust futex list on thread exit and set FUTEX_OWNER_DIED
  * on each held lock. Wakes one waiter per lock so a new owner can

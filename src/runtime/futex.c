@@ -79,6 +79,10 @@ static _Atomic int futex_interrupt_requested = 0;
 
 /* Per-waiter node. Allocated on the host stack of the waiting thread (no malloc
  * needed; the waiter is stack-local to sys_futex).
+ *
+ * group_lock / group_cond are optional: when non-NULL, a wake additionally
+ * signals group_cond under group_lock. futex_waitv uses this so that any wake
+ * across the wait set unblocks the polling thread without per-bucket polling.
  */
 typedef struct futex_waiter {
     uint64_t uaddr;            /* Guest VA being waited on */
@@ -86,7 +90,22 @@ typedef struct futex_waiter {
     pthread_cond_t cond;       /* Signalled by WAKE to unblock this waiter */
     int woken;                 /* Set to 1 by WAKE before signalling */
     struct futex_waiter *next; /* Next waiter in same bucket */
+    pthread_mutex_t *group_lock;
+    pthread_cond_t *group_cond;
 } futex_waiter_t;
+
+/* If the waiter belongs to a futex_waitv group, signal the group's cond so the
+ * polling thread wakes immediately. Caller holds the bucket lock; group_lock is
+ * acquired below it (lock order: bucket -> group_lock).
+ */
+static void futex_waiter_notify_group(futex_waiter_t *w)
+{
+    if (!w->group_cond)
+        return;
+    pthread_mutex_lock(w->group_lock);
+    pthread_cond_signal(w->group_cond);
+    pthread_mutex_unlock(w->group_lock);
+}
 
 /* One bucket in the hash table. Protected by its own mutex.
  * Lock order: 7 (leaf locks, index-ordered when two acquired).
@@ -146,10 +165,29 @@ int futex_interrupt_pending(void)
     return atomic_load(&futex_interrupt_requested);
 }
 
+/* Cap on guest-supplied tv_sec. The cap exists purely so the int64_t / time_t
+ * arithmetic in the deadline conversion (now.tv_sec + delta_sec, where
+ * delta_sec = lts.tv_sec - mono.tv_sec) cannot overflow even for adversarial
+ * inputs. INT64_MAX / 4 leaves four-way headroom for any pairwise sum or
+ * difference and still allows absolute CLOCK_REALTIME deadlines billions of
+ * years into the future, which comfortably covers the year-2038/2106
+ * envelope. Linux saturates at KTIME_MAX (INT64_MAX ns ~ 292 years) on
+ * conversion to ktime_t; this code stays in struct timespec so it does not
+ * need that conversion, only the cap.
+ */
+#define FUTEX_TIMESPEC_SEC_MAX (INT64_MAX / 4)
+
+static int linux_timespec_is_valid(const linux_timespec_t *lts)
+{
+    return lts->tv_sec >= 0 && lts->tv_sec <= FUTEX_TIMESPEC_SEC_MAX &&
+           lts->tv_nsec >= 0 && lts->tv_nsec < 1000000000L;
+}
+
 /* Convert a Linux guest timespec to an absolute struct timespec deadline.
  * For FUTEX_WAIT (relative timeout), adds the duration to the current time.
  * For FUTEX_WAIT_BITSET (absolute timeout), uses the value directly.
- * Returns 0 on success, -1 if the guest pointer is invalid.
+ * Returns 0 on success, -1 if the guest pointer is invalid, -2 if the guest
+ * timespec is malformed.
  */
 static int futex_make_deadline(guest_t *g,
                                uint64_t timeout_gva,
@@ -159,6 +197,8 @@ static int futex_make_deadline(guest_t *g,
     linux_timespec_t lts;
     if (guest_read_small(g, timeout_gva, &lts, sizeof(lts)) < 0)
         return -1;
+    if (!linux_timespec_is_valid(&lts))
+        return -2;
 
     if (is_absolute) {
         out->tv_sec = (time_t) lts.tv_sec;
@@ -194,8 +234,11 @@ static int64_t futex_wait(guest_t *g,
     bool has_timeout = (timeout_gva != 0);
     struct timespec deadline;
     if (has_timeout) {
-        if (futex_make_deadline(g, timeout_gva, is_absolute, &deadline) < 0)
+        int rc = futex_make_deadline(g, timeout_gva, is_absolute, &deadline);
+        if (rc == -1)
             return -LINUX_EFAULT;
+        if (rc == -2)
+            return -LINUX_EINVAL;
     }
 
     pthread_mutex_lock(&b->lock);
@@ -346,6 +389,7 @@ static int64_t futex_wake(uint64_t uaddr, uint32_t val, uint32_t bitset)
             *pp = w->next; /* Unlink before signaling */
             __atomic_store_n(&w->woken, 1, __ATOMIC_RELEASE);
             pthread_cond_signal(&w->cond);
+            futex_waiter_notify_group(w);
             woken++;
         } else {
             pp = &w->next;
@@ -428,6 +472,7 @@ static int64_t futex_requeue(guest_t *g,
             *pp = w->next;
             __atomic_store_n(&w->woken, 1, __ATOMIC_RELEASE);
             pthread_cond_signal(&w->cond);
+            futex_waiter_notify_group(w);
             woken++;
             /* Leave pp unchanged because *pp is already the next node */
         } else if ((uint32_t) requeued < requeue_count) {
@@ -562,6 +607,7 @@ static int64_t futex_wake_op(guest_t *g,
             *pp1 = w->next;
             __atomic_store_n(&w->woken, 1, __ATOMIC_RELEASE);
             pthread_cond_signal(&w->cond);
+            futex_waiter_notify_group(w);
             woken++;
         } else {
             pp1 = &w->next;
@@ -605,6 +651,7 @@ static int64_t futex_wake_op(guest_t *g,
                 *pp2 = w2->next;
                 __atomic_store_n(&w2->woken, 1, __ATOMIC_RELEASE);
                 pthread_cond_signal(&w2->cond);
+                futex_waiter_notify_group(w2);
                 woken2++;
             } else {
                 pp2 = &w2->next;
@@ -663,9 +710,12 @@ static int64_t futex_lock_pi(guest_t *g, uint64_t uaddr, uint64_t timeout_gva)
     bool has_timeout = (timeout_gva != 0);
     struct timespec deadline;
     if (has_timeout) {
-        if (futex_make_deadline(g, timeout_gva, /*is_absolute=*/1, &deadline) <
-            0)
+        int rc =
+            futex_make_deadline(g, timeout_gva, /*is_absolute=*/1, &deadline);
+        if (rc == -1)
             return -LINUX_EFAULT;
+        if (rc == -2)
+            return -LINUX_EINVAL;
     }
 
     unsigned idx = futex_hash(uaddr);
@@ -901,6 +951,7 @@ static int64_t futex_unlock_pi(guest_t *g, uint64_t uaddr)
             *pp = w->next; /* Unlink before signaling */
             __atomic_store_n(&w->woken, 1, __ATOMIC_RELEASE);
             pthread_cond_signal(&w->cond);
+            futex_waiter_notify_group(w);
             break; /* Wake exactly one */
         }
         pp = &w->next;
@@ -974,13 +1025,45 @@ int futex_wake_one(guest_t *g, uint64_t uaddr)
     return (int) futex_wake(uaddr, 1, FUTEX_BITSET_MATCH_ANY);
 }
 
-/* Unlink a waiter from its bucket's list, taking the bucket lock. */
+/* Unlink a waiter from whichever bucket it currently sits in, with retry on
+ * concurrent requeue. The waiter's struct lives on the calling thread's stack;
+ * leaving a dangling reference behind is a real host-safety bug because a
+ * later wake at the new uaddr would dereference it. The regular futex_wait
+ * self-dequeue path handles the same race the same way.
+ *
+ * Termination: on each iteration we either find w in the bucket (unlink and
+ * return), or observe w->woken==1 under the bucket lock (the wake path
+ * unlinks before storing woken with RELEASE under the bucket lock; once we
+ * acquire that bucket lock we synchronize with it), or determine w was
+ * requeued elsewhere (re-hash and retry). Forward progress is guaranteed
+ * because every requeue and every wake also holds bucket locks, so once we
+ * take the lock for the bucket that hashes w's current uaddr, no concurrent
+ * mover can step around us.
+ */
 static void waitv_unlink(futex_waiter_t *w)
 {
-    futex_bucket_t *b = &buckets[futex_hash(w->uaddr)];
-    pthread_mutex_lock(&b->lock);
-    bucket_unlink_locked(b, w);
-    pthread_mutex_unlock(&b->lock);
+    if (__atomic_load_n(&w->woken, __ATOMIC_ACQUIRE))
+        return;
+    for (;;) {
+        unsigned idx = futex_hash(w->uaddr);
+        futex_bucket_t *b = &buckets[idx];
+        pthread_mutex_lock(&b->lock);
+        bool found = false;
+        for (futex_waiter_t **pp = &b->head; *pp; pp = &(*pp)->next) {
+            if (*pp == w) {
+                *pp = w->next;
+                found = true;
+                break;
+            }
+        }
+        bool was_woken = __atomic_load_n(&w->woken, __ATOMIC_ACQUIRE);
+        pthread_mutex_unlock(&b->lock);
+        if (found || was_woken)
+            return;
+        /* w must have been requeued to another bucket while we hashed.
+         * Re-read uaddr and try again.
+         */
+    }
 }
 
 /* futex_waitv (SYS 449): batch futex wait on multiple addresses.
@@ -1006,14 +1089,20 @@ typedef struct {
 _Static_assert(sizeof(linux_futex_waitv_t) == 24,
                "futex_waitv element must be 24 bytes");
 
-/* Shared poll state for futex_waitv. The mutex+cond pair serves only as a timed
- * sleep primitive; futex_wake does not signal shared.cond directly. The poll
- * loop checks waiter.woken flags periodically.
+/* Shared wakeup state for futex_waitv. Each enqueued waiter holds pointers to
+ * this struct so any wake site (futex_wake, futex_requeue, futex_wake_op,
+ * futex_unlock_pi) signals shared.cond after marking the waiter woken. The
+ * polling loop sleeps on shared.cond with a bounded timeout so it still picks
+ * up exit_group requests and real timeouts even when no signal arrives.
  */
 typedef struct {
     pthread_mutex_t lock;
     pthread_cond_t cond;
 } waitv_shared_t;
+
+/* Linux clockid values accepted by futex_waitv. */
+#define LINUX_CLOCK_REALTIME 0
+#define LINUX_CLOCK_MONOTONIC 1
 
 static int waitv_collect_buckets(const linux_futex_waitv_t *elts,
                                  uint32_t nr_futexes,
@@ -1047,12 +1136,63 @@ int64_t sys_futex_waitv(guest_t *g,
                         uint64_t waiters_gva,
                         uint32_t nr_futexes,
                         uint32_t flags,
-                        uint64_t timeout_gva)
+                        uint64_t timeout_gva,
+                        int clockid)
 {
+    /* Validation order matches Linux do_futex_waitv():
+     *   1. flags
+     *   2. nr_futexes / !waiters
+     *   3. clockid (when timeout != NULL)
+     *   4. copy_from_user(timeout) -> EFAULT
+     *   5. timespec64_valid(timeout) -> EINVAL
+     *   6. copy_from_user(waiters) -> EFAULT
+     *   7. per-element validate -> EINVAL
+     * Reordering steps 4-7 to match Linux means a guest that passes a bad
+     * timeout AND bad waiters sees the same errno Linux would, instead of
+     * having ours fault on waiters first.
+     */
     if (flags != 0)
         return -LINUX_EINVAL;
-    if (nr_futexes == 0 || nr_futexes > FUTEX_WAITV_MAX)
+    if (nr_futexes == 0 || nr_futexes > FUTEX_WAITV_MAX || waiters_gva == 0)
         return -LINUX_EINVAL;
+
+    bool has_timeout = (timeout_gva != 0);
+    if (has_timeout && clockid != LINUX_CLOCK_REALTIME &&
+        clockid != LINUX_CLOCK_MONOTONIC)
+        return -LINUX_EINVAL;
+
+    /* Copy and validate the timeout before reading the waiters array. */
+    struct timespec deadline;
+    if (has_timeout) {
+        linux_timespec_t lts;
+        if (guest_read_small(g, timeout_gva, &lts, sizeof(lts)) < 0)
+            return -LINUX_EFAULT;
+        if (!linux_timespec_is_valid(&lts))
+            return -LINUX_EINVAL;
+
+        if (clockid == LINUX_CLOCK_MONOTONIC) {
+            /* Translate the monotonic absolute deadline to a CLOCK_REALTIME
+             * absolute deadline so pthread_cond_timedwait (which uses
+             * CLOCK_REALTIME) waits the right amount. macOS has no
+             * CLOCK_MONOTONIC condattr, so this conversion is unavoidable;
+             * minor wall-clock skew is accepted. lts.tv_sec is bounded by
+             * FUTEX_TIMESPEC_SEC_MAX (linux_timespec_is_valid), so the
+             * subtraction and addition stay inside int64_t / time_t range.
+             */
+            struct timeval now;
+            gettimeofday(&now, NULL);
+            struct timespec mono;
+            clock_gettime(CLOCK_MONOTONIC, &mono);
+            int64_t delta_sec = lts.tv_sec - mono.tv_sec;
+            long delta_nsec = (long) lts.tv_nsec - mono.tv_nsec;
+            deadline.tv_sec = now.tv_sec + delta_sec;
+            deadline.tv_nsec = (long) now.tv_usec * 1000 + delta_nsec;
+        } else {
+            deadline.tv_sec = (time_t) lts.tv_sec;
+            deadline.tv_nsec = (long) lts.tv_nsec;
+        }
+        timespec_normalize(&deadline);
+    }
 
     linux_futex_waitv_t elts[FUTEX_WAITV_MAX];
     size_t sz = nr_futexes * sizeof(linux_futex_waitv_t);
@@ -1066,26 +1206,12 @@ int64_t sys_futex_waitv(guest_t *g,
             return -LINUX_EINVAL;
         if ((elts[i].flags & FUTEX2_SIZE_MASK) != FUTEX2_SIZE_U32)
             return -LINUX_EINVAL;
-    }
-
-    /* Convert CLOCK_MONOTONIC absolute deadline to CLOCK_REALTIME for
-     * pthread_cond_timedwait (macOS has no CLOCK_MONOTONIC condattr).
-     */
-    bool has_timeout = (timeout_gva != 0);
-    struct timespec deadline;
-    if (has_timeout) {
-        linux_timespec_t lts;
-        if (guest_read_small(g, timeout_gva, &lts, sizeof(lts)) < 0)
-            return -LINUX_EFAULT;
-        struct timeval now;
-        gettimeofday(&now, NULL);
-        struct timespec mono;
-        clock_gettime(CLOCK_MONOTONIC, &mono);
-        int64_t delta_sec = lts.tv_sec - mono.tv_sec;
-        long delta_nsec = (long) lts.tv_nsec - mono.tv_nsec;
-        deadline.tv_sec = now.tv_sec + delta_sec;
-        deadline.tv_nsec = (long) now.tv_usec * 1000 + delta_nsec;
-        timespec_normalize(&deadline);
+        /* uaddr must be naturally aligned for the declared size. For
+         * FUTEX2_SIZE_U32 that is 4-byte alignment; an unaligned futex word
+         * loses atomicity on aarch64 and matches no kernel-side behavior.
+         */
+        if (elts[i].uaddr & 0x3)
+            return -LINUX_EINVAL;
     }
 
     waitv_shared_t shared;
@@ -1129,6 +1255,8 @@ int64_t sys_futex_waitv(guest_t *g,
         w->bitset = FUTEX_BITSET_MATCH_ANY;
         w->woken = 0;
         w->next = b->head;
+        w->group_lock = &shared.lock;
+        w->group_cond = &shared.cond;
         pthread_cond_init(&w->cond, NULL);
         b->head = w;
         enqueued++;
@@ -1137,16 +1265,14 @@ int64_t sys_futex_waitv(guest_t *g,
     for (int i = nbuckets - 1; i >= 0; i--)
         pthread_mutex_unlock(&bucket_ptrs[i]->lock);
 
-    /* All enqueued. Wait for any one to be woken. Poll periodically to check
-     * all waiters (the waker signals the waiter's own cond).
+    /* All enqueued. Block on shared.cond until any wake site signals it.
+     * The bounded sleep (capped at 500ms or the user deadline, whichever is
+     * sooner) gives proc_exit_group_requested() and timeout checks a chance to
+     * run if the cond_signal never arrives.
      */
     int result_idx = -1;
     pthread_mutex_lock(&shared.lock);
     for (;;) {
-        /* Check if any waiter was woken. Use acquire load to synchronize with
-         * the release store in futex_wake (which sets woken=1 under the bucket
-         * lock, but the polling thread reads outside that lock).
-         */
         for (uint32_t i = 0; i < nr_futexes; i++) {
             if (__atomic_load_n(&waiters[i].woken, __ATOMIC_ACQUIRE)) {
                 result_idx = (int) i;
@@ -1161,53 +1287,46 @@ int64_t sys_futex_waitv(guest_t *g,
             break;
         }
 
-        /* Poll with 50ms timeout to check for wakeups across buckets.
-         * futex_wake sets waiter.woken=1 and signals waiter.cond, but waitv
-         * doesn't block on individual waiter conds; it polls all of them. This
-         * gives up to 50ms latency per wakeup. For lower latency, each
-         * waiter.cond could also broadcast to shared.cond, but that requires
-         * modifying the generic futex_wake path.
-         * Acceptable for now since futex_waitv is mainly for Wine/Proton which
-         * is not yet a target workload.
-         */
-        struct timespec poll_ts;
-        timespec_deadline_in_ms(&poll_ts, 50);
-
+        struct timespec wait_ts;
+        timespec_deadline_in_ms(&wait_ts, 500);
         if (has_timeout) {
-            /* Use earlier of poll_ts and deadline */
-            if (deadline.tv_sec < poll_ts.tv_sec ||
-                (deadline.tv_sec == poll_ts.tv_sec &&
-                 deadline.tv_nsec < poll_ts.tv_nsec)) {
-                poll_ts = deadline;
+            if (deadline.tv_sec < wait_ts.tv_sec ||
+                (deadline.tv_sec == wait_ts.tv_sec &&
+                 deadline.tv_nsec < wait_ts.tv_nsec)) {
+                wait_ts = deadline;
             }
         }
 
-        pthread_cond_timedwait(&shared.cond, &shared.lock, &poll_ts);
-
-        for (uint32_t i = 0; i < nr_futexes; i++) {
-            if (__atomic_load_n(&waiters[i].woken, __ATOMIC_ACQUIRE)) {
-                result_idx = (int) i;
-                break;
-            }
-        }
-        if (result_idx >= 0)
-            break;
+        pthread_cond_timedwait(&shared.cond, &shared.lock, &wait_ts);
 
         if (has_timeout) {
             struct timeval now;
             gettimeofday(&now, NULL);
             long now_ns = (long) now.tv_usec * 1000;
-            if (now.tv_sec > deadline.tv_sec ||
-                (now.tv_sec == deadline.tv_sec && now_ns >= deadline.tv_nsec)) {
-                result_idx = -LINUX_ETIMEDOUT;
+            bool past_deadline =
+                now.tv_sec > deadline.tv_sec ||
+                (now.tv_sec == deadline.tv_sec && now_ns >= deadline.tv_nsec);
+            if (past_deadline) {
+                /* Re-check woken under shared.lock before declaring a timeout:
+                 * a wake that arrived during the cond_timedwait may not have
+                 * been signalled yet on this thread but the woken flag is set.
+                 */
+                for (uint32_t i = 0; i < nr_futexes; i++) {
+                    if (__atomic_load_n(&waiters[i].woken, __ATOMIC_ACQUIRE)) {
+                        result_idx = (int) i;
+                        break;
+                    }
+                }
+                if (result_idx < 0)
+                    result_idx = -LINUX_ETIMEDOUT;
                 break;
             }
         }
     }
     pthread_mutex_unlock(&shared.lock);
 
-    /* Unlink all waiters (woken entries are usually already removed by
-     * futex_wake, but a second pass is harmless and avoids stale pointers).
+    /* Unlink all waiters (woken entries are already removed by the wake path,
+     * but a second pass is harmless and avoids stale pointers).
      */
     for (uint32_t i = 0; i < nr_futexes; i++)
         waitv_unlink(&waiters[i]);

@@ -110,6 +110,9 @@ test-inotify
 [section] PI futex + EINTR regression tests
 test-futex-pi                  # diff=skip
 
+[section] futex_waitv (SYS 449) tests
+test-futex-waitv               # diff=skip
+
 [section] SIGILL / null guard tests
 test-sigill
 
