@@ -618,8 +618,20 @@ int fork_ipc_recv_process_state(int ipc_fd, guest_t *g, signal_state_t *sig)
         return -1;
     }
     g->nregions = (int) num_guest_regions;
-    for (int i = 0; i < g->nregions; i++)
+    for (int i = 0; i < g->nregions; i++) {
         g->regions[i].backing_fd = -1;
+        /* Demote inherited overlays: the child does not yet re-establish
+         * host MAP_FIXED|MAP_SHARED mappings from the parent's overlay
+         * fds, so msync, MADV_DONTNEED and friends must use the
+         * snapshot-style emulation. The CoW path's pre-fork sync of
+         * overlay bytes into shm_fd already gave the child snapshot the
+         * correct content at fork time. Live cross-fork MAP_SHARED
+         * coherence is the next P1 TODO item.
+         */
+        g->regions[i].overlay_active = false;
+        g->regions[i].overlay_start = 0;
+        g->regions[i].overlay_end = 0;
+    }
 
     if (fork_ipc_recv_backing_fds(ipc_fd, g) < 0)
         return -1;

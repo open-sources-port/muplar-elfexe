@@ -177,11 +177,12 @@ run_elfuse_sysroot()
 
 # Generic test helpers.
 
-# Tests that exercise raw clone / PI futex / massive thread+mmap stress and
-# legitimately hang under qemu-system-aarch64 on Apple Silicon (HVF + Alpine
-# linux-virt 6.12 kernel).  They pass cleanly under elfuse and are kept in
-# the elfuse-aarch64 mode; the qemu reference run skips them with SKIP.
-QEMU_SKIP="test-thread test-stress test-futex-pi"
+# Tests that either hang under qemu-system-aarch64 on Apple Silicon
+# (raw clone / PI futex / massive thread+mmap stress) or currently diverge
+# from the Alpine linux-virt reference kernel on the deprecated oom_adj
+# procfs compatibility path exercised by test-io-opt. They still run in
+# elfuse-aarch64 mode and in `make check`; the qemu reference run skips them.
+QEMU_SKIP="test-thread test-stress test-futex-pi test-io-opt"
 
 is_qemu_skipped()
 {

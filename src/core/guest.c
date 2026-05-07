@@ -77,6 +77,47 @@ static pthread_mutex_t pt_lock = PTHREAD_MUTEX_INITIALIZER; /* Lock order: 2 */
 /* Track whether the 80% warning has been emitted (avoid log spam) */
 static bool pt_pool_warned = false;
 
+static size_t guest_host_page_size_cached(void)
+{
+    static size_t cached;
+    if (!cached) {
+        long s = sysconf(_SC_PAGESIZE);
+        cached = (s > 0) ? (size_t) s : GUEST_PAGE_SIZE;
+    }
+    return cached;
+}
+
+static void guest_region_clear_overlay(guest_region_t *r)
+{
+    r->overlay_active = false;
+    r->overlay_start = 0;
+    r->overlay_end = 0;
+}
+
+static void guest_region_clip_overlay(guest_region_t *r)
+{
+    if (!r->overlay_active || r->end <= r->start) {
+        guest_region_clear_overlay(r);
+        return;
+    }
+
+    size_t hps = guest_host_page_size_cached();
+    uint64_t page_start = ALIGN_DOWN(r->start, hps);
+    uint64_t page_end = ALIGN_UP(r->end, hps);
+    uint64_t overlay_start =
+        r->overlay_start > page_start ? r->overlay_start : page_start;
+    uint64_t overlay_end =
+        r->overlay_end < page_end ? r->overlay_end : page_end;
+
+    if (overlay_end <= overlay_start) {
+        guest_region_clear_overlay(r);
+        return;
+    }
+
+    r->overlay_start = overlay_start;
+    r->overlay_end = overlay_end;
+}
+
 /* Allocate a zeroed 4KiB page from the page table pool.
  * Returns GPA of the page, or 0 on pool exhaustion.
  * Acquires pt_lock internally. Caller typically holds mmap_lock.
@@ -304,6 +345,12 @@ int guest_init(guest_t *g, uint64_t size, uint32_t ipa_bits)
         return -1;
     }
 
+    /* Seed HVF segment list with one entry covering the whole slab.
+     * sys_mmap may later split this for MAP_SHARED file overlays.
+     */
+    g->segments[0] = (hvf_segment_t) {.ipa = GUEST_IPA_BASE, .len = size};
+    g->n_segments = 1;
+
     return 0;
 }
 
@@ -371,6 +418,13 @@ int guest_init_from_shm(guest_t *g,
         return -1;
     }
 
+    /* Seed HVF segment list. The child re-establishes any per-region file
+     * overlays the parent had after this call (handled by fork-state
+     * deserialization).
+     */
+    g->segments[0] = (hvf_segment_t) {.ipa = GUEST_IPA_BASE, .len = size};
+    g->n_segments = 1;
+
     log_debug(
         "guest: CoW fork: mapped %llu GiB from shm "
         "(ipa=%u bits)",
@@ -390,6 +444,13 @@ void guest_destroy(guest_t *g)
         hv_vcpu_destroy(g->vcpu);
         g->vcpu = 0;
     }
+    /* Unmap each HVF segment. hv_vm_destroy releases all stage-2 state
+     * regardless, but unmapping explicitly keeps invariants clean for
+     * downstream tools (Instruments, leak detectors).
+     */
+    for (int i = 0; i < g->n_segments; i++)
+        hv_vm_unmap(g->segments[i].ipa, g->segments[i].len);
+    g->n_segments = 0;
     hv_vm_destroy();
     if (g->host_base) {
         munmap(g->host_base, g->guest_size);
@@ -901,6 +962,8 @@ static bool regions_mergeable(const guest_region_t *a, const guest_region_t *b)
      */
     if (a->noreserve != b->noreserve)
         return false;
+    if (a->overlay_active || b->overlay_active)
+        return false;
     if (strcmp(a->name, b->name) != 0)
         return false;
 
@@ -1014,6 +1077,7 @@ int guest_region_add_ex_owned(guest_t *g,
     r->backing_fd = owned_backing_fd;
     r->shared = (flags & 0x01) != 0;      /* LINUX_MAP_SHARED = 0x01 */
     r->noreserve = (flags & 0x4000) != 0; /* LINUX_MAP_NORESERVE = 0x4000 */
+    guest_region_clear_overlay(r);
     if (name) {
         str_copy_trunc(r->name, name, sizeof(r->name));
     } else {
@@ -1062,6 +1126,7 @@ void guest_region_remove(guest_t *g, uint64_t start, uint64_t end)
             uint64_t trimmed = end - r->start;
             r->offset += trimmed;
             r->start = end;
+            guest_region_clip_overlay(r);
             i++;
             continue;
         }
@@ -1069,6 +1134,7 @@ void guest_region_remove(guest_t *g, uint64_t start, uint64_t end)
         /* Partial overlap: removal range cuts the end */
         if (r->start < start && r->end > start && r->end <= end) {
             r->end = start;
+            guest_region_clip_overlay(r);
             i++;
             continue;
         }
@@ -1117,6 +1183,8 @@ void guest_region_remove(guest_t *g, uint64_t start, uint64_t end)
 
             /* Left half keeps the original entry and shortens its end. */
             r->end = start;
+            guest_region_clip_overlay(r);
+            guest_region_clip_overlay(right);
 
             g->nregions++;
             i += 2; /* skip both halves */
@@ -1173,6 +1241,7 @@ void guest_region_set_prot(guest_t *g, uint64_t start, uint64_t end, int prot)
             g->nregions++;
             /* Left half keeps original prot and backing_fd */
             g->regions[i].end = start;
+            guest_region_clip_overlay(&g->regions[i]);
             /* Right half will be processed next iteration */
             g->regions[i + 1].offset += (start - g->regions[i + 1].start);
             g->regions[i + 1].start = start;
@@ -1185,6 +1254,7 @@ void guest_region_set_prot(guest_t *g, uint64_t start, uint64_t end, int prot)
                         "split: %s",
                         strerror(errno));
             }
+            guest_region_clip_overlay(&g->regions[i + 1]);
             i++; /* advance to the right half */
             r = &g->regions[i];
         }
@@ -1213,6 +1283,7 @@ void guest_region_set_prot(guest_t *g, uint64_t start, uint64_t end, int prot)
             /* Left half: [r->start, end) with new prot */
             g->regions[i].end = end;
             g->regions[i].prot = prot;
+            guest_region_clip_overlay(&g->regions[i]);
             /* Right half: [end, old_end) keeps original prot */
             g->regions[i + 1].offset += (end - g->regions[i + 1].start);
             g->regions[i + 1].start = end;
@@ -1225,6 +1296,7 @@ void guest_region_set_prot(guest_t *g, uint64_t start, uint64_t end, int prot)
                         "end-split: %s",
                         strerror(errno));
             }
+            guest_region_clip_overlay(&g->regions[i + 1]);
             if (first_modified < 0)
                 first_modified = i;
             last_modified = i;

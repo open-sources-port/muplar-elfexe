@@ -107,6 +107,26 @@ typedef struct {
  */
 #define GUEST_MAX_REGIONS 4096
 
+/* HVF stage-2 mapping segment. The slab is mapped to HVF in pieces so that
+ * file-backed MAP_SHARED regions can have real host-VA overlays applied via
+ * mmap MAP_FIXED|MAP_SHARED of a file fd. HVF requires hv_vm_unmap to target
+ * an exactly-previously-mapped range; sub-range unmap of a larger map fails
+ * with HV_BAD_ARGUMENT. To allow a 2 MiB-aligned middle range to be unmapped +
+ * remapped (refreshing HVF stage-2 caching after a host mmap MAP_FIXED), the
+ * slab is split into 2 MiB-aligned segments around each affected block. All
+ * segments are 2 MiB-aligned and 2 MiB-sized at minimum.
+ *
+ * 256 segments is generous: each MAP_SHARED file mmap costs at most 2 new
+ * segments (left/right of the carved block), and most workloads keep that count
+ * well under 50.
+ */
+typedef struct {
+    uint64_t ipa; /* 2 MiB-aligned IPA start */
+    uint64_t len; /* 2 MiB-aligned length */
+} hvf_segment_t;
+
+#define GUEST_MAX_HVF_SEGMENTS 256
+
 /* A semantic memory region tracked for munmap/mprotect and /proc/self/maps.
  * Distinct from mem_region_t which is used purely for page table construction.
  * Regions are kept sorted by start address in guest_t.regions[].
@@ -120,7 +140,17 @@ typedef struct {
     int backing_fd;  /* Duplicated host fd for file-backed mappings, or -1 */
     bool shared;     /* MAP_SHARED (writes should propagate) */
     bool noreserve;  /* MAP_NORESERVE: PTEs deferred until fault */
-    char name[64];   /* Label: "[heap]", "[stack]", ELF path, etc. */
+    bool overlay_active; /* Region has a live host MAP_FIXED|MAP_SHARED overlay
+                          * of backing_fd at host_base+start. The kernel's
+                          * page cache keeps it coherent with the file and
+                          * with peer overlays of the same file, so msync
+                          * skips the snapshot-style pwrite-the-diff and
+                          * refresh-from-file paths for these regions. */
+    uint64_t overlay_start; /* Host-page-aligned overlay start. May extend
+                             * outside [start, end) when only part of a host
+                             * page is guest-visible. */
+    uint64_t overlay_end;   /* Host-page-aligned overlay end (exclusive). */
+    char name[64];          /* Label: "[heap]", "[stack]", ELF path, etc. */
 } guest_region_t;
 
 /* Guest state. */
@@ -160,6 +190,15 @@ typedef struct {
     /* Semantic region tracking for munmap/mprotect/proc-self-maps */
     guest_region_t regions[GUEST_MAX_REGIONS];
     int nregions; /* Number of active regions */
+
+    /* HVF stage-2 segment list: the union of segments[0..n_segments) covers the
+     * live IPA range that is currently hv_vm_map'd to HVF. Sorted by ipa.
+     * Initially one segment spans the whole slab. See guest.h header comment on
+     * hvf_segment_t for the rationale.
+     */
+    hvf_segment_t segments[GUEST_MAX_HVF_SEGMENTS];
+    int n_segments;
+
     /* Page table generation counter: incremented on every PT modification.
      * Used by the per-thread GVA TLB cache to detect stale entries.
      * 64-bit to avoid wrap-around stale hits over long-running sessions.

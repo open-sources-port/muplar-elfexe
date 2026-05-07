@@ -984,8 +984,45 @@ int64_t sys_clone(hv_vcpu_t vcpu,
         goto fail_snapshot;
     }
 
-    /* CoW path: send shm fd to child via SCM_RIGHTS */
+    /* CoW path: sync MAP_SHARED file overlays back into shm_fd before
+     * sending it to the child. The parent's host VA at each overlay
+     * region maps the overlay file, not shm_fd, so shm_fd's content at
+     * those IPAs is stale (typically zero). The child's MAP_PRIVATE
+     * snapshot would expose that stale data at the overlay IPAs. Copy
+     * the live overlay bytes into shm_fd at the matching offsets so the
+     * child snapshot reflects the parent's view at fork time. Live
+     * cross-fork MAP_SHARED coherence (parent and child both seeing
+     * subsequent writes through the same file) is left to the cross-fork
+     * coherence TODO; this fix only avoids the stale-snapshot regression.
+     */
     if (use_shm) {
+        for (int i = 0; i < g->nregions; i++) {
+            const guest_region_t *r = &g->regions[i];
+            if (!r->overlay_active)
+                continue;
+            uint64_t len = r->end - r->start;
+            const uint8_t *src = (const uint8_t *) g->host_base + r->start;
+            uint64_t off = r->start;
+            while (len > 0) {
+                size_t chunk = len > (uint64_t) SSIZE_MAX ? (size_t) SSIZE_MAX
+                                                          : (size_t) len;
+                ssize_t nw = pwrite(g->shm_fd, src, chunk, (off_t) off);
+                if (nw < 0) {
+                    if (errno == EINTR)
+                        continue;
+                    log_error("clone: shm overlay sync pwrite failed: %s",
+                              strerror(errno));
+                    goto fail_snapshot;
+                }
+                if (nw == 0) {
+                    log_error("clone: shm overlay sync pwrite returned 0");
+                    goto fail_snapshot;
+                }
+                src += nw;
+                off += (uint64_t) nw;
+                len -= (uint64_t) nw;
+            }
+        }
         if (fork_ipc_send_fds(ipc_sock, &g->shm_fd, 1) < 0) {
             log_error("clone: failed to send shm fd");
             goto fail_snapshot;

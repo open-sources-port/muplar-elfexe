@@ -330,8 +330,112 @@ SC_FORWARD(sc_waitid, sc_waitid_impl(g, x0, x1, x2, x3, x4))
 /* Futex */
 SC_FORWARD(sc_futex, sys_futex(g, x0, (int) x1, (uint32_t) x2, x3, x4, (uint32_t) x5))
 
-/* Sync */
-SC_FORWARD(sc_sync, (sync(), 0))
+/* Sync.
+ *
+ * Linux sync(2) flushes all dirty buffers. Forwarding to host sync()
+ * stalls because the guest slab is mmap'd MAP_SHARED to an internal
+ * tempfile (g->shm_fd) for the CoW fork fast path: a global flush has
+ * to walk multi-GB of demand-paged dirty pages from that tempfile, plus
+ * the same from any other elfuse process running on the host. The slab
+ * tempfile is implementation detail; the guest never opened it. Iterate
+ * the guest fd table and the region overlay backing fds, dup each under
+ * its lock, release the lock, and fsync the dups outside any guest lock
+ * so a slow disk cannot stall concurrent mmap/fd operations on other
+ * threads. fsync on non-regular fds returns EINVAL on macOS, which is
+ * benign and ignored. Always returns 0 to mirror sync(2)'s "void" spirit.
+ */
+/* Inline fallback: under malloc failure the bulk-dup path cannot proceed,
+ * so iterate one fd at a time, dupping under the matching lock and fsync
+ * outside it. Slower (acquires/releases fd_lock per regular fd) but keeps
+ * sync(2) honest under memory pressure instead of silently no-opping.
+ */
+static void sc_sync_fdtable_inline(void)
+{
+    for (int i = 0; i < FD_TABLE_SIZE; i++) {
+        pthread_mutex_lock(&fd_lock);
+        int t = fd_table[i].type;
+        int duped = -1;
+        if (t == FD_REGULAR || t == FD_DIR)
+            duped = dup(fd_table[i].host_fd);
+        pthread_mutex_unlock(&fd_lock);
+        if (duped < 0)
+            continue;
+        (void) fsync(duped);
+        close(duped);
+    }
+}
+
+static void sc_sync_regions_inline(guest_t *g)
+{
+    /* Region count can change under us once mmap_lock is released, so
+     * resnapshot under the lock each iteration; the i index is a live
+     * cursor into g->regions[] so a concurrent insertion (always at the
+     * sorted position) cannot make us skip an entry permanently.
+     */
+    for (int i = 0;; i++) {
+        pthread_mutex_lock(&mmap_lock);
+        if (i >= g->nregions) {
+            pthread_mutex_unlock(&mmap_lock);
+            break;
+        }
+        const guest_region_t *r = &g->regions[i];
+        int duped = -1;
+        if (r->shared && r->backing_fd >= 0)
+            duped = dup(r->backing_fd);
+        pthread_mutex_unlock(&mmap_lock);
+        if (duped < 0)
+            continue;
+        (void) fsync(duped);
+        close(duped);
+    }
+}
+
+static int64_t sc_sync_impl(guest_t *g)
+{
+    size_t cap = FD_TABLE_SIZE + GUEST_MAX_REGIONS;
+    int *hosts = malloc(cap * sizeof(int));
+    if (!hosts) {
+        sc_sync_fdtable_inline();
+        sc_sync_regions_inline(g);
+        return 0;
+    }
+    int n = 0;
+
+    pthread_mutex_lock(&fd_lock);
+    for (int i = 0; i < FD_TABLE_SIZE && n < (int) cap; i++) {
+        int t = fd_table[i].type;
+        if (t != FD_REGULAR && t != FD_DIR)
+            continue;
+        int duped = dup(fd_table[i].host_fd);
+        if (duped < 0)
+            continue;
+        hosts[n++] = duped;
+    }
+    pthread_mutex_unlock(&fd_lock);
+
+    pthread_mutex_lock(&mmap_lock);
+    for (int i = 0; i < g->nregions && n < (int) cap; i++) {
+        const guest_region_t *r = &g->regions[i];
+        if (!r->shared || r->backing_fd < 0)
+            continue;
+        int duped = dup(r->backing_fd);
+        if (duped < 0)
+            continue;
+        hosts[n++] = duped;
+    }
+    pthread_mutex_unlock(&mmap_lock);
+
+    /* fsync each dup outside both locks so a slow disk does not stall
+     * concurrent FD or memory operations on other threads.
+     */
+    for (int i = 0; i < n; i++) {
+        (void) fsync(hosts[i]);
+        close(hosts[i]);
+    }
+    free(hosts);
+    return 0;
+}
+SC_FORWARD(sc_sync, sc_sync_impl(g))
 
 /* SysV IPC */
 SC_FORWARD(sc_shmget, sys_shmget(g, (int32_t) x0, x1, (int) x2))
