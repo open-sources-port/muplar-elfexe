@@ -35,6 +35,7 @@
 
 #include "syscall/abi.h"
 #include "syscall/internal.h"
+#include "syscall/mem.h"
 #include "syscall/net.h"  /* absock namespace IPC state */
 #include "syscall/poll.h" /* wakeup_pipe_signal */
 #include "syscall/proc.h"
@@ -89,8 +90,8 @@ int fork_child_main(int ipc_fd, bool verbose, int timeout_sec)
     absock_set_namespace_id(hdr.absock_namespace_id);
     proc_set_session(hdr.sid, hdr.pgid);
 
-    /* Create guest memory before receiving state so all incoming offsets can
-     * be bounds-checked against the negotiated guest size.
+    /* Create guest memory before receiving state so all incoming offsets can be
+     * bounds-checked against the negotiated guest size.
      */
     guest_t g;
 
@@ -176,6 +177,7 @@ int fork_child_main(int ipc_fd, bool verbose, int timeout_sec)
         guest_destroy(&g);
         return 1;
     }
+
     /* POSIX: "Signals pending to the parent shall not be pending to the child."
      * Clear pending bitmask and RT queue before applying state.
      * signal_set_state() is deferred until after thread_register_main()
@@ -218,17 +220,17 @@ int fork_child_main(int ipc_fd, bool verbose, int timeout_sec)
     HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TPIDR_EL0, regs.tpidr_el0));
 
     /* Enable MMU directly (page tables already in guest memory from IPC).
-     * SCTLR must include MMU-enable (M), caches (C, I), RES1 bits,
-     * and EL0 cache maintenance access (UCI, UCT) for JIT translators.
+     * SCTLR must include MMU-enable (M), caches (C, I), RES1 bits, and EL0
+     * cache maintenance access (UCI, UCT) for JIT translators.
      */
     uint64_t sctlr_with_mmu = SCTLR_RES1 | SCTLR_M | SCTLR_C | SCTLR_I |
                               SCTLR_DZE | SCTLR_UCT | SCTLR_UCI;
     HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SCTLR_EL1, sctlr_with_mmu));
 
-    /* Restore all 31 GPRs from parent state, then override X0=0 (child
-     * clone return value). This preserves X1-X30 exactly as they were when
-     * the parent called clone(), which is required by the Linux syscall ABI
-     * (especially callee-saved X19-X28, FP=X29, LR=X30).
+    /* Restore all 31 GPRs from parent state, then override X0=0 (child clone
+     * return value). This preserves X1-X30 exactly as they were when the parent
+     * called clone(), which is required by the Linux syscall ABI (especially
+     * callee-saved X19-X28, FP=X29, LR=X30).
      */
     vcpu_restore_gprs(vcpu, regs.x);
     vcpu_set_gpr(vcpu, 0, 0); /* Child gets 0 from clone */
@@ -246,14 +248,14 @@ int fork_child_main(int ipc_fd, bool verbose, int timeout_sec)
 
     /* Register the fork child's main thread in the thread table.
      * Without this, current_thread is NULL and any syscall handler that
-     * accesses per-thread state (signal masks, ptrace, CLONE_THREAD)
-     * will dereference NULL.
+     * accesses per-thread state (signal masks, ptrace, CLONE_THREAD) will
+     * dereference NULL.
      */
     thread_register_main(vcpu, vexit, hdr.child_pid, regs.sp_el1);
 
     /* Now that current_thread is set, apply signal state. This must happen
-     * after thread_register_main() so the per-thread blocked mask and
-     * altstack are properly restored to the thread entry.
+     * after thread_register_main() so the per-thread blocked mask and altstack
+     * are properly restored to the thread entry.
      */
     signal_set_state(&sig);
 
@@ -921,6 +923,22 @@ int64_t sys_clone(hv_vcpu_t vcpu,
      */
     thread_quiesce_siblings();
 
+    mmap_fork_anon_shared_txn_t *anon_shared_txn = NULL;
+    guest_region_t *regions_snapshot = NULL;
+
+    /* Convert MAP_SHARED|MAP_ANONYMOUS regions that have no backing fd
+     * into memfd-backed overlay regions. The conversion seeds a private
+     * temp file with the current bytes and installs a host
+     * MAP_SHARED|MAP_FIXED overlay on the parent. The child receives the
+     * fd via SCM_RIGHTS and re-installs its own overlay so subsequent
+     * writes from either side flow through the kernel page cache and
+     * reach the other. File-backed MAP_SHARED regions already carry a
+     * backing fd and are unaffected. Misaligned shared regions
+     * (snapshot-style) remain incoherent across fork by design.
+     */
+    if (mmap_fork_prepare_anon_shared(g, &anon_shared_txn) < 0)
+        goto fail_snapshot;
+
     /* Determine if elfuse can use the CoW (shm) fast path.
      * If shm_fd >= 0, elfuse freezes a snapshot via MAP_PRIVATE and sends the
      * shm fd to the child. Otherwise fall back to region-by-region copy.
@@ -947,8 +965,6 @@ int64_t sys_clone(hv_vcpu_t vcpu,
      * but before sibling vCPUs resume. Declared up front so all goto paths to
      * fail_snapshot can free it unconditionally.
      */
-    guest_region_t *regions_snapshot = NULL;
-
     /* Header */
     ipc_header_t hdr = {
         .magic = IPC_MAGIC_HEADER,
@@ -1064,9 +1080,7 @@ int64_t sys_clone(hv_vcpu_t vcpu,
     if (nregions_snapshot > 0) {
         regions_snapshot = malloc(snap_sz);
         if (!regions_snapshot) {
-            thread_resume_siblings();
-            close(ipc_sock);
-            return -LINUX_ENOMEM;
+            goto fail_snapshot;
         }
         memcpy(regions_snapshot, g->regions, snap_sz);
     }
@@ -1074,15 +1088,17 @@ int64_t sys_clone(hv_vcpu_t vcpu,
     if (fork_ipc_send_fd_table(ipc_sock) < 0)
         goto fail_snapshot;
 
-    /* Resume sibling vCPUs now that the memory snapshot, semantic region
-     * snapshot, and FD snapshot have been serialized.
-     */
-    thread_resume_siblings();
-
     uint32_t num_guest_regions = (uint32_t) nregions_snapshot;
     if (fork_ipc_send_process_state(ipc_sock, regions_snapshot,
                                     num_guest_regions) < 0)
-        goto fail_ipc;
+        goto fail_snapshot;
+
+    /* The process-state payload includes the SCM_RIGHTS handoff for region
+     * backing fds. Keep siblings quiesced until that send completes so a
+     * concurrent munmap/remap cannot close or recycle the captured fd numbers.
+     */
+    thread_resume_siblings();
+    mmap_fork_commit_anon_shared(&anon_shared_txn);
 
     close(ipc_sock);
 
@@ -1112,13 +1128,21 @@ int64_t sys_clone(hv_vcpu_t vcpu,
     free(regions_snapshot);
     return child_guest_pid;
 
-fail_ipc:
-    free(regions_snapshot);
-    close(ipc_sock);
-    return -LINUX_ENOMEM;
-
 fail_snapshot:
     free(regions_snapshot);
+    /* Roll back the in-place anon-shared overlay conversion while
+     * siblings are still parked. A partial rollback failure (e.g.,
+     * region drift past the quiesce timeout) leaves the parent in a
+     * mixed state: the originating fork-IPC error is the user-visible
+     * one, but log abort failures so post-mortem can spot the
+     * lingering overlay without grepping for behavioral symptoms.
+     */
+    int abort_rc = mmap_fork_abort_anon_shared(g, &anon_shared_txn);
+    if (abort_rc < 0)
+        log_warn(
+            "clone: anon-shared rollback partial failure (%d); parent "
+            "may have stale memfd-backed regions",
+            abort_rc);
     thread_resume_siblings();
     close(ipc_sock);
     return -LINUX_ENOMEM;
