@@ -21,6 +21,7 @@
 #include "debug/log.h"
 #include "syscall/abi.h"
 #include "syscall/internal.h"
+#include "syscall/mem.h"
 #include "syscall/proc.h"
 
 int fork_ipc_write_all(int fd, const void *buf, size_t len)
@@ -494,7 +495,9 @@ static int fork_ipc_drain_bytes(int ipc_fd, uint32_t len)
     return 0;
 }
 
-static int fork_ipc_recv_backing_fds(int ipc_fd, guest_t *g)
+static int fork_ipc_recv_backing_fds(int ipc_fd,
+                                     guest_t *g,
+                                     const bool *parent_had_fd)
 {
     uint32_t nbacking;
     if (fork_ipc_read_all(ipc_fd, &nbacking, sizeof(nbacking)) < 0) {
@@ -518,19 +521,59 @@ static int fork_ipc_recv_backing_fds(int ipc_fd, guest_t *g)
         .msg_controllen = cmsg_sz,
     };
     ssize_t nr = recvmsg(ipc_fd, &msg, 0);
-    if (nr > 0) {
-        struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
-        if (cmsg && cmsg->cmsg_level == SOL_SOCKET &&
-            cmsg->cmsg_type == SCM_RIGHTS) {
-            int *region_fds = (int *) CMSG_DATA(cmsg);
-            uint32_t fi = 0;
-            for (int i = 0; i < g->nregions && fi < nbacking; i++) {
-                if (!(g->regions[i].flags & LINUX_MAP_ANONYMOUS) &&
-                    g->regions[i].offset != (uint64_t) -1) {
-                    g->regions[i].backing_fd = region_fds[fi++];
-                }
-            }
-        }
+    if (nr <= 0) {
+        free(cmsg_buf);
+        return -1;
+    }
+
+    struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+    if (msg.msg_flags & MSG_CTRUNC) {
+        log_error("fork-child: backing fd SCM_RIGHTS payload truncated");
+        free(cmsg_buf);
+        return -1;
+    }
+    if (!cmsg || cmsg->cmsg_level != SOL_SOCKET ||
+        cmsg->cmsg_type != SCM_RIGHTS) {
+        log_error("fork-child: missing backing fd SCM_RIGHTS payload");
+        free(cmsg_buf);
+        return -1;
+    }
+    if (cmsg->cmsg_len < CMSG_LEN(0)) {
+        free(cmsg_buf);
+        return -1;
+    }
+
+    int *region_fds = (int *) CMSG_DATA(cmsg);
+    uint32_t nreceived =
+        (uint32_t) ((cmsg->cmsg_len - CMSG_LEN(0)) / sizeof(int));
+    uint32_t fi = 0;
+
+    /* Sender (fork_ipc_send_backing_fds) iterates regions and sends one fd per
+     * region with backing_fd >= 0. The receiver must iterate in the same order
+     * over regions that had backing_fd in the parent. parent_had_fd[i] is
+     * captured by the caller before backing_fd is cleared.
+     *
+     * The original filter (!MAP_ANONYMOUS && offset != -1) matched extra
+     * regions like the shim and ELF text, so the first received fd was
+     * misassigned and the actual file-backed region was left without
+     * backing_fd.
+     */
+    for (int i = 0; i < g->nregions && fi < nreceived; i++) {
+        if (parent_had_fd && parent_had_fd[i])
+            g->regions[i].backing_fd = region_fds[fi++];
+    }
+
+    /* Close any received fds that did not get assigned: avoids leaking host fds
+     * into the child's process table when a mismatch occurs.
+     */
+    while (fi < nreceived)
+        close(region_fds[fi++]);
+
+    if (nreceived != nbacking) {
+        log_error("fork-child: expected %u backing fds but received %u",
+                  nbacking, nreceived);
+        free(cmsg_buf);
+        return -1;
     }
     free(cmsg_buf);
     return 0;
@@ -618,23 +661,73 @@ int fork_ipc_recv_process_state(int ipc_fd, guest_t *g, signal_state_t *sig)
         return -1;
     }
     g->nregions = (int) num_guest_regions;
+
+    /* Capture parent state before clearing the inherited overlay/backing fd
+     * fields. parent_had_fd lets recv_backing_fds iterate in the same order the
+     * sender used (regions with backing_fd >= 0); the parent_ovl_* arrays let
+     * mmap_fork_restore_overlays know which regions to re-install, with what
+     * overlay span. Heap-allocated to avoid pushing hundreds of KiB onto the
+     * recv stack frame.
+     */
+    bool *parent_had_fd = NULL;
+    bool *parent_active = NULL;
+    uint64_t *parent_ovl_start = NULL;
+    uint64_t *parent_ovl_end = NULL;
+    if (g->nregions > 0) {
+        parent_had_fd = calloc((size_t) g->nregions, sizeof(*parent_had_fd));
+        parent_active = calloc((size_t) g->nregions, sizeof(*parent_active));
+        parent_ovl_start =
+            calloc((size_t) g->nregions, sizeof(*parent_ovl_start));
+        parent_ovl_end = calloc((size_t) g->nregions, sizeof(*parent_ovl_end));
+        if (!parent_had_fd || !parent_active || !parent_ovl_start ||
+            !parent_ovl_end) {
+            log_error("fork-child: parent overlay buffer alloc failed");
+            free(parent_had_fd);
+            free(parent_active);
+            free(parent_ovl_start);
+            free(parent_ovl_end);
+            return -1;
+        }
+        for (int i = 0; i < g->nregions; i++) {
+            parent_had_fd[i] = (g->regions[i].backing_fd >= 0);
+            parent_active[i] = g->regions[i].overlay_active;
+            parent_ovl_start[i] = g->regions[i].overlay_start;
+            parent_ovl_end[i] = g->regions[i].overlay_end;
+        }
+    }
+
     for (int i = 0; i < g->nregions; i++) {
         g->regions[i].backing_fd = -1;
-        /* Demote inherited overlays: the child does not yet re-establish
-         * host MAP_FIXED|MAP_SHARED mappings from the parent's overlay
-         * fds, so msync, MADV_DONTNEED and friends must use the
-         * snapshot-style emulation. The CoW path's pre-fork sync of
-         * overlay bytes into shm_fd already gave the child snapshot the
-         * correct content at fork time. Live cross-fork MAP_SHARED
-         * coherence is the next P1 TODO item.
+        /* Drop inherited overlay metadata; the host MAP_FIXED|MAP_SHARED
+         * mapping does not exist yet in the child. Re-establishment runs after
+         * fork_ipc_recv_backing_fds populates backing_fd from the
+         * parent-supplied SCM_RIGHTS bundle.
          */
         g->regions[i].overlay_active = false;
         g->regions[i].overlay_start = 0;
         g->regions[i].overlay_end = 0;
     }
 
-    if (fork_ipc_recv_backing_fds(ipc_fd, g) < 0)
+    if (fork_ipc_recv_backing_fds(ipc_fd, g, parent_had_fd) < 0) {
+        free(parent_had_fd);
+        free(parent_active);
+        free(parent_ovl_start);
+        free(parent_ovl_end);
         return -1;
+    }
+
+    /* Re-install MAP_SHARED overlays for every region the parent had as
+     * overlay_active and that now carries a backing fd. Failures here fall back
+     * to snapshot semantics for the affected region; the child still boots and
+     * can run.
+     */
+    if (g->nregions > 0)
+        (void) mmap_fork_restore_overlays(g, parent_active, parent_ovl_start,
+                                          parent_ovl_end);
+    free(parent_had_fd);
+    free(parent_active);
+    free(parent_ovl_start);
+    free(parent_ovl_end);
 
     if (fork_ipc_read_all(ipc_fd, sig, sizeof(*sig)) < 0) {
         log_error("fork-child: failed to read signal state");

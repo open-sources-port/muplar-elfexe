@@ -98,6 +98,9 @@ test-mremap
 [section] msync MAP_SHARED tests
 test-msync
 
+[section] Cross-fork MAP_SHARED coherence tests
+test-cross-fork-mapshared          # diff=skip
+
 [section] madvise MADV_DONTNEED tests
 test-madvise
 
