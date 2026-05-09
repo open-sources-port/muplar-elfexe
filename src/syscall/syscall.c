@@ -213,7 +213,11 @@ SC_FORWARD(sc_fchmodat2,   sys_fchmodat(g, (int) x0, x1, (uint32_t) x2, (int) x3
 SC_FORWARD(sc_fchownat,    sys_fchownat(g, (int) x0, x1, (uint32_t) x2, (uint32_t) x3, (int) x4))
 SC_FORWARD(sc_fchown,      sys_fchown((int) x0, (uint32_t) x1, (uint32_t) x2))
 SC_FORWARD(sc_utimensat,   sys_utimensat(g, (int) x0, x1, x2, (int) x3))
-SC_FORWARD(sc_faccessat,   sys_faccessat(g, (int) x0, x1, (int) x2, (int) x3))
+/* Linux faccessat (SYS 48) is 3-arg: dirfd, path, mode.
+ * The flags parameter was added in faccessat2 (SYS 439).
+ * x3 contains garbage from the caller's register state.
+ */
+SC_FORWARD(sc_faccessat,   sys_faccessat(g, (int) x0, x1, (int) x2, 0))
 SC_FORWARD(sc_faccessat2,  sys_faccessat(g, (int) x0, x1, (int) x2, (int) x3))
 SC_FORWARD(sc_ftruncate,   sys_ftruncate((int) x0, (int64_t) x1))
 SC_FORWARD(sc_truncate,    sys_truncate(g, x0, (int64_t) x1))
