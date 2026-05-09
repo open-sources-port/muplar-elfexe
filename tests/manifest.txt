@@ -57,6 +57,7 @@ test-large-io-boundary
 
 [section] /proc and /dev emulation tests
 test-proc
+test-sysfs-cpu
 
 [section] Network tests
 test-net
