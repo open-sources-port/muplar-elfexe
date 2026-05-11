@@ -348,7 +348,10 @@ int64_t sys_execve(hv_vcpu_t vcpu,
     interp_resolved[0] = '\0';
 
     if (elf_info.interp_path[0] != '\0') {
-        elf_resolve_interp(proc_get_sysroot(), elf_info.interp_path,
+        char sysroot_snap[LINUX_PATH_MAX];
+        bool have_sr =
+            proc_sysroot_snapshot(sysroot_snap, sizeof(sysroot_snap));
+        elf_resolve_interp(have_sr ? sysroot_snap : NULL, elf_info.interp_path,
                            interp_resolved, sizeof(interp_resolved));
 
         log_debug("execve: pre-validating interpreter: %s", interp_resolved);
