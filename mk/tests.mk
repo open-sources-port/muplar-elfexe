@@ -6,6 +6,7 @@
         test-glibc-coreutils test-perf \
         test-matrix test-matrix-elfuse-aarch64 test-matrix-qemu-aarch64 \
         test-full test-multi-vcpu test-rwx test-sysroot-rename \
+        test-proctitle-low-stack \
         test-sysroot-procfs-exec test-timeout-disable \
         test-sysroot-nofollow test-sysroot-chdir perf
 
@@ -17,6 +18,8 @@ test-hello: $(ELFUSE_BIN) $(TEST_HELLO_DEP)
 ## Run the unit test suite plus busybox applet validation
 check: $(ELFUSE_BIN) $(TEST_DEPS)
 	@bash tests/driver.sh -e $(ELFUSE_BIN) -d $(TEST_DIR) -v
+	@printf "\n$(BLUE)━━━ proctitle low-stack regression ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-proctitle-low-stack
 	@printf "\n$(BLUE)━━━ busybox applet validation ━━━$(RESET)\n"
 	@$(MAKE) --no-print-directory test-busybox
 	@printf "\n$(BLUE)━━━ sysroot procfs exec validation ━━━$(RESET)\n"
@@ -204,6 +207,14 @@ test-busybox: $(ELFUSE_BIN) $(BUSYBOX_DEPS)
 		exit 1; \
 	fi
 	@bash tests/test-busybox.sh $(ELFUSE_BIN) $(BUSYBOX_BIN)
+
+## Run the low-stack argv rewrite regression on busybox startup
+test-proctitle-low-stack: $(ELFUSE_BIN) $(BUSYBOX_DEPS)
+	@if [ ! -x "$(BUSYBOX_BIN)" ]; then \
+		printf "$(RED)✗ Busybox not found.$(RESET) Set BUSYBOX_BIN=/path/to/busybox.\n"; \
+		exit 1; \
+	fi
+	@bash tests/test-proctitle-low-stack.sh $(ELFUSE_BIN) $(BUSYBOX_BIN)
 
 # ── Static binary integration tests ──────────────────────────────
 

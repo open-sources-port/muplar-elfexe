@@ -15,68 +15,35 @@
 
 #include "runtime/proctitle.h"
 
-static char *runtime_find_argv_environ_end(int argc, char **argv, char **envp)
+/* Return the contiguous argv block size starting at argv[0].
+ *
+ * Stop at the first non-contiguous argv entry and exclude the environment block
+ * entirely. Rewriting through envp is unsafe on Apple Silicon because libc's
+ * optimized memset may zero in cache-line chunks and step past the top of the
+ * stack when argv/env reach the stack ceiling under a small RLIMIT_STACK.
+ */
+static size_t runtime_argv_block_size(int argc, char **argv)
 {
-    char *end = argv[0];
+    char *next = argv[0];
 
     for (int i = 0; i < argc; i++) {
-        if (!argv[i])
-            continue;
-
-        char *next = argv[i] + strlen(argv[i]) + 1;
-        if (next > end)
-            end = next;
+        if (!argv[i] || argv[i] != next)
+            break;
+        next = argv[i] + strlen(argv[i]) + 1;
     }
 
-    for (int i = 0; envp[i]; i++) {
-        char *next = envp[i] + strlen(envp[i]) + 1;
-        if (next > end)
-            end = next;
-    }
-
-    return end;
-}
-
-static bool runtime_duplicate_environment(char ***out_envp)
-{
-    extern char **environ;
-    int env_count = 0;
-
-    while (environ[env_count])
-        env_count++;
-
-    char **new_environ =
-        (char **) malloc((size_t) (env_count + 1) * sizeof(char *));
-    if (!new_environ)
-        return false;
-
-    for (int i = 0; i < env_count; i++) {
-        new_environ[i] = strdup(environ[i]);
-        if (new_environ[i])
-            continue;
-
-        for (int j = 0; j < i; j++)
-            free(new_environ[j]);
-        free(new_environ);
-        return false;
-    }
-
-    new_environ[env_count] = NULL;
-    *out_envp = new_environ;
-    return true;
+    return (size_t) (next - argv[0]);
 }
 
 void runtime_set_process_title(int argc, char **argv, const char *elf_path)
 {
-    extern char **environ;
-    char **new_environ = NULL;
     size_t avail;
     const char *arch = "aarch64";
     char title[256];
     char thread_name[64];
     size_t title_len;
 
-    if (argc <= 0 || !argv || !argv[0] || !elf_path || !environ)
+    if (argc <= 0 || !argv || !argv[0] || !elf_path)
         return;
 
     const char *slash = strrchr(elf_path, '/');
@@ -90,19 +57,23 @@ void runtime_set_process_title(int argc, char **argv, const char *elf_path)
     snprintf(thread_name, sizeof(thread_name), "%s (%s-linux)", bin, arch);
     pthread_setname_np(thread_name);
 
-    avail =
-        (size_t) (runtime_find_argv_environ_end(argc, argv, environ) - argv[0]);
+    avail = runtime_argv_block_size(argc, argv);
     if (avail == 0)
         return;
 
-    if (!runtime_duplicate_environment(&new_environ))
-        return;
-    environ = new_environ;
+    /* Write the argv block with explicit byte stores through a volatile
+     * destination. The libc memcpy/memset on Apple Silicon are free to use
+     * cache-line-aligned stp/DC ZVA stores; using single-byte STRB removes
+     * any chance of touching the byte past avail, which on a Linux-style
+     * initial stack is the first character of envp[0].
+     */
+    size_t copy = title_len < avail ? title_len : avail - 1;
+    volatile char *dst = (volatile char *) argv[0];
+    for (size_t i = 0; i < copy; i++)
+        dst[i] = title[i];
+    for (size_t i = copy; i < avail; i++)
+        dst[i] = '\0';
 
-    if (title_len < avail) {
-        memcpy(argv[0], title, title_len);
-        memset(argv[0] + title_len, '\0', avail - title_len);
-    }
     for (int i = 1; i < argc; i++)
         argv[i] = NULL;
 }

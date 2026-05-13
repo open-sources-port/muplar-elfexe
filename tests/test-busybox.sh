@@ -37,9 +37,50 @@ test_tool_path()
     printf "%s" "$1"
 }
 
+# Probe which applets this busybox binary actually carries. The Debian
+# busybox-static drops a handful of applets (e.g. comm) compared to a
+# full build, and tests for them must skip rather than fail. Hard-fail
+# the whole suite if the probe itself fails so a broken elfuse/busybox
+# does not silently degrade to "all SKIP".
+if ! _bb_list=$(timeout "$TEST_TIMEOUT" "$ELFUSE" "$BB" --list 2>&1); then
+    printf "test-busybox: probing '%s --list' under elfuse failed:\n%s\n" \
+        "$BB" "$_bb_list" >&2
+    exit 1
+fi
+BB_APPLETS=" $(printf '%s\n' "$_bb_list" | tr '\n' ' ') "
+# Sanity: a usable busybox should expose at least one of these common
+# applets. A reduced build may legitimately omit sh, so accept any of
+# the small universal set; only fail if --list produced nothing usable.
+case "$BB_APPLETS" in
+    *" sh "* | *" echo "* | *" cat "* | *" ls "* | *" true "*) ;;
+    *)
+        printf "test-busybox: applet list from '%s --list' looks empty or malformed:\n%s\n" \
+            "$BB" "$_bb_list" >&2
+        exit 1
+        ;;
+esac
+unset _bb_list
+
+# Override: skip if the requested applet isn't compiled into this busybox.
+# shellcheck disable=SC2329  # Invoked indirectly by tests/lib/test-runner.sh.
+test_skip_missing_tool()
+{
+    local tool="$1"
+    case "$BB_APPLETS" in
+        *" $tool "*) return 1 ;;
+    esac
+    run_skip "$tool" "applet not in this busybox build"
+    return 0
+}
+
 run_nc_http_check()
 {
     local applet="nc" output rc server_pid port_file port
+
+    if test_skip_missing_tool "$applet"; then
+        return
+    fi
+
     port_file=$(mktemp "${TMPDIR}/nc-http-port.XXXXXX") || {
         test_report skip "$applet" " (failed to create port file)"
         skip=$((skip + 1))

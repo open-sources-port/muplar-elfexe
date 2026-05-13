@@ -10,6 +10,41 @@
 : "${TEST_LABEL_WIDTH:=14}"
 : "${TEST_TIMEOUT:=10}"
 
+# Resolve a working `timeout` binary. macOS doesn't ship one, so fall back to
+# GNU coreutils' gtimeout. Wrap as a function so callers keep using the bare
+# name `timeout`. Resolution order: TIMEOUT_BIN env override, `timeout` on
+# PATH, `gtimeout` on PATH, then Homebrew's stable opt symlinks for ARM and
+# Intel macOS (the install prefix differs between the two).
+if [ -n "${TIMEOUT_BIN:-}" ]; then
+    timeout()
+    {
+        "$TIMEOUT_BIN" "$@"
+    }
+elif ! command -v timeout > /dev/null 2>&1; then
+    _timeout_bin=
+    if command -v gtimeout > /dev/null 2>&1; then
+        _timeout_bin=gtimeout
+    else
+        for _candidate in /opt/homebrew/opt/coreutils/bin/gtimeout \
+            /usr/local/opt/coreutils/bin/gtimeout; do
+            if [ -x "$_candidate" ]; then
+                _timeout_bin="$_candidate"
+                break
+            fi
+        done
+    fi
+    if [ -n "$_timeout_bin" ]; then
+        # shellcheck disable=SC2317  # Invoked indirectly via `timeout` callers.
+        eval "timeout() { \"$_timeout_bin\" \"\$@\"; }"
+    else
+        echo "test-runner: no 'timeout' or 'gtimeout' in PATH." >&2
+        echo "  Install GNU coreutils (brew install coreutils), put gtimeout" >&2
+        echo "  on PATH, or set TIMEOUT_BIN=/path/to/timeout." >&2
+        exit 127
+    fi
+    unset _timeout_bin _candidate
+fi
+
 if [ -t 1 ]; then
     # Use ANSI-C quoting so the variables hold real ESC bytes, not the literal
     # 4-char "\033" sequence. Without this, callers that pass colors as printf

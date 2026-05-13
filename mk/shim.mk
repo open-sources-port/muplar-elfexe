@@ -9,6 +9,15 @@ $(BUILD_DIR)/shim.o: src/core/shim.S | $(BUILD_DIR)
 $(BUILD_DIR)/shim.bin: $(BUILD_DIR)/shim.o
 	@echo "  OBJCOPY $@"
 	$(Q)$(OBJCOPY) -O binary $< $@
+	$(Q)magic=$$(od -An -N4 -tx1 $@ | tr -d '[:space:]'); \
+	case "$$magic" in \
+	cffaedfe|cefaedfe|feedface|feedfacf|cafebabe|bebafeca|cafebabf|bfbafeca) \
+	  echo "ERROR: $@ still has a Mach-O header (magic $$magic)."; \
+	  echo "       $(OBJCOPY) does not strip Mach-O containers in -O binary mode."; \
+	  echo "       Install GNU binutils (brew install binutils) and rebuild, or"; \
+	  echo "       set OBJCOPY=/opt/homebrew/opt/binutils/bin/objcopy."; \
+	  rm -f $@; exit 1;; \
+	esac
 
 $(BUILD_DIR)/shim_blob.h: $(BUILD_DIR)/shim.bin
 	@echo "  GEN     $@"
