@@ -16,6 +16,8 @@
 
 #include "utils.h"
 
+#include "core/sysroot.h"
+
 #include "runtime/thread.h"
 
 #include "syscall/internal.h"
@@ -30,6 +32,11 @@ static bool shim_blob_owned = false;
 /* Current ELF and launcher paths. */
 static char elf_path[LINUX_PATH_MAX] = {0};
 static char elfuse_path[LINUX_PATH_MAX] = {0};
+/* Serializes proc_set_elf_path against readers that consume the string.
+ * Without this, an execve on one vCPU can tear the buffer underneath a
+ * sibling vCPU resolving /proc/self/exe.
+ */
+static pthread_mutex_t elf_path_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* Guest process metadata snapshots. */
 static char cmdline_buf[8192] = {0};
@@ -45,6 +52,7 @@ static char sysroot_path[LINUX_PATH_MAX] = {0};
  * the snprintf input buffer underneath that thread.
  */
 static pthread_mutex_t sysroot_lock = PTHREAD_MUTEX_INITIALIZER;
+static bool sysroot_casefold = false;
 
 /* Cached current working directory for getcwd() and /proc/self/cwd. */
 static pthread_mutex_t cwd_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -62,6 +70,7 @@ void proc_state_init(void)
     environ_len = 0;
     auxv_len = 0;
     sysroot_path[0] = '\0';
+    sysroot_casefold = false;
 
     pthread_mutex_lock(&cwd_lock);
     cwd_path[0] = '\0';
@@ -80,7 +89,7 @@ int proc_cwd_refresh(void)
     char sr[LINUX_PATH_MAX];
     if (proc_sysroot_snapshot(sr, sizeof(sr))) {
         size_t sr_len = strlen(sr);
-        if (strncmp(cwd, sr, sr_len) == 0 &&
+        if (!strncmp(cwd, sr, sr_len) &&
             (cwd[sr_len] == '\0' || cwd[sr_len] == '/')) {
             guest_cwd = cwd + sr_len;
             if (*guest_cwd == '\0')
@@ -238,6 +247,7 @@ unsigned int proc_get_shim_size(void)
 
 void proc_set_elf_path(const char *path)
 {
+    pthread_mutex_lock(&elf_path_lock);
     if (path) {
         if (path[0] == '/') {
             str_copy_trunc(elf_path, path, sizeof(elf_path));
@@ -251,11 +261,36 @@ void proc_set_elf_path(const char *path)
     } else {
         elf_path[0] = '\0';
     }
+    pthread_mutex_unlock(&elf_path_lock);
 }
 
+/* Returns the elf_path buffer pointer. Boolean-test callers tolerate the
+ * racy read since the first byte transitions atomically. Callers that
+ * consume the string content must use proc_elf_path_snapshot() to avoid
+ * a torn read against a concurrent proc_set_elf_path().
+ */
 const char *proc_get_elf_path(void)
 {
     return elf_path[0] ? elf_path : NULL;
+}
+
+bool proc_elf_path_snapshot(char *out, size_t outsz)
+{
+    if (!out || outsz == 0)
+        return false;
+    pthread_mutex_lock(&elf_path_lock);
+    bool ok = false;
+    if (elf_path[0]) {
+        size_t need = strlen(elf_path) + 1;
+        if (need <= outsz) {
+            memcpy(out, elf_path, need);
+            ok = true;
+        }
+    }
+    pthread_mutex_unlock(&elf_path_lock);
+    if (!ok)
+        out[0] = '\0';
+    return ok;
 }
 
 void proc_set_elfuse_path(const char *path)
@@ -390,6 +425,22 @@ bool proc_sysroot_snapshot(char *out, size_t outsz)
     return ok;
 }
 
+void proc_set_sysroot_casefold(bool enabled)
+{
+    pthread_mutex_lock(&sysroot_lock);
+    sysroot_casefold = enabled;
+    pthread_mutex_unlock(&sysroot_lock);
+}
+
+bool proc_sysroot_casefold_enabled(void)
+{
+    bool enabled;
+    pthread_mutex_lock(&sysroot_lock);
+    enabled = sysroot_casefold;
+    pthread_mutex_unlock(&sysroot_lock);
+    return enabled;
+}
+
 /* Confirm resolved_path canonicalizes inside sysroot. This is a check-then-use
  * sequence: callers issue the actual syscall after this returns, so a symlink
  * swapped in between will not be re-validated. openat2
@@ -410,28 +461,40 @@ static bool sysroot_path_is_contained(const char *resolved_path,
         if (!realpath(resolved_path, real_path))
             return false;
     } else {
-        char parent[LINUX_PATH_MAX];
-        char *slash;
-
-        str_copy_trunc(parent, resolved_path, sizeof(parent));
-        slash = strrchr(parent, '/');
-        /* resolved_path is always ${sysroot}${guest_path} where sysroot is
-         * non-empty (caller short-circuits otherwise) and guest_path starts
-         * with '/'. The result therefore contains at least two '/' bytes, so
-         * the basename slash is never at parent[0]. Reject anything that
-         * violates the invariant rather than carrying dead code for it.
+        const char *base = strrchr(resolved_path, '/');
+        /* "." and ".." basenames navigate the directory tree and cannot
+         * themselves be symlinks, so realpath the full path: appending
+         * the literal basename onto realpath(parent) would let
+         * "${sysroot}/x/.." pass the prefix check while the kernel
+         * resolves the syscall target above sysroot.
          */
-        if (!slash || slash == parent)
-            return false;
+        if (base && (!strcmp(base + 1, "..") || !strcmp(base + 1, "."))) {
+            if (!realpath(resolved_path, real_path))
+                return false;
+        } else {
+            char parent[LINUX_PATH_MAX];
+            char *slash;
 
-        *slash = '\0';
-        if (!realpath(parent, real_path))
-            return false;
-        size_t parent_len = strlen(real_path);
-        if (snprintf(real_path + parent_len, sizeof(real_path) - parent_len,
-                     "/%s",
-                     slash + 1) >= (int) (sizeof(real_path) - parent_len)) {
-            return false;
+            str_copy_trunc(parent, resolved_path, sizeof(parent));
+            slash = strrchr(parent, '/');
+            /* resolved_path is always ${sysroot}${guest_path} where sysroot
+             * is non-empty (caller short-circuits otherwise) and guest_path
+             * starts with '/'. The result therefore contains at least two
+             * '/' bytes, so the basename slash is never at parent[0].
+             * Reject anything that violates the invariant rather than
+             * carrying dead code for it.
+             */
+            if (!slash || slash == parent)
+                return false;
+
+            *slash = '\0';
+            if (!realpath(parent, real_path))
+                return false;
+            size_t parent_len = strlen(real_path);
+            if (snprintf(real_path + parent_len, sizeof(real_path) - parent_len,
+                         "/%s",
+                         slash + 1) >= (int) (sizeof(real_path) - parent_len))
+                return false;
         }
     }
 
@@ -467,20 +530,31 @@ static const char *proc_resolve_sysroot_path_flags(const char *path,
     char sr[LINUX_PATH_MAX];
     if (!proc_sysroot_snapshot(sr, sizeof(sr)) || !path || path[0] != '/')
         return path;
-    if (bufsz == 0)
+    if (bufsz == 0) {
+        errno = ENAMETOOLONG;
         return NULL;
+    }
 
     int n = snprintf(buf, bufsz, "%s%s", sr, path);
-    if (n < 0)
+    if (n < 0) {
+        if (errno == 0)
+            errno = EINVAL;
         return NULL;
+    }
     bool full_path_truncated = (size_t) n >= bufsz;
     if (!full_path_truncated && sysroot_path_exists(buf, follow_final)) {
-        if (!sysroot_path_is_contained(buf, sr, follow_final))
+        if (!sysroot_path_is_contained(buf, sr, follow_final)) {
+            errno = ELOOP;
             return NULL;
+        }
         return buf;
     }
 
-    return full_path_truncated ? NULL : path;
+    if (full_path_truncated) {
+        errno = ENAMETOOLONG;
+        return NULL;
+    }
+    return path;
 }
 
 const char *proc_resolve_sysroot_path(const char *path, char *buf, size_t bufsz)
@@ -497,28 +571,69 @@ const char *proc_resolve_sysroot_nofollow_path(const char *path,
 
 const char *proc_resolve_sysroot_create_path(const char *path,
                                              char *buf,
-                                             size_t bufsz)
+                                             size_t bufsz,
+                                             bool create_parents)
 {
     char sr[LINUX_PATH_MAX];
     if (!proc_sysroot_snapshot(sr, sizeof(sr)) || !path || path[0] != '/')
         return path;
-    if (bufsz == 0)
+    if (bufsz == 0) {
+        errno = ENAMETOOLONG;
         return NULL;
+    }
 
     int n = snprintf(buf, bufsz, "%s%s", sr, path);
-    if (n < 0 || (size_t) n >= bufsz)
+    if (n < 0) {
+        if (errno == 0)
+            errno = EINVAL;
         return NULL;
+    }
+    if ((size_t) n >= bufsz) {
+        errno = ENAMETOOLONG;
+        return NULL;
+    }
 
     char parent[LINUX_PATH_MAX];
     str_copy_trunc(parent, buf, sizeof(parent));
     char *slash = strrchr(parent, '/');
-    if (slash && slash != parent) {
-        *slash = '\0';
-        if (access(parent, F_OK) == 0 &&
-            !sysroot_path_is_contained(parent, sr, true)) {
+    if (!slash || slash == parent)
+        return buf;
+
+    *slash = '\0';
+    if (access(parent, F_OK) == 0) {
+        if (!sysroot_path_is_contained(parent, sr, true)) {
+            errno = ELOOP;
             return NULL;
         }
+        return buf;
     }
 
+    /* access() failed for a reason other than "parent missing" (e.g. EACCES,
+     * ELOOP, ENAMETOOLONG, EIO). Treating those as "parent absent" would let
+     * the redirect logic auto-create or silently fall back to the host
+     * literal, which can bypass sysroot resolution. Surface the real error.
+     */
+    if (errno != ENOENT && errno != ENOTDIR)
+        return NULL;
+
+    /* Parent doesn't exist in sysroot. Only /tmp, /var/tmp, and ccache get
+     * forcefully redirected to the sysroot to avoid host case-collisions;
+     * everything else falls back to the host literal.
+     */
+    if (strncmp(path, "/tmp/", 5) && strncmp(path, "/var/tmp/", 9) &&
+        !strstr(path, "/.ccache/"))
+        return path;
+
+    if (!create_parents) {
+        if (sysroot_validate_dir_prefix(parent) < 0)
+            return NULL;
+        return buf;
+    }
+    if (sysroot_ensure_dir_exists(parent) < 0)
+        return NULL;
+    if (!sysroot_path_is_contained(parent, sr, true)) {
+        errno = ELOOP;
+        return NULL;
+    }
     return buf;
 }

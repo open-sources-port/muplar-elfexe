@@ -25,8 +25,11 @@
 #include <string.h>
 #include <unistd.h>
 
+#include "utils.h"
+
 #include "core/bootstrap.h"
 #include "core/guest.h"
+#include "core/sysroot.h"
 
 #include "runtime/forkipc.h"
 #include "runtime/proctitle.h"
@@ -58,13 +61,18 @@ static void free_guest_argv(const char **guest_argv, int guest_argc)
 
 static void cleanup_main_resources(guest_t *g,
                                    bool guest_initialized,
+                                   sysroot_mount_t *sysroot_mount,
+                                   const char *host_cwd,
                                    const char **guest_argv,
                                    int guest_argc,
-                                   const char *elf_path,
-                                   const char *sysroot_path)
+                                   char *elf_path,
+                                   char *sysroot_path)
 {
     if (guest_initialized)
         guest_destroy(g);
+    if (host_cwd && host_cwd[0] != '\0' && chdir(host_cwd) < 0)
+        (void) chdir("/");
+    sysroot_cleanup_mount(sysroot_mount);
     free_guest_argv(guest_argv, guest_argc);
     free((void *) elf_path);
     free((void *) sysroot_path);
@@ -114,6 +122,7 @@ int main(int argc, char **argv)
     bool verbose = false;
     int timeout_sec = 10, fork_child_fd = -1, vfork_notify_fd = -1;
     const char *sysroot = NULL;
+    const char *create_sysroot = NULL;
     int gdb_port = 0;
     bool gdb_stop_on_entry = false;
     int arg_start = 1;
@@ -127,6 +136,7 @@ int main(int argc, char **argv)
         if (!strcmp(argv[1], "--help") || !strcmp(argv[1], "-h")) {
             printf(
                 "usage: elfuse [--verbose] [--timeout N] [--sysroot PATH]\n"
+                "              [--create-sysroot PATH]\n"
                 "              [--gdb PORT] [--gdb-stop-on-entry]\n"
                 "              <elf-path> [args...]\n"
                 "\n"
@@ -138,6 +148,8 @@ int main(int argc, char **argv)
                 "(seconds, default 10; 0 disables)\n"
                 "  --sysroot PATH          Resolve absolute guest paths under "
                 "PATH first\n"
+                "  --create-sysroot PATH   Provision and use a case-sensitive "
+                "APFS sparsebundle mounted at PATH\n"
                 "  --gdb PORT              Listen for GDB Remote Serial "
                 "Protocol on PORT\n"
                 "  --gdb-stop-on-entry     Halt before the first guest "
@@ -183,6 +195,10 @@ int main(int argc, char **argv)
                    arg_start + 1 < argc) {
             sysroot = argv[arg_start + 1];
             arg_start += 2;
+        } else if (!strcmp(argv[arg_start], "--create-sysroot") &&
+                   arg_start + 1 < argc) {
+            create_sysroot = argv[arg_start + 1];
+            arg_start += 2;
         } else if (!strcmp(argv[arg_start], "--gdb") && arg_start + 1 < argc) {
             if (parse_int_arg(argv[arg_start + 1], 1, 65535, &gdb_port) < 0) {
                 log_error("invalid GDB port: %s", argv[arg_start + 1]);
@@ -201,10 +217,16 @@ int main(int argc, char **argv)
             log_error("unknown option: %s", argv[arg_start]);
             log_error(
                 "usage: elfuse [--verbose] [--timeout N] "
-                "[--sysroot PATH] [--gdb PORT] "
+                "[--sysroot PATH] [--create-sysroot PATH] [--gdb PORT] "
                 "[--gdb-stop-on-entry] <elf-path> [args...]");
             return 1;
         }
+    }
+
+    if (sysroot && create_sysroot) {
+        log_error(
+            "use either --sysroot PATH or --create-sysroot PATH, not both");
+        return 1;
     }
 
     /* Fork-child mode: receive VM state over IPC and run */
@@ -215,7 +237,7 @@ int main(int argc, char **argv)
     if (arg_start >= argc) {
         log_error(
             "usage: elfuse [--verbose] [--timeout N] "
-            "[--sysroot PATH] <elf-path> [args...]");
+            "[--sysroot PATH] [--create-sysroot PATH] <elf-path> [args...]");
         return 1;
     }
 
@@ -223,29 +245,79 @@ int main(int argc, char **argv)
      * data lives in a contiguous stack region that elfuse clobbers below for
      * the process title (PostgreSQL/nginx argv-clobber technique).
      */
-    const char *elf_path = strdup(argv[arg_start]);
-    bool have_sysroot = (sysroot != NULL);
-    const char *sysroot_path = have_sysroot ? strdup(sysroot) : NULL;
+    char *elf_path = strdup(argv[arg_start]);
+    bool have_sysroot = (sysroot != NULL || create_sysroot != NULL);
+    const char *sysroot_src = create_sysroot ? create_sysroot : sysroot;
+    char *sysroot_path = NULL;
+    if (have_sysroot) {
+        sysroot_path = (char *) calloc(LINUX_PATH_MAX, 1);
+        if (sysroot_path) {
+            size_t src_len =
+                str_copy_trunc(sysroot_path, sysroot_src, LINUX_PATH_MAX);
+            if (src_len >= LINUX_PATH_MAX) {
+                log_error("sysroot path too long (%zu bytes, max %d): %s",
+                          src_len, LINUX_PATH_MAX - 1, sysroot_src);
+                free(elf_path);
+                free(sysroot_path);
+                return 1;
+            }
+        }
+    }
     sysroot = sysroot_path;
     int guest_argc = argc - arg_start;
     const char **guest_argv =
         (const char **) calloc((size_t) guest_argc, sizeof(char *));
     guest_t g;
     bool guest_initialized = false;
+    sysroot_mount_t sysroot_mount;
+    char host_cwd[LINUX_PATH_MAX];
+    bool have_host_cwd = (getcwd(host_cwd, sizeof(host_cwd)) != NULL);
+    memset(&sysroot_mount, 0, sizeof(sysroot_mount));
     if (!elf_path || (have_sysroot && !sysroot_path) || !guest_argv) {
         log_error("out of memory");
-        cleanup_main_resources(&g, guest_initialized, guest_argv, guest_argc,
-                               elf_path, sysroot_path);
+        cleanup_main_resources(&g, guest_initialized, &sysroot_mount,
+                               have_host_cwd ? host_cwd : NULL, guest_argv,
+                               guest_argc, elf_path, sysroot_path);
         return 1;
     }
     for (int i = 0; i < guest_argc; i++) {
         guest_argv[i] = strdup(argv[arg_start + i]);
         if (!guest_argv[i]) {
             log_error("out of memory");
-            cleanup_main_resources(&g, guest_initialized, guest_argv,
+            cleanup_main_resources(&g, guest_initialized, &sysroot_mount,
+                                   have_host_cwd ? host_cwd : NULL, guest_argv,
                                    guest_argc, elf_path, sysroot_path);
             return 1;
         }
+    }
+
+    if (create_sysroot) {
+        if (sysroot_create_mount(sysroot_path, &sysroot_mount) < 0) {
+            log_error("failed to provision case-sensitive sysroot at %s: %s",
+                      sysroot_path, strerror(errno));
+            cleanup_main_resources(&g, guest_initialized, &sysroot_mount,
+                                   have_host_cwd ? host_cwd : NULL, guest_argv,
+                                   guest_argc, elf_path, sysroot_path);
+            return 1;
+        }
+        size_t mounted_len = str_copy_trunc(
+            sysroot_path, sysroot_mount.mount_path, LINUX_PATH_MAX);
+        if (mounted_len >= LINUX_PATH_MAX) {
+            log_error("mounted sysroot path too long: %s",
+                      sysroot_mount.mount_path);
+            cleanup_main_resources(&g, guest_initialized, &sysroot_mount,
+                                   have_host_cwd ? host_cwd : NULL, guest_argv,
+                                   guest_argc, elf_path, sysroot_path);
+            return 1;
+        }
+        sysroot = sysroot_path;
+    }
+
+    if (have_sysroot && sysroot_validate_case_sensitivity(sysroot) < 0) {
+        cleanup_main_resources(&g, guest_initialized, &sysroot_mount,
+                               have_host_cwd ? host_cwd : NULL, guest_argv,
+                               guest_argc, elf_path, sysroot_path);
+        return 1;
     }
 
     guest_bootstrap_t boot;
@@ -254,9 +326,23 @@ int main(int argc, char **argv)
     if (guest_bootstrap_prepare(&g, elf_path, sysroot, guest_argc, guest_argv,
                                 environ, shim_bin, shim_bin_len, verbose,
                                 &guest_initialized, &boot) < 0) {
-        cleanup_main_resources(&g, guest_initialized, guest_argv, guest_argc,
-                               elf_path, sysroot_path);
+        cleanup_main_resources(&g, guest_initialized, &sysroot_mount,
+                               have_host_cwd ? host_cwd : NULL, guest_argv,
+                               guest_argc, elf_path, sysroot_path);
         return 1;
+    }
+
+    if (have_sysroot) {
+        bool case_sensitive = true;
+        bool case_preserving = true;
+        if (sysroot_probe_case_sensitivity(sysroot, &case_sensitive,
+                                           &case_preserving) == 0) {
+            proc_set_sysroot_casefold(case_preserving && !case_sensitive);
+        } else {
+            proc_set_sysroot_casefold(false);
+        }
+    } else {
+        proc_set_sysroot_casefold(false);
     }
 
     runtime_set_process_title(argc, argv, elf_path);
@@ -264,8 +350,9 @@ int main(int argc, char **argv)
     hv_vcpu_t vcpu;
     hv_vcpu_exit_t *vexit;
     if (guest_bootstrap_create_vcpu(&g, &boot, verbose, &vcpu, &vexit) < 0) {
-        cleanup_main_resources(&g, guest_initialized, guest_argv, guest_argc,
-                               elf_path, sysroot_path);
+        cleanup_main_resources(&g, guest_initialized, &sysroot_mount,
+                               have_host_cwd ? host_cwd : NULL, guest_argv,
+                               guest_argc, elf_path, sysroot_path);
         return 1;
     }
 
@@ -275,7 +362,8 @@ int main(int argc, char **argv)
     if (gdb_port > 0) {
         if (gdb_stub_init(gdb_port, &g) < 0) {
             log_error("failed to initialize GDB stub");
-            cleanup_main_resources(&g, guest_initialized, guest_argv,
+            cleanup_main_resources(&g, guest_initialized, &sysroot_mount,
+                                   have_host_cwd ? host_cwd : NULL, guest_argv,
                                    guest_argc, elf_path, sysroot_path);
             return 1;
         }
@@ -292,8 +380,9 @@ int main(int argc, char **argv)
 
     /* Tear down debugger state before freeing guest/vCPU resources. */
     gdb_stub_shutdown();
-    cleanup_main_resources(&g, guest_initialized, guest_argv, guest_argc,
-                           elf_path, sysroot_path);
+    cleanup_main_resources(&g, guest_initialized, &sysroot_mount,
+                           have_host_cwd ? host_cwd : NULL, guest_argv,
+                           guest_argc, elf_path, sysroot_path);
 
     return exit_code;
 }

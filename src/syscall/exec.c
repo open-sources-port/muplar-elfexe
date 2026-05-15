@@ -166,9 +166,15 @@ int64_t sys_execve(hv_vcpu_t vcpu,
         log_debug("execve resolved to \"%s\"", path);
     }
 
-    if (!host_path && path[0] == '/')
-        path_host = path_resolve_sysroot_path(path, path_host_buf,
-                                              sizeof(path_host_buf));
+    if (!host_path) {
+        path_translation_t tx;
+        if (path_translate_at(LINUX_AT_FDCWD, path, PATH_TR_NONE, &tx) < 0) {
+            err = linux_errno();
+            goto fail;
+        }
+        str_copy_trunc(path_host_buf, tx.host_path, sizeof(path_host_buf));
+        path_host = path_host_buf;
+    }
     if (!path_host) {
         err = -LINUX_ENAMETOOLONG;
         goto fail;
@@ -292,14 +298,15 @@ int64_t sys_execve(hv_vcpu_t vcpu,
 
         /* Continue the same exec transaction using the interpreter image. */
         str_copy_trunc(path, interp_start, sizeof(path));
-        path_host = path;
-        if (path[0] == '/')
-            path_host = path_resolve_sysroot_path(path, path_host_buf,
-                                                  sizeof(path_host_buf));
-        if (!path_host) {
-            err = -LINUX_ENAMETOOLONG;
+        path_translation_t interp_tx;
+        if (path_translate_at(LINUX_AT_FDCWD, path, PATH_TR_NONE, &interp_tx) <
+            0) {
+            err = linux_errno();
             goto fail;
         }
+        str_copy_trunc(path_host_buf, interp_tx.host_path,
+                       sizeof(path_host_buf));
+        path_host = path_host_buf;
 
         if (elf_load(path_host, &elf_info) < 0) {
             err = -LINUX_ENOENT;

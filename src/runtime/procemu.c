@@ -547,11 +547,16 @@ static int proc_emit_literal(const char *s)
  */
 static const char *proc_comm_name(void)
 {
-    const char *exe = proc_get_elf_path();
-    if (!exe)
+    /* Snapshot into a thread-local buffer so a concurrent execve cannot
+     * tear the shared elf_path under the basename scan. The TLS lifetime
+     * matches the calling thread, which is what callers (printf-style
+     * formatters) require.
+     */
+    static _Thread_local char exe_tls[LINUX_PATH_MAX];
+    if (!proc_elf_path_snapshot(exe_tls, sizeof(exe_tls)))
         return "elfuse";
-    const char *slash = strrchr(exe, '/');
-    return slash ? slash + 1 : exe;
+    const char *slash = strrchr(exe_tls, '/');
+    return slash ? slash + 1 : exe_tls;
 }
 
 /* Parse the numeric tail of a /proc/.../<N> or /dev/fd/<N> path.
@@ -1556,8 +1561,8 @@ int proc_intercept_open(const guest_t *g,
      * return an actual file descriptor to the binary.
      */
     if (!strcmp(path, "/proc/self/exe")) {
-        const char *exe = proc_get_elf_path();
-        if (!exe) {
+        char exe[LINUX_PATH_MAX];
+        if (!proc_elf_path_snapshot(exe, sizeof(exe))) {
             errno = ENOENT;
             return -1;
         }
@@ -2566,17 +2571,27 @@ int proc_intercept_readlink(const char *path, char *buf, size_t bufsiz)
      * abstraction the rest of the path layer presents.
      */
     if (!strcmp(path, "/proc/self/exe")) {
-        const char *exe = proc_get_elf_path();
-        if (!exe) {
+        char exe_buf[LINUX_PATH_MAX];
+        if (!proc_elf_path_snapshot(exe_buf, sizeof(exe_buf))) {
             errno = ENOENT;
             return -1;
         }
+        const char *exe = exe_buf;
+        char exe_real[LINUX_PATH_MAX];
         char sysroot_snap[LINUX_PATH_MAX];
         if (proc_sysroot_snapshot(sysroot_snap, sizeof(sysroot_snap))) {
+            /* proc_set_sysroot stores a realpath()-canonicalized form, so
+             * canonicalize exe before the prefix check or the strip fails
+             * when /var -> /private/var (and similar macOS symlinks) make
+             * the two strings diverge.
+             */
+            const char *exe_cmp = exe;
+            if (realpath(exe, exe_real))
+                exe_cmp = exe_real;
             size_t sr_len = strlen(sysroot_snap);
-            if (sr_len > 0 && strncmp(exe, sysroot_snap, sr_len) == 0 &&
-                (exe[sr_len] == '/' || exe[sr_len] == '\0')) {
-                exe += sr_len;
+            if (sr_len > 0 && !strncmp(exe_cmp, sysroot_snap, sr_len) &&
+                (exe_cmp[sr_len] == '/' || exe_cmp[sr_len] == '\0')) {
+                exe = exe_cmp + sr_len;
                 if (*exe == '\0')
                     exe = "/";
             }

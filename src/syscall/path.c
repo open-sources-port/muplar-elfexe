@@ -19,6 +19,7 @@
 #include "syscall/abi.h"
 #include "syscall/path.h"
 #include "syscall/proc.h"
+#include "syscall/sidecar.h"
 
 #ifndef MAXSYMLINKS
 #define MAXSYMLINKS 40
@@ -123,6 +124,108 @@ int path_check_intercept_access(const struct stat *st, int mode, int flags)
     return -1;
 }
 
+int path_translate_at(guest_fd_t dirfd,
+                      const char *path,
+                      unsigned int flags,
+                      path_translation_t *tx)
+{
+    if (!tx) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    memset(tx, 0, sizeof(*tx));
+    tx->guest_path = path;
+    tx->intercept_path = path;
+    tx->host_path = path;
+
+    if (!path)
+        return 0;
+
+    tx->proc_resolved =
+        resolve_proc_at_path(dirfd, path, tx->proc_path, sizeof(tx->proc_path));
+    if (tx->proc_resolved < 0)
+        return -1;
+    if (tx->proc_resolved > 0) {
+        tx->guest_path = tx->proc_path;
+        tx->intercept_path = tx->proc_path;
+    }
+
+    errno = 0;
+    if ((flags & PATH_TR_CREATE) && sidecar_active() &&
+        sidecar_path_targets_reserved_name(tx->guest_path)) {
+        errno = ENOENT;
+        return -1;
+    }
+
+    if (flags & PATH_TR_CREATE) {
+        tx->host_path = path_resolve_sysroot_create_path(
+            tx->guest_path, tx->host_buf, sizeof(tx->host_buf),
+            (flags & PATH_TR_CREATE_PARENTS) != 0);
+    } else if (flags & PATH_TR_NOFOLLOW) {
+        tx->host_path = path_resolve_sysroot_nofollow_path(
+            tx->guest_path, tx->host_buf, sizeof(tx->host_buf));
+    } else {
+        tx->host_path = path_resolve_sysroot_path(tx->guest_path, tx->host_buf,
+                                                  sizeof(tx->host_buf));
+    }
+
+    /* Sidecar only runs after sysroot resolution succeeds. If the resolver
+     * rejected the path (e.g. nofollow containment violation), sidecar must not
+     * be allowed to walk an alternate index and resurrect the rejected target.
+     */
+    if (tx->host_path && !(flags & PATH_TR_CREATE)) {
+        int sidecar_rc = sidecar_translate_lookup_at(
+            dirfd, tx->guest_path, tx->host_buf, sizeof(tx->host_buf));
+        if (sidecar_rc < 0)
+            return -1;
+        if (sidecar_rc > 0)
+            tx->host_path = tx->host_buf;
+    }
+
+    if (!tx->host_path) {
+        /* Resolvers set errno on every failure path; only synthesize one if a
+         * future caller forgets, so the error class survives instead of being
+         * flattened to ENAMETOOLONG.
+         */
+        if (errno == 0)
+            errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    return 0;
+}
+
+int path_translate_dirent_name(guest_fd_t dirfd,
+                               const char *host_name,
+                               char *guest_name,
+                               size_t guest_name_sz)
+{
+    if (!host_name || !guest_name || guest_name_sz == 0) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    guest_name[0] = '\0';
+    int sidecar_rc = sidecar_translate_dirent_name(dirfd, host_name, guest_name,
+                                                   guest_name_sz);
+    if (sidecar_rc < 0)
+        return sidecar_rc;
+    if (sidecar_rc > 0)
+        return sidecar_rc;
+    if (guest_name[0] != '\0')
+        return 0;
+
+    size_t len = strlen(host_name);
+    if (len + 1 > guest_name_sz) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    memcpy(guest_name, host_name, len + 1);
+    return 0;
+}
+
 static bool path_next_component(const char **pathp,
                                 const char **comp,
                                 size_t *len)
@@ -163,9 +266,10 @@ const char *path_resolve_sysroot_nofollow_path(const char *path,
 
 const char *path_resolve_sysroot_create_path(const char *path,
                                              char *buf,
-                                             size_t bufsz)
+                                             size_t bufsz,
+                                             bool create_parents)
 {
-    return proc_resolve_sysroot_create_path(path, buf, bufsz);
+    return proc_resolve_sysroot_create_path(path, buf, bufsz, create_parents);
 }
 
 int sys_path_has_symlink(guest_fd_t dirfd, const char *path)

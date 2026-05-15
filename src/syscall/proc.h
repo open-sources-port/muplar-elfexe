@@ -62,8 +62,17 @@ unsigned int proc_get_shim_size(void);
  */
 void proc_set_elf_path(const char *path);
 
-/* Get the stored ELF binary path. Returns NULL if not set. */
+/* Get the stored ELF binary path. Returns NULL if not set. The returned
+ * pointer references shared mutable state and is safe only for boolean
+ * tests; callers that consume the string must use proc_elf_path_snapshot.
+ */
 const char *proc_get_elf_path(void);
+
+/* Copy the stored ELF binary path into out. Returns true on success, false
+ * if no path is set or outsz is too small. Locked against concurrent
+ * proc_set_elf_path() so the returned content is consistent.
+ */
+bool proc_elf_path_snapshot(char *out, size_t outsz);
 
 /* Store the absolute path of the elfuse binary itself.  Used to spawn
  * fork/clone children.  Set once at startup via _NSGetExecutablePath().
@@ -204,6 +213,8 @@ const char *proc_get_sysroot(void);
  * case out[0] is set to '\0' when possible).
  */
 bool proc_sysroot_snapshot(char *out, size_t outsz);
+void proc_set_sysroot_casefold(bool enabled);
+bool proc_sysroot_casefold_enabled(void);
 
 /* Resolve an absolute guest path through the stored sysroot. Returns path
  * unchanged when no sysroot applies or when the sysroot-backed path does not
@@ -228,7 +239,8 @@ const char *proc_resolve_sysroot_nofollow_path(const char *path,
  */
 const char *proc_resolve_sysroot_create_path(const char *path,
                                              char *buf,
-                                             size_t bufsz);
+                                             size_t bufsz,
+                                             bool create_parents);
 
 /* execve. */
 
