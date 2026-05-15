@@ -32,6 +32,7 @@
 #include "syscall/net.h" /* absock_unregister_fd */
 #include "syscall/path.h"
 #include "syscall/proc.h"
+#include "syscall/sidecar.h"
 
 /* Linux dirent64 layout. */
 typedef struct {
@@ -208,6 +209,20 @@ static int fd_alloc_opened_host(int host_fd,
     return guest_fd;
 }
 
+static int64_t read_translated_path(guest_t *g,
+                                    int dirfd,
+                                    uint64_t path_gva,
+                                    unsigned int tx_flags,
+                                    char path[LINUX_PATH_MAX],
+                                    path_translation_t *tx)
+{
+    if (guest_read_str(g, path_gva, path, LINUX_PATH_MAX) < 0)
+        return -LINUX_EFAULT;
+    if (path_translate_at(dirfd, path, tx_flags, tx) < 0)
+        return linux_errno();
+    return 0;
+}
+
 /* open/close. */
 
 int64_t sys_openat_path(guest_t *g,
@@ -216,20 +231,37 @@ int64_t sys_openat_path(guest_t *g,
                         int linux_flags,
                         int mode)
 {
-    char proc_path[LINUX_PATH_MAX];
-    const char *guest_path = pathp;
-    const char *intercept_path = pathp;
-    int proc_resolved =
-        resolve_proc_at_path(dirfd, pathp, proc_path, sizeof(proc_path));
-    if (proc_resolved < 0)
-        return -LINUX_ENAMETOOLONG;
-    if (proc_resolved > 0) {
-        guest_path = proc_path;
-        intercept_path = proc_path;
+    if (linux_flags & LINUX_O_CREAT) {
+        int sidecar_fd =
+            sidecar_openat(dirfd, pathp, linux_flags, (mode_t) mode);
+        if (sidecar_fd != (int) SIDECAR_NOT_HANDLED) {
+            if (sidecar_fd < 0)
+                return linux_errno();
+            int type = opened_fd_type(sidecar_fd, linux_flags);
+            if (type < 0) {
+                close_keep_errno(sidecar_fd);
+                return linux_errno();
+            }
+            int guest_fd =
+                fd_alloc_opened_host(sidecar_fd, type, linux_flags, -1);
+            if (guest_fd < 0) {
+                close_keep_errno(sidecar_fd);
+                return linux_errno();
+            }
+            return guest_fd;
+        }
     }
 
+    path_translation_t tx;
+    unsigned int tx_flags =
+        (linux_flags & LINUX_O_NOFOLLOW) ? PATH_TR_NOFOLLOW : PATH_TR_NONE;
+    if (linux_flags & LINUX_O_CREAT)
+        tx_flags = PATH_TR_CREATE | PATH_TR_CREATE_PARENTS;
+    if (path_translate_at(dirfd, pathp, tx_flags, &tx) < 0)
+        return linux_errno();
+
     int flags = translate_open_flags(linux_flags);
-    if (proc_resolved == 0 && dirfd == LINUX_AT_FDCWD && pathp[0] != '/' &&
+    if (tx.proc_resolved == 0 && dirfd == LINUX_AT_FDCWD && pathp[0] != '/' &&
         !proc_get_sysroot()) {
         int host_fd = openat(AT_FDCWD, pathp, flags, mode);
         if (host_fd < 0)
@@ -249,9 +281,9 @@ int64_t sys_openat_path(guest_t *g,
     }
 
     /* Intercept /proc and /dev paths before touching the host filesystem */
-    if (path_might_use_open_intercept(intercept_path)) {
+    if (path_might_use_open_intercept(tx.intercept_path)) {
         int intercepted =
-            proc_intercept_open(g, intercept_path, linux_flags, mode);
+            proc_intercept_open(g, tx.intercept_path, linux_flags, mode);
         if (intercepted >= 0) {
             /* Got a host fd from the intercept. Device nodes (/dev/...) use
              * fd_alloc() for POSIX lowest-fd semantics because busybox sh
@@ -265,14 +297,14 @@ int64_t sys_openat_path(guest_t *g,
                 return linux_errno();
             }
             int min_guest_fd =
-                (!strncmp(intercept_path, "/dev/", 5)) ? -1 : 128;
+                (!strncmp(tx.intercept_path, "/dev/", 5)) ? -1 : 128;
             int guest_fd = fd_alloc_opened_host(intercepted, type, linux_flags,
                                                 min_guest_fd);
             if (guest_fd < 0) {
                 close_keep_errno(intercepted);
                 return linux_errno();
             }
-            fd_note_proc_path(guest_fd, intercept_path);
+            fd_note_proc_path(guest_fd, tx.intercept_path);
             return guest_fd;
         }
         if (intercepted == -1) {
@@ -282,18 +314,8 @@ int64_t sys_openat_path(guest_t *g,
         /* intercepted == PROC_NOT_INTERCEPTED: fall through to real openat */
     }
 
-    char sysroot_buf[LINUX_PATH_MAX];
-    const char *open_path =
-        (linux_flags & LINUX_O_NOFOLLOW)
-            ? path_resolve_sysroot_nofollow_path(guest_path, sysroot_buf,
-                                                 sizeof(sysroot_buf))
-            : path_resolve_sysroot_path(guest_path, sysroot_buf,
-                                        sizeof(sysroot_buf));
-    if (!open_path)
-        return -LINUX_ENAMETOOLONG;
-
     if (dirfd == LINUX_AT_FDCWD) {
-        int host_fd = open(open_path, flags, mode);
+        int host_fd = open(tx.host_path, flags, mode);
         if (host_fd < 0)
             return linux_errno();
 
@@ -314,7 +336,7 @@ int64_t sys_openat_path(guest_t *g,
     if (host_dirfd_ref_open(dirfd, &dir_ref) < 0)
         return -LINUX_EBADF;
 
-    int host_fd = openat(dir_ref.fd, open_path, flags, mode);
+    int host_fd = openat(dir_ref.fd, tx.host_path, flags, mode);
     host_fd_ref_close(&dir_ref);
     if (host_fd < 0)
         return linux_errno();
@@ -748,7 +770,15 @@ int64_t sys_getdents64(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
         if (!de)
             break;
 
-        size_t name_len = strlen(de->d_name);
+        char guest_name[NAME_MAX + 1];
+        int name_rc = path_translate_dirent_name(fd, de->d_name, guest_name,
+                                                 sizeof(guest_name));
+        if (name_rc > 0)
+            continue;
+        if (name_rc < 0)
+            return guest_pos > 0 ? (int64_t) guest_pos : linux_errno();
+
+        size_t name_len = strlen(guest_name);
         /* Linux dirent64: 19-byte header + name + null, padded to 8 */
         size_t reclen = (19 + name_len + 1 + 7) & ~7ULL;
 
@@ -768,7 +798,7 @@ int64_t sys_getdents64(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
          * guest_write() which handles 2MiB block boundary crossings.
          */
         memcpy(entry_buf, &lde, sizeof(lde));
-        memcpy(entry_buf + 19, de->d_name, name_len + 1);
+        memcpy(entry_buf + 19, guest_name, name_len + 1);
         size_t pad_start = 19 + name_len + 1;
         if (pad_start < reclen)
             memset(entry_buf + pad_start, 0, reclen - pad_start);
@@ -784,29 +814,25 @@ int64_t sys_getdents64(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
 
 int64_t sys_chdir(guest_t *g, uint64_t path_gva)
 {
-    char path[LINUX_PATH_MAX], proc_path[LINUX_PATH_MAX];
-    if (guest_read_str(g, path_gva, path, sizeof(path)) < 0)
-        return -LINUX_EFAULT;
+    char path[LINUX_PATH_MAX];
+    path_translation_t tx;
+    int64_t rc = read_translated_path(g, LINUX_AT_FDCWD, path_gva, PATH_TR_NONE,
+                                      path, &tx);
+    if (rc < 0)
+        return rc;
 
     char proc_virt[64];
-    const char *chdir_path = path;
-    int proc_resolved = resolve_proc_at_path(LINUX_AT_FDCWD, path, proc_path,
-                                             sizeof(proc_path));
-    if (proc_resolved < 0)
-        return -LINUX_ENAMETOOLONG;
-    if (proc_resolved > 0)
-        chdir_path = proc_path;
-
     const char *virt =
-        proc_virtual_dir_path(chdir_path, proc_virt, sizeof(proc_virt));
+        proc_virtual_dir_path(tx.guest_path, proc_virt, sizeof(proc_virt));
     if (virt) {
-        int host_fd = proc_intercept_open(g, chdir_path, LINUX_O_DIRECTORY, 0);
+        int host_fd =
+            proc_intercept_open(g, tx.intercept_path, LINUX_O_DIRECTORY, 0);
         if (host_fd < 0)
             return linux_errno();
-        int rc = fchdir(host_fd);
+        int chdir_rc = fchdir(host_fd);
         int saved_errno = errno;
         close_keep_errno(host_fd);
-        if (rc < 0) {
+        if (chdir_rc < 0) {
             errno = saved_errno;
             return linux_errno();
         }
@@ -814,12 +840,7 @@ int64_t sys_chdir(guest_t *g, uint64_t path_gva)
         return 0;
     }
 
-    char sysroot_buf[LINUX_PATH_MAX];
-    const char *target =
-        path_resolve_sysroot_path(chdir_path, sysroot_buf, sizeof(sysroot_buf));
-    if (!target)
-        return -LINUX_ENAMETOOLONG;
-    if (chdir(target) < 0)
+    if (chdir(tx.host_path) < 0)
         return linux_errno();
 
     if (proc_cwd_refresh() < 0)
@@ -941,21 +962,16 @@ int64_t sys_readlinkat(guest_t *g,
                        uint64_t bufsiz)
 {
     char path[LINUX_PATH_MAX];
-    if (guest_read_str(g, path_gva, path, sizeof(path)) < 0)
-        return -LINUX_EFAULT;
-    char proc_path[LINUX_PATH_MAX];
-    const char *intercept_path = path;
-    int proc_resolved =
-        resolve_proc_at_path(dirfd, path, proc_path, sizeof(proc_path));
-    if (proc_resolved < 0)
-        return -LINUX_ENAMETOOLONG;
-    if (proc_resolved > 0)
-        intercept_path = proc_path;
+    path_translation_t tx;
+    int64_t rc =
+        read_translated_path(g, dirfd, path_gva, PATH_TR_NOFOLLOW, path, &tx);
+    if (rc < 0)
+        return rc;
 
     /* Intercept /proc paths (e.g. /proc/self/exe, /proc/self/fd/N) */
     char link[LINUX_PATH_MAX];
     int intercepted =
-        proc_intercept_readlink(intercept_path, link, sizeof(link));
+        proc_intercept_readlink(tx.intercept_path, link, sizeof(link));
     if (intercepted >= 0) {
         size_t copy_len =
             (size_t) intercepted < bufsiz ? (size_t) intercepted : bufsiz;
@@ -973,14 +989,7 @@ int64_t sys_readlinkat(guest_t *g,
         return -LINUX_EBADF;
 
     /* Apply sysroot redirect for absolute paths */
-    char sysroot_buf[LINUX_PATH_MAX];
-    const char *read_path = path_resolve_sysroot_nofollow_path(
-        path, sysroot_buf, sizeof(sysroot_buf));
-    if (!read_path) {
-        host_fd_ref_close(&dir_ref);
-        return -LINUX_ENAMETOOLONG;
-    }
-    ssize_t len = readlinkat(dir_ref.fd, read_path, link, sizeof(link) - 1);
+    ssize_t len = readlinkat(dir_ref.fd, tx.host_path, link, sizeof(link) - 1);
     host_fd_ref_close(&dir_ref);
     if (len < 0)
         return linux_errno();
@@ -995,19 +1004,21 @@ int64_t sys_readlinkat(guest_t *g,
 int64_t sys_unlinkat(guest_t *g, int dirfd, uint64_t path_gva, int flags)
 {
     char path[LINUX_PATH_MAX];
-    char proc_path[LINUX_PATH_MAX];
-    const char *unlink_guest_path = path;
     if (guest_read_str(g, path_gva, path, sizeof(path)) < 0)
         return -LINUX_EFAULT;
-    int proc_resolved =
-        resolve_proc_at_path(dirfd, path, proc_path, sizeof(proc_path));
-    if (proc_resolved < 0)
-        return -LINUX_ENAMETOOLONG;
-    if (proc_resolved > 0)
-        unlink_guest_path = proc_path;
 
     if (!validate_at_flags(flags, LINUX_AT_REMOVEDIR))
         return -LINUX_EINVAL;
+
+    int64_t sidecar_rc = sidecar_unlinkat(dirfd, path, flags);
+    if (sidecar_rc != SIDECAR_NOT_HANDLED)
+        return sidecar_rc;
+
+    path_translation_t tx;
+    int64_t rc =
+        read_translated_path(g, dirfd, path_gva, PATH_TR_CREATE, path, &tx);
+    if (rc < 0)
+        return rc;
 
     host_fd_ref_t dir_ref;
     if (host_dirfd_ref_open(dirfd, &dir_ref) < 0)
@@ -1016,8 +1027,8 @@ int64_t sys_unlinkat(guest_t *g, int dirfd, uint64_t path_gva, int flags)
     /* Rewrite /dev/shm/<name> to the host temp directory so shm_unlink works */
     const char *unlink_path;
     char shm_host[LINUX_PATH_MAX];
-    if (!strncmp(unlink_guest_path, "/dev/shm/", 9)) {
-        if (proc_dev_shm_resolve(unlink_guest_path + 9, shm_host,
+    if (!strncmp(tx.guest_path, "/dev/shm/", 9)) {
+        if (proc_dev_shm_resolve(tx.guest_path + 9, shm_host,
                                  sizeof(shm_host)) < 0) {
             host_fd_ref_close(&dir_ref);
             return linux_errno();
@@ -1027,14 +1038,7 @@ int64_t sys_unlinkat(guest_t *g, int dirfd, uint64_t path_gva, int flags)
         dir_ref.fd = AT_FDCWD;
         dir_ref.owned = 0;
     } else {
-        char sysroot_buf[LINUX_PATH_MAX];
-        const char *resolved = path_resolve_sysroot_create_path(
-            unlink_guest_path, sysroot_buf, sizeof(sysroot_buf));
-        if (!resolved) {
-            host_fd_ref_close(&dir_ref);
-            return -LINUX_ENAMETOOLONG;
-        }
-        unlink_path = resolved;
+        unlink_path = tx.host_path;
     }
 
     int host_flags = translate_at_flags(flags);
@@ -1050,30 +1054,24 @@ int64_t sys_unlinkat(guest_t *g, int dirfd, uint64_t path_gva, int flags)
 int64_t sys_mkdirat(guest_t *g, int dirfd, uint64_t path_gva, int mode)
 {
     char path[LINUX_PATH_MAX];
-    char proc_path[LINUX_PATH_MAX];
-    const char *mkdir_path = path;
     if (guest_read_str(g, path_gva, path, sizeof(path)) < 0)
         return -LINUX_EFAULT;
-    int proc_resolved =
-        resolve_proc_at_path(dirfd, path, proc_path, sizeof(proc_path));
-    if (proc_resolved < 0)
-        return -LINUX_ENAMETOOLONG;
-    if (proc_resolved > 0)
-        mkdir_path = proc_path;
+
+    int64_t sidecar_rc = sidecar_mkdirat(dirfd, path, (mode_t) mode);
+    if (sidecar_rc != SIDECAR_NOT_HANDLED)
+        return sidecar_rc;
+
+    path_translation_t tx;
+    int64_t rc = read_translated_path(
+        g, dirfd, path_gva, PATH_TR_CREATE | PATH_TR_CREATE_PARENTS, path, &tx);
+    if (rc < 0)
+        return rc;
 
     host_fd_ref_t dir_ref;
     if (host_dirfd_ref_open(dirfd, &dir_ref) < 0)
         return -LINUX_EBADF;
 
-    char sysroot_buf[LINUX_PATH_MAX];
-    const char *resolved = path_resolve_sysroot_create_path(
-        mkdir_path, sysroot_buf, sizeof(sysroot_buf));
-    if (!resolved) {
-        host_fd_ref_close(&dir_ref);
-        return -LINUX_ENAMETOOLONG;
-    }
-
-    if (mkdirat(dir_ref.fd, resolved, (mode_t) mode) < 0) {
+    if (mkdirat(dir_ref.fd, tx.host_path, (mode_t) mode) < 0) {
         host_fd_ref_close(&dir_ref);
         return linux_errno();
     }
@@ -1103,25 +1101,24 @@ int64_t sys_renameat2(guest_t *g,
                       int flags)
 {
     char oldpath[LINUX_PATH_MAX], newpath[LINUX_PATH_MAX];
-    char old_proc_path[LINUX_PATH_MAX], new_proc_path[LINUX_PATH_MAX];
-    const char *old_guest_path = oldpath;
-    const char *new_guest_path = newpath;
-    if (guest_read_str(g, oldpath_gva, oldpath, sizeof(oldpath)) < 0)
+    path_translation_t old_tx, new_tx;
+    if (guest_read_str(g, oldpath_gva, oldpath, sizeof(oldpath)) < 0 ||
+        guest_read_str(g, newpath_gva, newpath, sizeof(newpath)) < 0)
         return -LINUX_EFAULT;
-    if (guest_read_str(g, newpath_gva, newpath, sizeof(newpath)) < 0)
-        return -LINUX_EFAULT;
-    int old_proc_resolved = resolve_proc_at_path(
-        olddirfd, oldpath, old_proc_path, sizeof(old_proc_path));
-    if (old_proc_resolved < 0)
-        return -LINUX_ENAMETOOLONG;
-    if (old_proc_resolved > 0)
-        old_guest_path = old_proc_path;
-    int new_proc_resolved = resolve_proc_at_path(
-        newdirfd, newpath, new_proc_path, sizeof(new_proc_path));
-    if (new_proc_resolved < 0)
-        return -LINUX_ENAMETOOLONG;
-    if (new_proc_resolved > 0)
-        new_guest_path = new_proc_path;
+
+    if ((flags & ~(LINUX_RENAME_NOREPLACE | LINUX_RENAME_EXCHANGE)) ||
+        ((flags & LINUX_RENAME_NOREPLACE) && (flags & LINUX_RENAME_EXCHANGE))) {
+        return -LINUX_EINVAL;
+    }
+
+    int64_t sidecar_rc =
+        sidecar_renameat(olddirfd, oldpath, newdirfd, newpath, flags);
+    if (sidecar_rc != SIDECAR_NOT_HANDLED)
+        return sidecar_rc;
+
+    if (path_translate_at(olddirfd, oldpath, PATH_TR_NONE, &old_tx) < 0 ||
+        path_translate_at(newdirfd, newpath, PATH_TR_CREATE, &new_tx) < 0)
+        return linux_errno();
 
     host_fd_ref_t olddir_ref, newdir_ref;
     if (host_dirfd_ref_open(olddirfd, &olddir_ref) < 0)
@@ -1131,29 +1128,15 @@ int64_t sys_renameat2(guest_t *g,
         return -LINUX_EBADF;
     }
 
-    if ((flags & ~(LINUX_RENAME_NOREPLACE | LINUX_RENAME_EXCHANGE)) ||
-        ((flags & LINUX_RENAME_NOREPLACE) && (flags & LINUX_RENAME_EXCHANGE))) {
-        return close_dir_refs_result(&olddir_ref, &newdir_ref, -LINUX_EINVAL);
-    }
-
     /* Apply sysroot resolution for absolute paths */
-    char old_sysroot[LINUX_PATH_MAX], new_sysroot[LINUX_PATH_MAX];
-    const char *old_resolved = path_resolve_sysroot_path(
-        old_guest_path, old_sysroot, sizeof(old_sysroot));
-    const char *new_resolved = path_resolve_sysroot_create_path(
-        new_guest_path, new_sysroot, sizeof(new_sysroot));
-    if (!old_resolved || !new_resolved) {
-        return close_dir_refs_result(&olddir_ref, &newdir_ref,
-                                     -LINUX_ENAMETOOLONG);
-    }
-
     /* RENAME_NOREPLACE: fail if destination exists. macOS renamex_np
      * supports RENAME_EXCL for the same semantics. Only supported for
      * AT_FDCWD paths (renamex_np does not take dirfd arguments).
      */
     if (flags & LINUX_RENAME_NOREPLACE) {
         if (olddirfd == LINUX_AT_FDCWD && newdirfd == LINUX_AT_FDCWD) {
-            if (renamex_np(old_resolved, new_resolved, RENAME_EXCL) < 0) {
+            if (renamex_np(old_tx.host_path, new_tx.host_path, RENAME_EXCL) <
+                0) {
                 return close_dir_refs_result(&olddir_ref, &newdir_ref,
                                              linux_errno());
             }
@@ -1164,14 +1147,14 @@ int64_t sys_renameat2(guest_t *g,
          * requirement. This path still cannot handle directories because
          * hardlinking directories is not allowed.
          */
-        if (linkat(olddir_ref.fd, old_resolved, newdir_ref.fd, new_resolved,
-                   0) < 0) {
+        if (linkat(olddir_ref.fd, old_tx.host_path, newdir_ref.fd,
+                   new_tx.host_path, 0) < 0) {
             return close_dir_refs_result(&olddir_ref, &newdir_ref,
                                          linux_errno());
         }
-        if (unlinkat(olddir_ref.fd, old_resolved, 0) < 0) {
+        if (unlinkat(olddir_ref.fd, old_tx.host_path, 0) < 0) {
             int err = errno;
-            (void) unlinkat(newdir_ref.fd, new_resolved, 0);
+            (void) unlinkat(newdir_ref.fd, new_tx.host_path, 0);
             errno = err;
             return close_dir_refs_result(&olddir_ref, &newdir_ref,
                                          linux_errno());
@@ -1183,7 +1166,8 @@ int64_t sys_renameat2(guest_t *g,
      */
     if (flags & LINUX_RENAME_EXCHANGE) {
         if (olddirfd == LINUX_AT_FDCWD && newdirfd == LINUX_AT_FDCWD) {
-            if (renamex_np(old_resolved, new_resolved, RENAME_SWAP) < 0) {
+            if (renamex_np(old_tx.host_path, new_tx.host_path, RENAME_SWAP) <
+                0) {
                 return close_dir_refs_result(&olddir_ref, &newdir_ref,
                                              linux_errno());
             }
@@ -1195,15 +1179,15 @@ int64_t sys_renameat2(guest_t *g,
     }
 
     if (olddirfd == LINUX_AT_FDCWD && newdirfd == LINUX_AT_FDCWD) {
-        if (rename(old_resolved, new_resolved) < 0) {
+        if (rename(old_tx.host_path, new_tx.host_path) < 0) {
             return close_dir_refs_result(&olddir_ref, &newdir_ref,
                                          linux_errno());
         }
         return close_dir_refs_result(&olddir_ref, &newdir_ref, 0);
     }
 
-    if (renameat(olddir_ref.fd, old_resolved, newdir_ref.fd, new_resolved) <
-        0) {
+    if (renameat(olddir_ref.fd, old_tx.host_path, newdir_ref.fd,
+                 new_tx.host_path) < 0) {
         return close_dir_refs_result(&olddir_ref, &newdir_ref, linux_errno());
     }
     return close_dir_refs_result(&olddir_ref, &newdir_ref, 0);
@@ -1213,32 +1197,19 @@ int64_t sys_mknodat(guest_t *g, int dirfd, uint64_t path_gva, int mode, int dev)
 {
     (void) dev;
     char path[LINUX_PATH_MAX];
-    char proc_path[LINUX_PATH_MAX];
-    const char *node_path = path;
-    if (guest_read_str(g, path_gva, path, sizeof(path)) < 0)
-        return -LINUX_EFAULT;
-    int proc_resolved =
-        resolve_proc_at_path(dirfd, path, proc_path, sizeof(proc_path));
-    if (proc_resolved < 0)
-        return -LINUX_ENAMETOOLONG;
-    if (proc_resolved > 0)
-        node_path = proc_path;
+    path_translation_t tx;
+    int64_t rc = read_translated_path(
+        g, dirfd, path_gva, PATH_TR_CREATE | PATH_TR_CREATE_PARENTS, path, &tx);
+    if (rc < 0)
+        return rc;
 
     host_fd_ref_t dir_ref;
     if (host_dirfd_ref_open(dirfd, &dir_ref) < 0)
         return -LINUX_EBADF;
 
-    char sysroot_buf[LINUX_PATH_MAX];
-    const char *target = path_resolve_sysroot_create_path(
-        node_path, sysroot_buf, sizeof(sysroot_buf));
-    if (!target) {
-        host_fd_ref_close(&dir_ref);
-        return -LINUX_ENAMETOOLONG;
-    }
-
     /* Only support FIFO creation; other node types need root */
     if (S_ISFIFO(mode)) {
-        if (mkfifoat(dir_ref.fd, target, mode & 0777) < 0) {
+        if (mkfifoat(dir_ref.fd, tx.host_path, mode & 0777) < 0) {
             host_fd_ref_close(&dir_ref);
             return linux_errno();
         }
@@ -1248,7 +1219,7 @@ int64_t sys_mknodat(guest_t *g, int dirfd, uint64_t path_gva, int mode, int dev)
 
     /* Regular files: create an empty file */
     if (S_ISREG(mode) || (mode & S_IFMT) == 0) {
-        int fd = openat(dir_ref.fd, target, O_CREAT | O_WRONLY | O_EXCL,
+        int fd = openat(dir_ref.fd, tx.host_path, O_CREAT | O_WRONLY | O_EXCL,
                         mode & 0777);
         host_fd_ref_close(&dir_ref);
         if (fd < 0)
@@ -1267,33 +1238,21 @@ int64_t sys_symlinkat(guest_t *g,
                       uint64_t linkpath_gva)
 {
     char target[LINUX_PATH_MAX], linkpath[LINUX_PATH_MAX];
-    char proc_path[LINUX_PATH_MAX];
-    const char *link_guest_path = linkpath;
     if (guest_read_str(g, target_gva, target, sizeof(target)) < 0)
         return -LINUX_EFAULT;
-    if (guest_read_str(g, linkpath_gva, linkpath, sizeof(linkpath)) < 0)
-        return -LINUX_EFAULT;
-    int proc_resolved =
-        resolve_proc_at_path(dirfd, linkpath, proc_path, sizeof(proc_path));
-    if (proc_resolved < 0)
-        return -LINUX_ENAMETOOLONG;
-    if (proc_resolved > 0)
-        link_guest_path = proc_path;
+    path_translation_t tx;
+    int64_t rc = read_translated_path(g, dirfd, linkpath_gva,
+                                      PATH_TR_CREATE | PATH_TR_CREATE_PARENTS,
+                                      linkpath, &tx);
+    if (rc < 0)
+        return rc;
 
     host_fd_ref_t dir_ref;
     if (host_dirfd_ref_open(dirfd, &dir_ref) < 0)
         return -LINUX_EBADF;
 
     /* Resolve linkpath (the new symlink location) through sysroot */
-    char sysroot_buf[LINUX_PATH_MAX];
-    const char *resolved = path_resolve_sysroot_create_path(
-        link_guest_path, sysroot_buf, sizeof(sysroot_buf));
-    if (!resolved) {
-        host_fd_ref_close(&dir_ref);
-        return -LINUX_ENAMETOOLONG;
-    }
-
-    if (symlinkat(target, dir_ref.fd, resolved) < 0) {
+    if (symlinkat(target, dir_ref.fd, tx.host_path) < 0) {
         host_fd_ref_close(&dir_ref);
         return linux_errno();
     }
@@ -1310,28 +1269,22 @@ int64_t sys_linkat(guest_t *g,
                    int flags)
 {
     char oldpath[LINUX_PATH_MAX], newpath[LINUX_PATH_MAX];
-    char old_proc_path[LINUX_PATH_MAX], new_proc_path[LINUX_PATH_MAX];
-    const char *old_guest_path = oldpath;
-    const char *new_guest_path = newpath;
-    if (guest_read_str(g, oldpath_gva, oldpath, sizeof(oldpath)) < 0)
+    path_translation_t old_tx, new_tx;
+    if (guest_read_str(g, oldpath_gva, oldpath, sizeof(oldpath)) < 0 ||
+        guest_read_str(g, newpath_gva, newpath, sizeof(newpath)) < 0)
         return -LINUX_EFAULT;
-    if (guest_read_str(g, newpath_gva, newpath, sizeof(newpath)) < 0)
-        return -LINUX_EFAULT;
-    int old_proc_resolved = resolve_proc_at_path(
-        olddirfd, oldpath, old_proc_path, sizeof(old_proc_path));
-    if (old_proc_resolved < 0)
-        return -LINUX_ENAMETOOLONG;
-    if (old_proc_resolved > 0)
-        old_guest_path = old_proc_path;
-    int new_proc_resolved = resolve_proc_at_path(
-        newdirfd, newpath, new_proc_path, sizeof(new_proc_path));
-    if (new_proc_resolved < 0)
-        return -LINUX_ENAMETOOLONG;
-    if (new_proc_resolved > 0)
-        new_guest_path = new_proc_path;
 
     if (!validate_at_flags(flags, LINUX_AT_SYMLINK_FOLLOW))
         return -LINUX_EINVAL;
+
+    int64_t sidecar_rc =
+        sidecar_linkat(olddirfd, oldpath, newdirfd, newpath, flags);
+    if (sidecar_rc != SIDECAR_NOT_HANDLED)
+        return sidecar_rc;
+
+    if (path_translate_at(olddirfd, oldpath, PATH_TR_NONE, &old_tx) < 0 ||
+        path_translate_at(newdirfd, newpath, PATH_TR_CREATE, &new_tx) < 0)
+        return linux_errno();
 
     host_fd_ref_t olddir_ref, newdir_ref;
     if (host_dirfd_ref_open(olddirfd, &olddir_ref) < 0)
@@ -1342,19 +1295,8 @@ int64_t sys_linkat(guest_t *g,
     }
 
     /* Resolve both paths through sysroot */
-    char old_sr[LINUX_PATH_MAX], new_sr[LINUX_PATH_MAX];
-    const char *old_resolved =
-        path_resolve_sysroot_path(old_guest_path, old_sr, sizeof(old_sr));
-    const char *new_resolved = path_resolve_sysroot_create_path(
-        new_guest_path, new_sr, sizeof(new_sr));
-    if (!old_resolved || !new_resolved) {
-        host_fd_ref_close(&olddir_ref);
-        host_fd_ref_close(&newdir_ref);
-        return -LINUX_ENAMETOOLONG;
-    }
-
     int mac_flags = translate_at_flags(flags);
-    if (linkat(olddir_ref.fd, old_resolved, newdir_ref.fd, new_resolved,
+    if (linkat(olddir_ref.fd, old_tx.host_path, newdir_ref.fd, new_tx.host_path,
                mac_flags) < 0) {
         host_fd_ref_close(&olddir_ref);
         host_fd_ref_close(&newdir_ref);
@@ -1384,21 +1326,18 @@ int64_t sys_faccessat(guest_t *g,
     }
 
     char path[LINUX_PATH_MAX];
-    char proc_path[LINUX_PATH_MAX];
-    const char *access_path = path;
-    if (guest_read_str(g, path_gva, path, sizeof(path)) < 0)
-        return -LINUX_EFAULT;
-    int proc_resolved =
-        resolve_proc_at_path(dirfd, path, proc_path, sizeof(proc_path));
-    if (proc_resolved < 0)
-        return -LINUX_ENAMETOOLONG;
-    if (proc_resolved > 0)
-        access_path = proc_path;
+    path_translation_t tx;
+    int64_t rc = read_translated_path(
+        g, dirfd, path_gva,
+        (flags & LINUX_AT_SYMLINK_NOFOLLOW) ? PATH_TR_NOFOLLOW : PATH_TR_NONE,
+        path, &tx);
+    if (rc < 0)
+        return rc;
 
     if (!validate_at_flags(flags, LINUX_AT_EACCESS | LINUX_AT_SYMLINK_NOFOLLOW))
         return -LINUX_EINVAL;
 
-    if (proc_resolved == 0 && dirfd == LINUX_AT_FDCWD && path[0] != '/') {
+    if (tx.proc_resolved == 0 && dirfd == LINUX_AT_FDCWD && path[0] != '/') {
         int mac_flags = translate_faccessat_flags(flags);
         if (faccessat(AT_FDCWD, path, mode, mac_flags) < 0)
             return linux_errno();
@@ -1414,28 +1353,16 @@ int64_t sys_faccessat(guest_t *g,
      * mode bits, not just path existence.
      */
     struct stat intercepted_st;
-    if (path_might_use_stat_intercept(access_path) &&
-        proc_intercept_stat(access_path, &intercepted_st) == 0) {
+    if (path_might_use_stat_intercept(tx.intercept_path) &&
+        proc_intercept_stat(tx.intercept_path, &intercepted_st) == 0) {
         host_fd_ref_close(&dir_ref);
         if (path_check_intercept_access(&intercepted_st, mode, flags) < 0)
             return linux_errno();
         return 0;
     }
 
-    char sysroot_buf[LINUX_PATH_MAX];
-    const char *check_path =
-        (flags & LINUX_AT_SYMLINK_NOFOLLOW)
-            ? path_resolve_sysroot_nofollow_path(access_path, sysroot_buf,
-                                                 sizeof(sysroot_buf))
-            : path_resolve_sysroot_path(access_path, sysroot_buf,
-                                        sizeof(sysroot_buf));
-    if (!check_path) {
-        host_fd_ref_close(&dir_ref);
-        return -LINUX_ENAMETOOLONG;
-    }
-
     int mac_flags = translate_faccessat_flags(flags);
-    if (faccessat(dir_ref.fd, check_path, mode, mac_flags) < 0) {
+    if (faccessat(dir_ref.fd, tx.host_path, mode, mac_flags) < 0) {
         host_fd_ref_close(&dir_ref);
         return linux_errno();
     }
@@ -1489,24 +1416,13 @@ int64_t sys_ftruncate(int fd, int64_t length)
 int64_t sys_truncate(guest_t *g, uint64_t path_gva, int64_t length)
 {
     char path[LINUX_PATH_MAX];
-    char proc_path[LINUX_PATH_MAX];
-    const char *trunc_guest_path = path;
-    if (guest_read_str(g, path_gva, path, sizeof(path)) < 0)
-        return -LINUX_EFAULT;
-    int proc_resolved = resolve_proc_at_path(LINUX_AT_FDCWD, path, proc_path,
-                                             sizeof(proc_path));
-    if (proc_resolved < 0)
-        return -LINUX_ENAMETOOLONG;
-    if (proc_resolved > 0)
-        trunc_guest_path = proc_path;
+    path_translation_t tx;
+    int64_t rc = read_translated_path(g, LINUX_AT_FDCWD, path_gva, PATH_TR_NONE,
+                                      path, &tx);
+    if (rc < 0)
+        return rc;
 
-    char sysroot_buf[LINUX_PATH_MAX];
-    const char *trunc_path = path_resolve_sysroot_path(
-        trunc_guest_path, sysroot_buf, sizeof(sysroot_buf));
-    if (!trunc_path)
-        return -LINUX_ENAMETOOLONG;
-
-    if (truncate(trunc_path, length) < 0)
+    if (truncate(tx.host_path, length) < 0)
         return linux_errno();
     return 0;
 }
@@ -1537,38 +1453,22 @@ int64_t sys_fchmodat(guest_t *g,
                      int flags)
 {
     char path[LINUX_PATH_MAX];
-    char proc_path[LINUX_PATH_MAX];
-    const char *chmod_path = path;
-    if (guest_read_str(g, path_gva, path, sizeof(path)) < 0)
-        return -LINUX_EFAULT;
-    int proc_resolved =
-        resolve_proc_at_path(dirfd, path, proc_path, sizeof(proc_path));
-    if (proc_resolved < 0)
-        return -LINUX_ENAMETOOLONG;
-    if (proc_resolved > 0)
-        chmod_path = proc_path;
-
     if (!validate_at_flags(flags, LINUX_AT_SYMLINK_NOFOLLOW))
         return -LINUX_EINVAL;
+    path_translation_t tx;
+    int64_t rc = read_translated_path(
+        g, dirfd, path_gva,
+        (flags & LINUX_AT_SYMLINK_NOFOLLOW) ? PATH_TR_NOFOLLOW : PATH_TR_NONE,
+        path, &tx);
+    if (rc < 0)
+        return rc;
 
     host_fd_ref_t dir_ref;
     if (host_dirfd_ref_open(dirfd, &dir_ref) < 0)
         return -LINUX_EBADF;
 
-    char sysroot_buf[LINUX_PATH_MAX];
-    const char *target =
-        (flags & LINUX_AT_SYMLINK_NOFOLLOW)
-            ? path_resolve_sysroot_nofollow_path(chmod_path, sysroot_buf,
-                                                 sizeof(sysroot_buf))
-            : path_resolve_sysroot_path(chmod_path, sysroot_buf,
-                                        sizeof(sysroot_buf));
-    if (!target) {
-        host_fd_ref_close(&dir_ref);
-        return -LINUX_ENAMETOOLONG;
-    }
-
     int mac_flags = translate_at_flags(flags);
-    if (fchmodat(dir_ref.fd, target, mode, mac_flags) < 0) {
+    if (fchmodat(dir_ref.fd, tx.host_path, mode, mac_flags) < 0) {
         host_fd_ref_close(&dir_ref);
         return linux_errno();
     }
@@ -1585,38 +1485,22 @@ int64_t sys_fchownat(guest_t *g,
                      int flags)
 {
     char path[LINUX_PATH_MAX];
-    char proc_path[LINUX_PATH_MAX];
-    const char *chown_path = path;
-    if (guest_read_str(g, path_gva, path, sizeof(path)) < 0)
-        return -LINUX_EFAULT;
-    int proc_resolved =
-        resolve_proc_at_path(dirfd, path, proc_path, sizeof(proc_path));
-    if (proc_resolved < 0)
-        return -LINUX_ENAMETOOLONG;
-    if (proc_resolved > 0)
-        chown_path = proc_path;
-
     if (!validate_at_flags(flags, LINUX_AT_SYMLINK_NOFOLLOW))
         return -LINUX_EINVAL;
+    path_translation_t tx;
+    int64_t rc = read_translated_path(
+        g, dirfd, path_gva,
+        (flags & LINUX_AT_SYMLINK_NOFOLLOW) ? PATH_TR_NOFOLLOW : PATH_TR_NONE,
+        path, &tx);
+    if (rc < 0)
+        return rc;
 
     host_fd_ref_t dir_ref;
     if (host_dirfd_ref_open(dirfd, &dir_ref) < 0)
         return -LINUX_EBADF;
 
-    char sysroot_buf[LINUX_PATH_MAX];
-    const char *target =
-        (flags & LINUX_AT_SYMLINK_NOFOLLOW)
-            ? path_resolve_sysroot_nofollow_path(chown_path, sysroot_buf,
-                                                 sizeof(sysroot_buf))
-            : path_resolve_sysroot_path(chown_path, sysroot_buf,
-                                        sizeof(sysroot_buf));
-    if (!target) {
-        host_fd_ref_close(&dir_ref);
-        return -LINUX_ENAMETOOLONG;
-    }
-
     int mac_flags = translate_at_flags(flags);
-    if (fchownat(dir_ref.fd, target, owner, group, mac_flags) < 0) {
+    if (fchownat(dir_ref.fd, tx.host_path, owner, group, mac_flags) < 0) {
         host_fd_ref_close(&dir_ref);
         return linux_errno();
     }
@@ -1659,29 +1543,18 @@ int64_t sys_utimensat(guest_t *g,
     /* If path is NULL (path_gva == 0), operate on the dirfd itself */
     const char *path_arg = NULL;
     char path[LINUX_PATH_MAX];
-    char proc_path[LINUX_PATH_MAX];
-    char sysroot_buf[LINUX_PATH_MAX];
+    path_translation_t tx;
     if (path_gva != 0) {
-        if (guest_read_str(g, path_gva, path, sizeof(path)) < 0) {
+        int64_t rc = read_translated_path(g, dirfd, path_gva,
+                                          (flags & LINUX_AT_SYMLINK_NOFOLLOW)
+                                              ? PATH_TR_NOFOLLOW
+                                              : PATH_TR_NONE,
+                                          path, &tx);
+        if (rc < 0) {
             host_fd_ref_close(&dir_ref);
-            return -LINUX_EFAULT;
+            return rc;
         }
-        int proc_resolved =
-            resolve_proc_at_path(dirfd, path, proc_path, sizeof(proc_path));
-        if (proc_resolved < 0) {
-            host_fd_ref_close(&dir_ref);
-            return -LINUX_ENAMETOOLONG;
-        }
-        const char *src = proc_resolved > 0 ? proc_path : path;
-        path_arg = (flags & LINUX_AT_SYMLINK_NOFOLLOW)
-                       ? path_resolve_sysroot_nofollow_path(src, sysroot_buf,
-                                                            sizeof(sysroot_buf))
-                       : path_resolve_sysroot_path(src, sysroot_buf,
-                                                   sizeof(sysroot_buf));
-        if (!path_arg) {
-            host_fd_ref_close(&dir_ref);
-            return -LINUX_ENAMETOOLONG;
-        }
+        path_arg = tx.host_path;
     }
 
     struct timespec ts[2];

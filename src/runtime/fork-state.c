@@ -441,13 +441,14 @@ int fork_ipc_send_process_state(int ipc_sock,
 
     char sysroot_ipc[LINUX_PATH_MAX] = {0};
     (void) proc_sysroot_snapshot(sysroot_ipc, sizeof(sysroot_ipc));
-    if (fork_ipc_write_all(ipc_sock, sysroot_ipc, sizeof(sysroot_ipc)) < 0)
+    uint8_t sysroot_casefold_ipc = proc_sysroot_casefold_enabled() ? 1 : 0;
+    if (fork_ipc_write_all(ipc_sock, sysroot_ipc, sizeof(sysroot_ipc)) < 0 ||
+        fork_ipc_write_all(ipc_sock, &sysroot_casefold_ipc,
+                           sizeof(sysroot_casefold_ipc)) < 0)
         return -1;
 
     char elf_path_ipc[LINUX_PATH_MAX] = {0};
-    const char *ep = proc_get_elf_path();
-    if (ep)
-        str_copy_trunc(elf_path_ipc, ep, sizeof(elf_path_ipc));
+    (void) proc_elf_path_snapshot(elf_path_ipc, sizeof(elf_path_ipc));
     char elfuse_path_ipc[LINUX_PATH_MAX] = {0};
     const char *hp = proc_get_elfuse_path();
     if (hp)
@@ -584,6 +585,14 @@ int fork_ipc_recv_process_state(int ipc_fd, guest_t *g, signal_state_t *sig)
     }
     if (sysroot_ipc[0] != '\0')
         proc_set_sysroot(sysroot_ipc);
+
+    uint8_t sysroot_casefold_ipc = 0;
+    if (fork_ipc_read_all(ipc_fd, &sysroot_casefold_ipc,
+                          sizeof(sysroot_casefold_ipc)) < 0) {
+        log_error("fork-child: failed to read sysroot casefold");
+        return -1;
+    }
+    proc_set_sysroot_casefold(sysroot_casefold_ipc != 0);
 
     char elf_path_ipc[LINUX_PATH_MAX];
     if (fork_ipc_read_all(ipc_fd, elf_path_ipc, sizeof(elf_path_ipc)) < 0) {

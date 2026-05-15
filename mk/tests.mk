@@ -6,6 +6,7 @@
         test-glibc-coreutils test-perf \
         test-matrix test-matrix-elfuse-aarch64 test-matrix-qemu-aarch64 \
         test-full test-multi-vcpu test-rwx test-sysroot-rename \
+        test-case-collision test-case-collision-fallback test-sysroot-create-paths \
         test-proctitle-low-stack \
         test-sysroot-procfs-exec test-timeout-disable \
         test-sysroot-nofollow test-sysroot-chdir perf
@@ -38,8 +39,8 @@ test-sysroot-rename: $(ELFUSE_BIN) $(BUILD_DIR)/test-sysroot-rename
 	printf 'inside-sysroot\n' > "$$tmpdir/tmp/elfuse-sysroot-rename-src.txt"; \
 	rm -f /tmp/elfuse-sysroot-rename-dst.txt; \
 	$(ELFUSE_BIN) --sysroot "$$tmpdir" $(BUILD_DIR)/test-sysroot-rename; \
-	if [ ! -f "$$tmpdir/tmp/elfuse-sysroot-rename-dst.txt" ]; then \
-		printf "$(RED)FAIL$(RESET) rename did not create destination in sysroot\n"; \
+	if [ -f "$$tmpdir/tmp/elfuse-sysroot-rename-src.txt" ]; then \
+		printf "$(RED)FAIL$(RESET) rename did not remove source from sysroot\n"; \
 		exit 1; \
 	fi; \
 	if [ -e /tmp/elfuse-sysroot-rename-dst.txt ]; then \
@@ -59,6 +60,39 @@ test-sysroot-chdir: $(ELFUSE_BIN) $(BUILD_DIR)/test-sysroot-chdir
 	trap 'rm -rf "$$tmpdir"' EXIT; \
 	mkdir -p "$$tmpdir/bin" "$$tmpdir/lib" "$$tmpdir/lib/elfuse-sysroot-shadow"; \
 	$(ELFUSE_BIN) --sysroot "$$tmpdir" $(BUILD_DIR)/test-sysroot-chdir
+
+test-case-collision: $(ELFUSE_BIN) $(BUILD_DIR)/test-case-collision
+	@tmpdir=$$(mktemp -d); \
+	trap 'rm -rf "$$tmpdir"' EXIT; \
+	$(ELFUSE_BIN) --create-sysroot "$$tmpdir/case-sysroot" $(BUILD_DIR)/test-case-collision
+
+test-case-collision-fallback: $(ELFUSE_BIN) $(BUILD_DIR)/test-case-collision
+	@tmpdir=$$(mktemp -d); \
+	trap 'rm -rf "$$tmpdir"' EXIT; \
+	$(ELFUSE_BIN) --sysroot "$$tmpdir" $(BUILD_DIR)/test-case-collision
+
+test-sysroot-create-paths: $(ELFUSE_BIN) $(BUILD_DIR)/test-sysroot-create-paths
+	@tmpdir=$$(mktemp -d); \
+	guest_tmp="/tmp/elfuse-sysroot-create-paths/file.txt"; \
+	mounted_tmp="$$tmpdir/case-sysroot/tmp/elfuse-sysroot-create-paths/file.txt"; \
+	host_out_dir="$$tmpdir/host-out"; \
+	host_out="$$host_out_dir/result.txt"; \
+	trap 'rm -rf "$$tmpdir"; rm -rf /tmp/elfuse-sysroot-create-paths' EXIT; \
+	rm -rf /tmp/elfuse-sysroot-create-paths; \
+	mkdir -p "$$host_out_dir"; \
+	$(ELFUSE_BIN) --create-sysroot "$$tmpdir/case-sysroot" $(BUILD_DIR)/test-sysroot-create-paths "$$guest_tmp" "$$mounted_tmp" "$$host_out" "$$tmpdir/case-sysroot"; \
+	if [ -e "$$guest_tmp" ]; then \
+		printf "$(RED)FAIL$(RESET) guest /tmp escaped to host /tmp\n"; \
+		exit 1; \
+	fi; \
+	if [ ! -f "$$host_out" ]; then \
+		printf "$(RED)FAIL$(RESET) host fallback path was not created\n"; \
+		exit 1; \
+	fi; \
+	if ! grep -q "host-fallback" "$$host_out"; then \
+		printf "$(RED)FAIL$(RESET) host fallback file contents mismatch\n"; \
+		exit 1; \
+	fi
 
 test-sysroot-procfs-exec: $(ELFUSE_BIN) $(BUILD_DIR)/test-procfs-exec
 	@tmpdir=$$(mktemp -d); \

@@ -182,16 +182,14 @@ static int64_t stat_at_path(guest_t *g,
                         sizeof(path), &pathp) < 0)
         return -LINUX_EFAULT;
 
-    char proc_path[LINUX_PATH_MAX];
-    const char *intercept_path = pathp;
-    int proc_resolved =
-        resolve_proc_at_path(dirfd, pathp, proc_path, sizeof(proc_path));
-    if (proc_resolved < 0)
-        return -LINUX_ENAMETOOLONG;
-    if (proc_resolved > 0)
-        intercept_path = proc_path;
+    path_translation_t tx;
+    if (path_translate_at(dirfd, pathp,
+                          (flags & LINUX_AT_SYMLINK_NOFOLLOW) ? PATH_TR_NOFOLLOW
+                                                              : PATH_TR_NONE,
+                          &tx) < 0)
+        return linux_errno();
 
-    if (proc_resolved == 0 && dirfd == LINUX_AT_FDCWD && pathp[0] != '/' &&
+    if (tx.proc_resolved == 0 && dirfd == LINUX_AT_FDCWD && pathp[0] != '/' &&
         pathp[0] != '\0' && !proc_get_sysroot()) {
         int mac_flags = translate_at_flags(flags);
         if (fstatat(AT_FDCWD, pathp, mac_st, mac_flags) < 0)
@@ -205,37 +203,34 @@ static int64_t stat_at_path(guest_t *g,
 
     int64_t rc = 0;
     if ((flags & LINUX_AT_EMPTY_PATH) && pathp[0] == '\0') {
-        if (dir_ref.fd < 0 || dir_ref.fd == AT_FDCWD) {
+        /* Linux: AT_EMPTY_PATH with dirfd == AT_FDCWD operates on the
+         * current working directory.
+         */
+        if (dir_ref.fd == AT_FDCWD) {
+            int mac_flags = translate_at_flags(flags);
+            if (fstatat(AT_FDCWD, ".", mac_st, mac_flags) < 0) {
+                rc = linux_errno();
+                goto done;
+            }
+        } else if (dir_ref.fd < 0) {
             rc = -LINUX_EBADF;
             goto done;
-        }
-        if (fstat(dir_ref.fd, mac_st) < 0) {
+        } else if (fstat(dir_ref.fd, mac_st) < 0) {
             rc = linux_errno();
             goto done;
         }
     } else {
         int intercepted = PROC_NOT_INTERCEPTED;
-        if (path_might_use_stat_intercept(intercept_path)) {
-            intercepted = proc_intercept_stat(intercept_path, mac_st);
+        if (path_might_use_stat_intercept(tx.intercept_path)) {
+            intercepted = proc_intercept_stat(tx.intercept_path, mac_st);
             if (intercepted == -1) {
                 rc = linux_errno();
                 goto done;
             }
         }
         if (intercepted == PROC_NOT_INTERCEPTED) {
-            char sysroot_buf[LINUX_PATH_MAX];
-            const char *stat_path =
-                (flags & LINUX_AT_SYMLINK_NOFOLLOW)
-                    ? path_resolve_sysroot_nofollow_path(pathp, sysroot_buf,
-                                                         sizeof(sysroot_buf))
-                    : path_resolve_sysroot_path(pathp, sysroot_buf,
-                                                sizeof(sysroot_buf));
-            if (!stat_path) {
-                rc = -LINUX_ENAMETOOLONG;
-                goto done;
-            }
             int mac_flags = translate_at_flags(flags);
-            if (fstatat(dir_ref.fd, stat_path, mac_st, mac_flags) < 0) {
+            if (fstatat(dir_ref.fd, tx.host_path, mac_st, mac_flags) < 0) {
                 rc = linux_errno();
                 goto done;
             }
@@ -299,14 +294,12 @@ int64_t sys_statfs(guest_t *g, uint64_t path_gva, uint64_t buf_gva)
     if (guest_read_str_small(g, path_gva, path, sizeof(path)) < 0)
         return -LINUX_EFAULT;
 
-    char sysroot_buf[LINUX_PATH_MAX];
-    const char *fs_path =
-        path_resolve_sysroot_path(path, sysroot_buf, sizeof(sysroot_buf));
-    if (!fs_path)
-        return -LINUX_ENAMETOOLONG;
+    path_translation_t tx;
+    if (path_translate_at(LINUX_AT_FDCWD, path, PATH_TR_NONE, &tx) < 0)
+        return linux_errno();
 
     struct statfs mac_st;
-    if (statfs(fs_path, &mac_st) < 0)
+    if (statfs(tx.host_path, &mac_st) < 0)
         return linux_errno();
 
     linux_statfs_t lin_st;

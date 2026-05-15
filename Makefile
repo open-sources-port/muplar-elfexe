@@ -24,6 +24,7 @@ SRCS := \
     core/stack.c \
     core/vdso.c \
     core/bootstrap.c \
+    core/sysroot.c \
     runtime/thread.c \
     runtime/futex.c \
     runtime/forkipc.c \
@@ -35,6 +36,7 @@ SRCS := \
     syscall/translate.c \
     syscall/mem.c \
     syscall/path.c \
+    syscall/sidecar.c \
     syscall/fs.c \
     syscall/fs-stat.c \
     syscall/fs-xattr.c \
