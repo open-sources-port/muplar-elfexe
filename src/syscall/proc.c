@@ -1742,6 +1742,26 @@ int vcpu_run_loop(hv_vcpu_t vcpu,
                     break;
                 }
 
+                case 6: {
+                    /* HVC #6: embedder extension hook.
+                     * X8 = call number, X0-X7 = arguments.
+                     * If a dispatch function is registered via
+                     * elfuse_set_hvc6_handler(), it is called here.
+                     * Otherwise falls through as a no-op. */
+                    if (g->hvc6_handler) {
+                        uint64_t x8 = 0;
+                        hv_vcpu_get_reg(vcpu, HV_REG_X8, &x8);
+                        uint64_t args[8] = {0};
+                        for (int i = 0; i < 8; i++)
+                            hv_vcpu_get_reg(vcpu, HV_REG_X0 + i, &args[i]);
+                        uint64_t result =
+                            g->hvc6_handler(x8, args, g->hvc6_userdata);
+                        hv_vcpu_set_reg(vcpu, HV_REG_X0, result);
+                    }
+                    /* PC already advanced by HVC instruction */
+                    break;
+                }
+
                 default: {
                     log_error("%s: unexpected HVC #%u", prefix, imm);
                     char detail[64];

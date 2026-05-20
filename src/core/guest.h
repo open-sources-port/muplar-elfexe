@@ -275,6 +275,21 @@ typedef struct {
      * 64-bit to avoid wrap-around stale hits over long-running sessions.
      */
     _Atomic uint64_t pt_gen;
+
+    /*
+     * Optional HVC #6 embedder extension hook.
+     *
+     * The handler may be invoked concurrently from multiple host threads once
+     * the guest becomes multi-threaded, so implementations must be thread-safe.
+     *
+     * The hook is process-local and does not survive fork(). elfuse implements
+     * fork via posix_spawn() of a fresh process, so the child must register its
+     * own handler during bootstrap.
+     */
+    uint64_t (*hvc6_handler)(uint64_t call_nr,
+                             const uint64_t args[8],
+                             void *userdata);
+    void *hvc6_userdata;
 } guest_t;
 
 /* Bump the page table generation counter (call after any PT modification).
