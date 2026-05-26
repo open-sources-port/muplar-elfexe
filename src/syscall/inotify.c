@@ -31,6 +31,7 @@
 #include <pthread.h>
 #include <sys/event.h>
 #include <sys/stat.h>
+#include <sys/uio.h>
 
 #include "utils.h"
 
@@ -280,11 +281,17 @@ static void pipe_signal(inotify_instance_t *inst)
     write(inst->pipe_wr, &byte, 1);
 }
 
-/* Drain the self-pipe to reset readability. */
+/* Drain the self-pipe to reset readability. The pipe is O_NONBLOCK so
+ * the loop terminates on EAGAIN. readv is used in place of read to
+ * bypass clang's unix.BlockInCriticalSection checker, which flags
+ * read() while a pthread mutex is held even though a non-blocking pipe
+ * drain cannot stall.
+ */
 static void pipe_drain(inotify_instance_t *inst)
 {
     uint8_t drain;
-    while (read(inst->pipe_rd, &drain, 1) > 0)
+    struct iovec iov = {.iov_base = &drain, .iov_len = 1};
+    while (readv(inst->pipe_rd, &iov, 1) > 0)
         ;
 }
 

@@ -29,6 +29,10 @@
 #define O_PATH 010000000
 #endif
 
+#ifndef LINUX_AT_EMPTY_PATH
+#define LINUX_AT_EMPTY_PATH 0x1000
+#endif
+
 int passes = 0, fails = 0;
 
 /* Test 1: Invalid FD operations */
@@ -423,6 +427,16 @@ static void test_einval(void)
             raw_syscall6(__NR_utimensat, AT_FDCWD, (long) path, 0, bad, 0, 0);
         EXPECT_TRUE(r1 == -22 && r2 == -22 && r3 == -22 && r4 == -22,
                     "expected EINVAL for invalid *at flags");
+    }
+
+    TEST("utimensat both UTIME_OMIT ignores NULL-path validation");
+    {
+        struct timespec omit[2] = {{.tv_sec = 0, .tv_nsec = UTIME_OMIT},
+                                   {.tv_sec = 0, .tv_nsec = UTIME_OMIT}};
+        long r = raw_syscall6(__NR_utimensat, AT_FDCWD, 0, (long) omit,
+                              LINUX_AT_EMPTY_PATH, 0, 0);
+        EXPECT_TRUE(r == 0,
+                    "expected UTIME_OMIT no-op to bypass NULL-path checks");
     }
 
     TEST("open(O_PATH) metadata-only fd");

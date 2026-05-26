@@ -153,11 +153,11 @@ static void translate_statfs(const struct statfs *mac, linux_statfs_t *lin)
     lin->f_frsize = mac->f_bsize;
 }
 
-/* Resolve the directory + path arguments of a *at-style stat operation and
- * fill *mac_st via the appropriate host call (proc intercept where applicable).
- * Shared by sys_newfstatat and sys_statx; the caller copies the result into
- * the guest's struct stat or struct statx layout. Returns 0 on success or a
- * negative Linux errno.
+/* Resolve the directory + path arguments of a *at-style stat operation and fill
+ * *mac_st via the appropriate host call (proc intercept where applicable).
+ * Shared by sys_newfstatat and sys_statx; the caller copies the result into the
+ * guest's struct stat or struct statx layout.
+ * Returns 0 on success or a negative Linux errno.
  */
 static int64_t stat_at_path(guest_t *g,
                             int dirfd,
@@ -259,7 +259,13 @@ done:
 
 int64_t sys_fstat(guest_t *g, int fd, uint64_t stat_gva)
 {
-    struct stat mac_st;
+    /* Zero-init so callees that fill only matched fields (FUSE shim, /proc
+     * emulators) leave the rest as defined zeros. Also keeps clang's
+     * core.CallAndMessage checker happy: it cannot see across fuse_fstat_fd /
+     * fstat to verify the buffer is fully written before translate_stat reads
+     * from it.
+     */
+    struct stat mac_st = {0};
     int frc = fuse_fstat_fd(fd, &mac_st);
     if (frc == 0) {
         if (write_linux_stat(g, stat_gva, &mac_st) < 0)
@@ -301,7 +307,8 @@ int64_t sys_newfstatat(guest_t *g,
                                       LINUX_AT_NO_AUTOMOUNT))
         return -LINUX_EINVAL;
 
-    struct stat mac_st;
+    /* See sys_fstat comment on the zero-init rationale. */
+    struct stat mac_st = {0};
     int64_t rc = stat_at_path(g, dirfd, path_gva, flags, &mac_st);
     if (rc < 0)
         return rc;
@@ -370,7 +377,8 @@ int64_t sys_statx(guest_t *g,
                        LINUX_AT_NO_AUTOMOUNT | LINUX_AT_STATX_SYNC_TYPE))
         return -LINUX_EINVAL;
 
-    struct stat mac_st;
+    /* See sys_fstat comment on the zero-init rationale. */
+    struct stat mac_st = {0};
     int64_t rc = stat_at_path(g, dirfd, path_gva, flags, &mac_st);
     if (rc < 0)
         return rc;

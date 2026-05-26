@@ -828,7 +828,11 @@ populate_existing:
                                       flags, offset, NULL,
                                       track_backing_fd) < 0)
         goto fail;
-    track_backing_fd = -1;
+    /* Ownership of track_backing_fd is now held by the new region. The
+     * fail handler below skips closing when track_backing_fd < 0, so
+     * subsequent steps must not goto fail or the region's backing fd
+     * would be double-closed.
+     */
     if (close_host_backing_fd && host_backing_fd >= 0)
         close(host_backing_fd);
     host_fd_ref_close(&backing_ref);
@@ -3541,8 +3545,14 @@ static void mmap_fork_dispose_anon_shared_txn(
 int mmap_fork_prepare_anon_shared(guest_t *g,
                                   mmap_fork_anon_shared_txn_t **txn_out)
 {
-    if (txn_out)
-        *txn_out = NULL;
+    /* Callers must provide a non-NULL txn_out: the transaction handle is
+     * the only way to commit or abort the partial state mutated below.
+     * Reject up front so the body can assume *txn_out is writable on
+     * every exit path.
+     */
+    if (!txn_out)
+        return -LINUX_EINVAL;
+    *txn_out = NULL;
 
     mmap_fork_anon_shared_txn_t *txn = calloc(1, sizeof(*txn));
     if (!txn)
@@ -3698,8 +3708,7 @@ int mmap_fork_prepare_anon_shared(guest_t *g,
                 close(dup_fds[k]);
             close(fd);
             pthread_mutex_unlock(&mmap_lock);
-            if (txn_out)
-                *txn_out = txn;
+            *txn_out = txn;
             return -LINUX_ENOMEM;
         }
 
@@ -3712,8 +3721,7 @@ int mmap_fork_prepare_anon_shared(guest_t *g,
                 close(dup_fds[k]);
             close(fd);
             pthread_mutex_unlock(&mmap_lock);
-            if (txn_out)
-                *txn_out = txn;
+            *txn_out = txn;
             return nsnaps;
         }
 
@@ -3754,8 +3762,7 @@ int mmap_fork_prepare_anon_shared(guest_t *g,
     }
 
     pthread_mutex_unlock(&mmap_lock);
-    if (txn_out)
-        *txn_out = txn;
+    *txn_out = txn;
     return 0;
 }
 
