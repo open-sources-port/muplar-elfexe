@@ -390,6 +390,10 @@ typedef struct {
 #define LINUX_AT_NO_AUTOMOUNT 0x800
 #define LINUX_AT_EMPTY_PATH 0x1000
 
+/* Linux utimensat/futimens timestamp selector constants. */
+#define LINUX_UTIME_NOW 0x3fffffff
+#define LINUX_UTIME_OMIT 0x3ffffffe
+
 /* statx() sync mode bits. AT_STATX_SYNC_AS_STAT == 0; the FORCE/DONT
  * variants are accepted and ignored (host fstatat is implicitly synchronous).
  */

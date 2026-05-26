@@ -197,23 +197,23 @@ typedef struct {
 #define FUSE_MAX_OPEN_FILES 128
 #define FUSE_MAX_PENDING 128
 /* Per-session capacity for held lookup references. Sized for recursive
- * directory walks (ls -R style) without pushing the per-session struct
- * into multi-page territory; sizeof(struct) at the chosen cap stays under
- * 80 KiB. Beyond this, fuse_lookup_locked() emits a compensating FORGET
- * to keep the daemon balanced instead of leaking a reference.
+ * directory walks (ls -R style) without pushing the per-session struct into
+ * multi-page territory; sizeof(struct) at the chosen cap stays under 80 KiB.
+ * Beyond this, fuse_lookup_locked() emits a compensating FORGET to keep the
+ * daemon balanced instead of leaking a reference.
  */
 #define FUSE_MAX_NODE_REFS 4096
 #define FUSE_FAKE_DEV 0xF00D
 
-/* Implementation ceiling for a single FUSE frame (header + payload). The
- * kernel FUSE protocol caps a READ or WRITE payload at FUSE_MAX_PAGES *
- * page_size = ~1 MiB by default and up to 4 MiB under recent kernels. The
- * 8 MiB hard cap below leaves headroom for the FUSE header, in-band
- * sub-headers, and any future readahead growth while still bounding the
- * largest single malloc the daemon can force. Daemon-negotiated
- * max_write is clamped to (FUSE_FRAME_CAP - sizeof(fuse_in_header_t) -
- * sizeof(fuse_write_in)) at FUSE_INIT time so the read-reply path cannot
- * negotiate a size larger than fuse_dev_write will accept.
+/* Implementation ceiling for a single FUSE frame (header + payload). The kernel
+ * FUSE protocol caps a READ or WRITE payload at FUSE_MAX_PAGES * page_size =
+ * ~1 MiB by default and up to 4 MiB under recent kernels. The 8 MiB hard cap
+ * below leaves headroom for the FUSE header, in-band sub-headers, and any
+ * future readahead growth while still bounding the largest single malloc the
+ * daemon can force. Daemon-negotiated max_write is clamped to (FUSE_FRAME_CAP
+ * - sizeof(fuse_in_header_t) - sizeof(fuse_write_in)) at FUSE_INIT time so the
+ * read-reply path cannot negotiate a size larger than fuse_dev_write will
+ * accept.
  */
 #define FUSE_FRAME_CAP ((size_t) (8 * 1024 * 1024))
 #define FUSE_MAX_NEGOTIATED_WRITE ((uint32_t) (FUSE_FRAME_CAP - 256))
@@ -275,12 +275,11 @@ typedef struct {
 
 typedef struct {
     bool used;
-    /* refcount keeps the slot alive while any thread holds a snapshot or
-     * does an in-flight FUSE request against this fd. 1 = held by the
-     * underlying open fd; +1 per in-flight op acquired via
-     * fuse_file_get_locked. The slot is zeroed only when refcount hits 0
-     * so a concurrent close cannot pull the io_cond out from under a
-     * waiting reader.
+    /* refcount keeps the slot alive while any thread holds a snapshot or does
+     * an in-flight FUSE request against this fd. 1 = held by the underlying
+     * open fd; +1 per in-flight op acquired via fuse_file_get_locked. The slot
+     * is zeroed only when refcount hits 0 so a concurrent close cannot pull the
+     * io_cond out from under a waiting reader.
      */
     int refcount;
     int guest_fd;
@@ -2318,7 +2317,20 @@ int64_t fuse_dev_write(guest_t *g,
          */
         const size_t init_min_len = offsetof(fuse_init_out_t, max_write) +
                                     sizeof(((fuse_init_out_t *) 0)->max_write);
-        if (hdr.error == 0 && req->reply_len >= init_min_len) {
+        bool local_oom = (req->reply_len > 0 && !req->reply);
+        if (local_oom) {
+            /* Local reply-buffer malloc failed earlier; req->error is already
+             * -LINUX_ENOMEM and must stay so the originator of the FUSE_INIT
+             * request sees the root cause. The daemon itself is still healthy,
+             * but elfuse never decoded its reply, so init_done cannot be set
+             * and the session cannot carry further traffic. Mark daemon_dead to
+             * release any fuse_wait_for_init_locked waiters with
+             * -LINUX_ENOTCONN and to fail subsequent fuse_request_locked calls;
+             * without this, init_cond's broadcast below wakes waiters that
+             * immediately re-block on the still-false init_done flag.
+             */
+            session->daemon_dead = true;
+        } else if (hdr.error == 0 && req->reply_len >= init_min_len) {
             fuse_init_out_t init_out;
             memset(&init_out, 0, sizeof(init_out));
             size_t copy_len = req->reply_len < sizeof(init_out)
@@ -2338,8 +2350,11 @@ int64_t fuse_dev_write(guest_t *g,
                     init_out.max_pages ? init_out.max_pages : 16;
                 session->init_done = true;
             }
+        } else if (hdr.error < 0) {
+            req->error = hdr.error;
+            session->daemon_dead = true;
         } else {
-            req->error = (hdr.error < 0) ? hdr.error : -LINUX_EPROTO;
+            req->error = -LINUX_EPROTO;
             session->daemon_dead = true;
         }
         pthread_cond_broadcast(&session->init_cond);
@@ -2424,9 +2439,9 @@ int64_t fuse_lseek_fd(int fd, int64_t offset, int whence)
         return -LINUX_EINVAL;
 
     pthread_mutex_lock(&fuse_lock);
-    /* Block while a stream read is in flight on this fd so the seek does
-     * not race the post-read offset update. The wait holds a file ref so
-     * io_cond cannot be destroyed under it.
+    /* Block while a stream read is in flight on this fd so the seek does not
+     * race the post-read offset update. The wait holds a file ref so io_cond
+     * cannot be destroyed under it.
      */
     for (;;) {
         fuse_file_t *waiter = fuse_file_by_fd_locked(fd);
@@ -2462,9 +2477,9 @@ int64_t fuse_lseek_fd(int fd, int64_t offset, int whence)
         pthread_mutex_unlock(&fuse_lock);
         return -LINUX_EINVAL;
     }
-    /* Both overflow checks complete before the addition itself; INT64_MIN
-     * for offset would otherwise produce signed-overflow UB on the bounds
-     * test.
+
+    /* Both overflow checks complete before the addition itself; INT64_MIN for
+     * offset would otherwise produce signed-overflow UB on the bounds test.
      */
     if (offset > 0 && base > INT64_MAX - offset) {
         pthread_mutex_unlock(&fuse_lock);
@@ -2610,12 +2625,12 @@ int fuse_resolve_at_path(guest_fd_t dirfd,
     if (proc_acquire_cwd_view(&view) < 0)
         return 0;
 
-    /* fuse_path_matches_mount returns true for both live and tombstoned
-     * mounts, so a virtual cwd left dangling by daemon death still routes
-     * the relative lookup into FUSE land. The follow-on
-     * fuse_path_lookup / fuse_open_path / fuse_stat_path call detects the
-     * tombstoned mount and surfaces -LINUX_ENOTCONN instead of letting the
-     * resolution fall back to host-relative open against the host cwd.
+    /* fuse_path_matches_mount returns true for both live and tombstoned mounts,
+     * so a virtual cwd left dangling by daemon death still routes the relative
+     * lookup into FUSE land. The follow-on fuse_{path_lookup,open_path,
+     * stat_path} call detects the tombstoned mount and surfaces -LINUX_ENOTCONN
+     * instead of letting the resolution fall back to host-relative open against
+     * the host cwd.
      */
     int rc = 0;
     if (view.path && view.path[0] == '/' &&

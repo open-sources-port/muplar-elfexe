@@ -189,15 +189,18 @@ uint64_t build_linux_stack(guest_t *g,
     uint64_t platform_ptr = str_ptr;
     str_err |= write_str(g, platform_ptr, "aarch64");
 
-    /* Dynamically allocate pointer arrays to avoid stack buffer overflow
-     * with large argument or environment lists. calloc(0, ...) is
-     * implementation-defined, so skip the call when the count is zero.
+    /* Dynamically allocate pointer arrays to avoid stack buffer overflow with
+     * large argument or environment lists. calloc(0, ...) is
+     * implementation-defined, so always allocate at least one slot. The extra
+     * slot when envc/argc is zero is wasted but keeps the pointers non-NULL,
+     * which simplifies subsequent code and avoids tripping static analyzers
+     * that cannot correlate the empty-loop case with the NULL pointer.
      */
     uint64_t *env_ptrs =
-        envc > 0 ? calloc((size_t) envc, sizeof(uint64_t)) : NULL;
+        calloc((size_t) (envc > 0 ? envc : 1), sizeof(uint64_t));
     uint64_t *arg_ptrs =
-        argc > 0 ? calloc((size_t) argc, sizeof(uint64_t)) : NULL;
-    if ((envc > 0 && !env_ptrs) || (argc > 0 && !arg_ptrs)) {
+        calloc((size_t) (argc > 0 ? argc : 1), sizeof(uint64_t));
+    if (!env_ptrs || !arg_ptrs) {
         free(env_ptrs);
         free(arg_ptrs);
         return 0;

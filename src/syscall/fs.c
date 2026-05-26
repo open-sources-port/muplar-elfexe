@@ -1638,6 +1638,29 @@ int64_t sys_utimensat(guest_t *g,
                       uint64_t times_gva,
                       int flags)
 {
+    struct timespec ts[2];
+    bool all_omit = false;
+    if (times_gva != 0) {
+        /* Read two linux_timespec_t from guest */
+        linux_timespec_t lts[2];
+        if (guest_read_small(g, times_gva, lts, sizeof(lts)) < 0)
+            return -LINUX_EFAULT;
+
+        ts[0].tv_sec = lts[0].tv_sec;
+        ts[1].tv_sec = lts[1].tv_sec;
+        all_omit = (lts[0].tv_nsec == LINUX_UTIME_OMIT &&
+                    lts[1].tv_nsec == LINUX_UTIME_OMIT);
+        ts[0].tv_nsec = (lts[0].tv_nsec == LINUX_UTIME_NOW)    ? UTIME_NOW
+                        : (lts[0].tv_nsec == LINUX_UTIME_OMIT) ? UTIME_OMIT
+                                                               : lts[0].tv_nsec;
+        ts[1].tv_nsec = (lts[1].tv_nsec == LINUX_UTIME_NOW)    ? UTIME_NOW
+                        : (lts[1].tv_nsec == LINUX_UTIME_OMIT) ? UTIME_OMIT
+                                                               : lts[1].tv_nsec;
+    }
+
+    if (all_omit)
+        return 0;
+
     if (!validate_at_flags(flags,
                            LINUX_AT_SYMLINK_NOFOLLOW | LINUX_AT_EMPTY_PATH))
         return -LINUX_EINVAL;
@@ -1668,31 +1691,28 @@ int64_t sys_utimensat(guest_t *g,
         path_arg = tx.host_path;
     }
 
-    struct timespec ts[2];
-    if (times_gva != 0) {
-        /* Read two linux_timespec_t from guest */
-        linux_timespec_t lts[2];
-        if (guest_read_small(g, times_gva, lts, sizeof(lts)) < 0) {
-            host_fd_ref_close(&dir_ref);
-            return -LINUX_EFAULT;
-        }
-
-        /* UTIME_NOW = 0x3FFFFFFF, UTIME_OMIT = 0x3FFFFFFE (same on macOS) */
-        ts[0].tv_sec = lts[0].tv_sec;
-        ts[0].tv_nsec = lts[0].tv_nsec;
-        ts[1].tv_sec = lts[1].tv_sec;
-        ts[1].tv_nsec = lts[1].tv_nsec;
-    }
-
     int mac_flags = 0;
     if (flags & LINUX_AT_SYMLINK_NOFOLLOW)
         mac_flags |= AT_SYMLINK_NOFOLLOW;
 
     /* macOS utimensat() does not support NULL path (Linux extension).
      * When path is NULL, the caller wants to operate on dirfd itself,
-     * so use futimens() instead.
+     * so use futimens() instead. Linux's do_utimes_fd rejects any flags
+     * with EINVAL, and utimensat(AT_FDCWD, NULL, ...) returns EFAULT
+     * because there is no real fd to apply timestamps to; mirror both
+     * here rather than letting futimens(AT_FDCWD, ...) be invoked with
+     * macOS's AT_FDCWD sentinel (-2), which returns EBADF and would not
+     * match Linux semantics.
      */
     if (!path_arg) {
+        if (flags) {
+            host_fd_ref_close(&dir_ref);
+            return -LINUX_EINVAL;
+        }
+        if (dir_ref.fd == AT_FDCWD) {
+            host_fd_ref_close(&dir_ref);
+            return -LINUX_EFAULT;
+        }
         if (futimens(dir_ref.fd, times_gva ? ts : NULL) < 0) {
             host_fd_ref_close(&dir_ref);
             return linux_errno();

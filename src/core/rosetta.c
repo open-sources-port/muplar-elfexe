@@ -451,31 +451,34 @@ int rosetta_finalize(guest_t *g,
     rosetta_argv[rosetta_argc] = NULL;
 
     /* Install the TTBR0 user-VA alias for the kbuf so rosetta's TaggedPointer
-     * extraction (which strips bits 63:48) resolves to the same physical
-     * pages as the TTBR1 kernel-VA window. The aliasing-proof invariant
-     * (RW + UXN + PXN under both mappings) is enforced inside the helper.
-     * An installed-but-unused alias is harmless (read-write pages aliasing
-     * the same physical kbuf), so the commit step below does not need to
-     * roll it back if a later allocation fails.
+     * extraction (which strips bits 63:48) resolves to the same physical pages
+     * as the TTBR1 kernel-VA window. The aliasing-proof invariant (RW + UXN +
+     * PXN under both mappings) is enforced inside the helper.
+     * An installed-but-unused alias is harmless (read-write pages aliasing the
+     * same physical kbuf), so the commit step below does not need to roll it
+     * back if a later allocation fails.
      */
     if (guest_install_kbuf_user_alias(g) < 0) {
         log_error("rosetta_finalize: failed to install TTBR0 kbuf alias");
         goto fail;
     }
 
-    /* Commit: from here on, no failure is possible. Install guest fd 3,
-     * publish the binary path to the VZ_CAPS handler, refresh
-     * /proc/self/cmdline, and transfer argv ownership to the caller.
+    /* Install guest fd 3 last so any earlier failure unwinds without needing to
+     * roll back the ownership transfer. fd_alloc_at(3) is the final fallible
+     * step; once it succeeds, the host fd is owned by the guest fd table and no
+     * goto fail must be introduced below, or the fail handler would
+     * double-close it.
      */
     int bin_guest_fd = fd_alloc_at(3, FD_REGULAR, bin_host_fd);
     if (bin_guest_fd < 0) {
         log_error("rosetta_finalize: fd_alloc_at(3) failed");
         goto fail;
     }
-    bin_host_fd = -1; /* Ownership transferred to the guest fd table */
-    /* Mark the rosetta target fd CLOEXEC so a rosetta-to-native execve
-     * does not leak it into the new image. fd_alloc_at clears
-     * linux_flags, so the OR is safe.
+
+    /* Ownership of bin_host_fd is now held by the guest fd table.
+     * Mark the rosetta target fd CLOEXEC so a rosetta-to-native execve does not
+     * leak it into the new image. fd_alloc_at clears linux_flags, so the OR is
+     * safe.
      */
     fd_table[bin_guest_fd].linux_flags |= LINUX_O_CLOEXEC;
 
@@ -489,12 +492,12 @@ int rosetta_finalize(guest_t *g,
     *out_argc = rosetta_argc;
     *out_argv = rosetta_argv;
 
-    /* The VZ ioctl trio is in; the rosettad translate pipeline and the
-     * mem.c body refactor for rosetta high-VA mmap allocations are still
-     * pending. Without rosettad, rosetta issues a translate request, hits
-     * the socketpair where the handler returns MISS, and exits. Without
-     * the high-VA mmap support, rosetta's slab allocator at 240 TiB cannot
-     * back its JIT memory and aborts in VMAllocationTracker.
+    /* The VZ ioctl trio is in; the rosettad translate pipeline and the mem.c
+     * body refactor for rosetta high-VA mmap allocations are still pending.
+     * Without rosettad, rosetta issues a translate request, hits the socketpair
+     * where the handler returns MISS, and exits. Without the high-VA mmap
+     * support, rosetta's slab allocator at 240 TiB cannot back its JIT memory
+     * and aborts in VMAllocationTracker.
      */
     log_debug(
         "rosetta_finalize: setup complete; runtime path still needs "

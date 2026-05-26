@@ -139,6 +139,25 @@ int main(void)
         }
     }
 
+    TEST("utimensat UTIME_NOW/UTIME_OMIT");
+    {
+        struct timespec times[2] = {{.tv_sec = 0, .tv_nsec = UTIME_OMIT},
+                                    {.tv_sec = 0, .tv_nsec = UTIME_NOW}};
+        struct stat st;
+        time_t before = time(NULL);
+        if (utimensat(AT_FDCWD, testfile, times, 0) == 0 &&
+            stat(testfile, &st) == 0) {
+            time_t after = time(NULL);
+            bool atime_unchanged = (st.st_atime == 1000000000);
+            bool mtime_updated =
+                (st.st_mtime >= before && st.st_mtime <= after + 1);
+            EXPECT_TRUE(atime_unchanged && mtime_updated,
+                        "UTIME_NOW/UTIME_OMIT semantics mismatch");
+        } else {
+            FAIL("utimensat UTIME_NOW/UTIME_OMIT failed");
+        }
+    }
+
     /* Test stat after operations */
     TEST("stat consistency");
     {
