@@ -1281,6 +1281,9 @@ void fuse_init(void)
     memset(fuse_file_bindings, 0, sizeof(fuse_file_bindings));
     fuse_next_mount_id = 100;
     pthread_mutex_unlock(&fuse_lock);
+    fd_register_cleanup(FD_FUSE_DEV, fuse_fd_cleanup);
+    fd_register_cleanup(FD_FUSE_FILE, fuse_fd_cleanup);
+    fd_register_cleanup(FD_FUSE_DIR, fuse_fd_cleanup);
 }
 
 int fuse_proc_open(int linux_flags)
@@ -2540,9 +2543,15 @@ int fuse_dup_fd(int src_fd,
         return -1;
     }
 
-    int guest_fd = fixed_slot
-                       ? fd_alloc_at_relaxed(fixed_guest_fd, snap.type, -1)
-                       : fd_alloc_from_relaxed(min_guest_fd, snap.type, -1);
+    /* Install cleanup atomically with the type. Without this, a racing
+     * close between fd_alloc_*_relaxed publishing the slot and the later
+     * fd_table[guest_fd].cleanup assignment would skip fuse_fd_cleanup
+     * and leak the session or file ref.
+     */
+    int guest_fd = fixed_slot ? fd_alloc_at_relaxed(fixed_guest_fd, snap.type,
+                                                    -1, fuse_fd_cleanup)
+                              : fd_alloc_from_relaxed(min_guest_fd, snap.type,
+                                                      -1, fuse_fd_cleanup);
     if (guest_fd < 0) {
         if (fixed_slot)
             errno = EBADF;
@@ -2588,7 +2597,6 @@ int fuse_dup_fd(int src_fd,
                           (LINUX_O_PATH | LINUX_O_DIRECTORY | LINUX_O_NOFOLLOW |
                            LINUX_O_DIRECT | LINUX_O_LARGEFILE);
     fd_table[guest_fd].linux_flags = preserved_flags | linux_flags;
-    fd_table[guest_fd].cleanup = fuse_fd_cleanup;
     pthread_mutex_unlock(&fuse_lock);
     return guest_fd;
 }

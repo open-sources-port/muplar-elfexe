@@ -104,6 +104,7 @@ void timerfd_init(void)
 {
     for (int i = 0; i < TIMERFD_MAX; i++)
         timerfd_state[i].guest_fd = -1;
+    fd_register_cleanup(FD_TIMERFD, timerfd_close);
 }
 
 static int timerfd_find(int guest_fd)
@@ -514,10 +515,20 @@ static void timerfd_close(int guest_fd)
 #define LINUX_EFD_NONBLOCK 0x800  /* Same as O_NONBLOCK */
 #define LINUX_EFD_SEMAPHORE 1
 
-/* Per-eventfd state */
+/* Per-eventfd state. The slot is shared across guest_fds that point at it (via
+ * dup/dup2/fcntl F_DUPFD), matching the Linux contract that dup'd eventfd fds
+ * share the same kernel object. eventfd_owner[gfd] maps a guest_fd to its slot;
+ * multiple guest_fds can map to the same slot. The slot owns its own read end
+ * for readiness/drain/blocking operations so it does not depend on any one
+ * guest fd remaining open. The slot is freed when refcount drops to zero. The
+ * slot's guest_fd field is retained for sfd_alloc_slot's
+ * "free if guest_fd == -1" convention and tracks the most recently allocated
+ * primary owner.
+ */
 #define EVENTFD_MAX 32
 static struct {
-    int guest_fd;     /* Guest fd (-1 if unused) */
+    int guest_fd;     /* Primary guest fd, -1 when slot is free */
+    int refcount;     /* Number of guest_fds bound to this slot */
     int pipe_rd;      /* Read end of self-pipe (for poll/epoll readiness) */
     int pipe_wr;      /* Write end of self-pipe */
     uint64_t counter; /* Accumulated event counter */
@@ -525,21 +536,40 @@ static struct {
     int nonblock;     /* O_NONBLOCK */
 } eventfd_state[EVENTFD_MAX];
 
+static int eventfd_owner[FD_TABLE_SIZE]; /* guest_fd -> slot, or -1 */
+
 void eventfd_init(void)
 {
     for (int i = 0; i < EVENTFD_MAX; i++)
         eventfd_state[i].guest_fd = -1;
+    for (int i = 0; i < FD_TABLE_SIZE; i++)
+        eventfd_owner[i] = -1;
+    fd_register_cleanup(FD_EVENTFD, eventfd_close);
 }
 
 static int eventfd_find(int guest_fd)
 {
-    return sfd_find_slot(eventfd_state, EVENTFD_MAX, sizeof(eventfd_state[0]),
-                         guest_fd);
+    if (!RANGE_CHECK(guest_fd, 0, FD_TABLE_SIZE))
+        return -1;
+    return eventfd_owner[guest_fd];
 }
 
 static int eventfd_slot_alloc(void)
 {
     return sfd_alloc_slot(eventfd_state, EVENTFD_MAX, sizeof(eventfd_state[0]));
+}
+
+static void eventfd_release_ref_locked(int slot)
+{
+    if (--eventfd_state[slot].refcount <= 0) {
+        close(eventfd_state[slot].pipe_rd);
+        close(eventfd_state[slot].pipe_wr);
+        eventfd_state[slot].guest_fd = -1;
+        eventfd_state[slot].counter = 0;
+        eventfd_state[slot].refcount = 0;
+        eventfd_state[slot].pipe_rd = -1;
+        eventfd_state[slot].pipe_wr = -1;
+    }
 }
 
 int64_t sys_eventfd2(unsigned int initval, int flags)
@@ -564,9 +594,22 @@ int64_t sys_eventfd2(unsigned int initval, int flags)
         return linux_errno();
     }
 
+    int state_rd = dup(pipefd[0]);
+    if (state_rd < 0 || fd_set_nonblock(state_rd) < 0 ||
+        fd_set_cloexec(state_rd) < 0) {
+        int saved_errno = errno;
+        if (state_rd >= 0)
+            close(state_rd);
+        close(pipefd[0]);
+        close(pipefd[1]);
+        errno = saved_errno;
+        return linux_errno();
+    }
+
     /* Allocate guest fd: use read end as the host fd so epoll/poll sees it */
     int gfd = fd_alloc(FD_EVENTFD, pipefd[0], eventfd_close);
     if (gfd < 0) {
+        close(state_rd);
         close(pipefd[0]);
         close(pipefd[1]);
         return -LINUX_EMFILE;
@@ -577,17 +620,20 @@ int64_t sys_eventfd2(unsigned int initval, int flags)
     if (slot < 0) {
         pthread_mutex_unlock(&sfd_lock);
         fd_mark_closed(gfd);
+        close(state_rd);
         close(pipefd[0]);
         close(pipefd[1]);
         return -LINUX_ENOMEM;
     }
 
     eventfd_state[slot].guest_fd = gfd;
-    eventfd_state[slot].pipe_rd = pipefd[0];
+    eventfd_state[slot].refcount = 1;
+    eventfd_state[slot].pipe_rd = state_rd;
     eventfd_state[slot].pipe_wr = pipefd[1];
     eventfd_state[slot].counter = (uint64_t) initval;
     eventfd_state[slot].semaphore = (flags & LINUX_EFD_SEMAPHORE) ? 1 : 0;
     eventfd_state[slot].nonblock = (flags & LINUX_EFD_NONBLOCK) ? 1 : 0;
+    eventfd_owner[gfd] = slot;
     pthread_mutex_unlock(&sfd_lock);
 
     fd_table[gfd].linux_flags =
@@ -610,12 +656,115 @@ static void eventfd_close(int guest_fd)
     pthread_mutex_lock(&sfd_lock);
     int slot = eventfd_find(guest_fd);
     if (slot >= 0) {
-        close(eventfd_state[slot].pipe_wr);
-        /* pipe_rd is closed by sys_close() as host_fd */
-        eventfd_state[slot].guest_fd = -1;
-        eventfd_state[slot].counter = 0;
+        eventfd_owner[guest_fd] = -1;
+        eventfd_release_ref_locked(slot);
     }
     pthread_mutex_unlock(&sfd_lock);
+}
+
+/* Bind an additional guest_fd to the same slot as src_fd, sharing the
+ * counter and pipe state. Two races to defeat:
+ *
+ *   - Source identity. duplicate_guest_fd() snapshots src_fd under
+ *     fd_lock, releases it, then calls us. Between those points src_fd
+ *     could be closed and rebound to a different eventfd. We carry the
+ *     caller's snapshot of fd_table[src_fd].host_fd as src_host_fd and verify
+ *     under fd_lock + sfd_lock that the source fd still has that host fd and
+ *     still maps to a live eventfd slot.
+ *
+ *   - Destination close. fd_alloc_*_relaxed publishes the new guest_fd
+ *     with eventfd_close as cleanup before we install the owner mapping.
+ *     A racing close would run eventfd_close, see owner == -1, skip the
+ *     refcount decrement, and leak the slot. We defeat this by reserving a
+ *     slot ref before publishing the destination, then holding fd_lock +
+ *     sfd_lock together while we verify fd_table[new] is still FD_EVENTFD with
+ *     the host_fd we allocated and set eventfd_owner. Any close that already
+ *     ran is observed here as FD_CLOSED, and we abandon the bind cleanly with
+ *     no leak.
+ */
+int eventfd_dup_fd(int src_fd,
+                   int src_host_fd,
+                   int min_guest_fd,
+                   int fixed_guest_fd,
+                   bool fixed_slot,
+                   int linux_flags)
+{
+    /* Pin the source under fd_lock + sfd_lock and dup the slot-owned
+     * readiness fd. The slot fd is independent of any guest alias, so closing
+     * the source later cannot invalidate eventfd_state[slot].pipe_rd.
+     */
+    pthread_mutex_lock(&fd_lock);
+    pthread_mutex_lock(&sfd_lock);
+    int slot = eventfd_find(src_fd);
+    if (slot < 0 || fd_table[src_fd].type != FD_EVENTFD ||
+        fd_table[src_fd].host_fd != src_host_fd ||
+        eventfd_state[slot].refcount <= 0) {
+        pthread_mutex_unlock(&sfd_lock);
+        pthread_mutex_unlock(&fd_lock);
+        errno = EBADF;
+        return -1;
+    }
+    eventfd_state[slot].refcount++;
+    int new_host_fd = dup(eventfd_state[slot].pipe_rd);
+    int original_pipe_rd = eventfd_state[slot].pipe_rd;
+    if (new_host_fd < 0)
+        eventfd_release_ref_locked(slot);
+    pthread_mutex_unlock(&sfd_lock);
+    pthread_mutex_unlock(&fd_lock);
+    if (new_host_fd < 0)
+        return -1;
+
+    /* Publish the destination fd with eventfd_close as cleanup. The
+     * eventfd_owner mapping is still -1, so a racing close here observes
+     * owner == -1 and does nothing; we detect that below.
+     */
+    int new_guest_fd = fixed_slot
+                           ? fd_alloc_at_relaxed(fixed_guest_fd, FD_EVENTFD,
+                                                 new_host_fd, eventfd_close)
+                           : fd_alloc_from_relaxed(min_guest_fd, FD_EVENTFD,
+                                                   new_host_fd, eventfd_close);
+    if (new_guest_fd < 0) {
+        close(new_host_fd);
+        pthread_mutex_lock(&sfd_lock);
+        eventfd_release_ref_locked(slot);
+        pthread_mutex_unlock(&sfd_lock);
+        if (fixed_slot)
+            errno = EBADF;
+        return -1;
+    }
+
+    /* Commit the bind under both locks in the documented order
+     * (fd_lock then sfd_lock). If a close already ran, fd_table[new].type
+     * is FD_CLOSED and we just bail with -EBADF; the host_fd is already
+     * gone via sys_close. Otherwise verify the source slot is still
+     * alive and unchanged, then install owner for the reserved ref.
+     */
+    pthread_mutex_lock(&fd_lock);
+    pthread_mutex_lock(&sfd_lock);
+    if (fd_table[new_guest_fd].type != FD_EVENTFD ||
+        fd_table[new_guest_fd].host_fd != new_host_fd ||
+        eventfd_state[slot].refcount <= 0 ||
+        eventfd_state[slot].pipe_rd != original_pipe_rd) {
+        pthread_mutex_unlock(&sfd_lock);
+        pthread_mutex_unlock(&fd_lock);
+        /* If the destination is still open but the source went away,
+         * tear it down. (If the destination already closed itself, the
+         * snapshot below sees FD_CLOSED and is a no-op.)
+         */
+        fd_entry_t snap;
+        if (fd_snapshot_and_close(new_guest_fd, &snap))
+            fd_cleanup_entry(new_guest_fd, &snap);
+        pthread_mutex_lock(&sfd_lock);
+        eventfd_release_ref_locked(slot);
+        pthread_mutex_unlock(&sfd_lock);
+        errno = EBADF;
+        return -1;
+    }
+    eventfd_owner[new_guest_fd] = slot;
+    fd_table[new_guest_fd].linux_flags = linux_flags;
+    pthread_mutex_unlock(&sfd_lock);
+    pthread_mutex_unlock(&fd_lock);
+    return new_guest_fd;
 }
 
 /* Read from eventfd: return 8-byte counter value, then reset to 0.
@@ -657,8 +806,12 @@ int64_t eventfd_read(int guest_fd, guest_t *g, uint64_t buf_gva, uint64_t count)
             return linux_errno();
 
         pthread_mutex_lock(&sfd_lock);
-        /* Re-validate: slot may have been freed by eventfd_close() */
-        if (eventfd_state[slot].guest_fd != guest_fd) {
+        /* Re-validate via the owner table, not eventfd_state[slot].guest_fd:
+         * dup'd aliases bind multiple guest_fds to the same slot, so a
+         * legitimate caller's guest_fd may not equal the primary owner.
+         */
+        if (eventfd_owner[guest_fd] != slot ||
+            eventfd_state[slot].refcount <= 0) {
             pthread_mutex_unlock(&sfd_lock);
             return -LINUX_EBADF;
         }
@@ -809,6 +962,7 @@ void signalfd_init(void)
 {
     for (int i = 0; i < SIGNALFD_MAX; i++)
         signalfd_state[i].guest_fd = -1;
+    fd_register_cleanup(FD_SIGNALFD, signalfd_close);
 }
 
 static int signalfd_find(int guest_fd)

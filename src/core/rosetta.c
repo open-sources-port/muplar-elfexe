@@ -469,7 +469,7 @@ int rosetta_finalize(guest_t *g,
      * goto fail must be introduced below, or the fail handler would
      * double-close it.
      */
-    int bin_guest_fd = fd_alloc_at(3, FD_REGULAR, bin_host_fd);
+    int bin_guest_fd = fd_alloc_at(3, FD_REGULAR, bin_host_fd, NULL);
     if (bin_guest_fd < 0) {
         log_error("rosetta_finalize: fd_alloc_at(3) failed");
         goto fail;

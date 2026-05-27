@@ -1447,7 +1447,7 @@ int signal_deliver(hv_vcpu_t vcpu, guest_t *g, int *exit_code)
      * glibc leaves sa_restorer uninitialized (garbage); musl sets it to
      * __restore_rt.  Match the kernel: always use the vDSO trampoline.
      */
-    hv_vcpu_set_reg(vcpu, HV_REG_X30, VDSO_BASE + VDSO_OFF_TEXT);
+    hv_vcpu_set_reg(vcpu, HV_REG_X30, VDSO_BASE + VDSO_OFF_SIGRET);
 
     if (act->sa_flags & LINUX_SA_SIGINFO) {
         /* X1 = pointer to siginfo, X2 = pointer to ucontext */

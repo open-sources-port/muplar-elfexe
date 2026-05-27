@@ -19,6 +19,7 @@
 #include <errno.h>
 #include <stdbool.h>
 #include <limits.h>
+#include <pthread.h>
 #include <sys/stat.h>
 #include <sys/uio.h>
 #include <sys/ioctl.h>
@@ -43,6 +44,7 @@
 
 #define SYSCALL_IOV_MAX 1024
 #define SYSCALL_IOV_STACK_MAX 64
+#define URANDOM_CACHE_SIZE 4096
 
 /* Linux terminal struct types. */
 
@@ -59,6 +61,15 @@ typedef struct {
     uint8_t c_line;
     uint8_t c_cc[19];
 } linux_termios_t;
+
+typedef struct {
+    uint8_t buf[URANDOM_CACHE_SIZE];
+    size_t off;
+    size_t len;
+} urandom_cache_t;
+
+static pthread_mutex_t urandom_lock = PTHREAD_MUTEX_INITIALIZER;
+static urandom_cache_t urandom_cache[FD_TABLE_SIZE];
 
 _Static_assert(sizeof(linux_termios_t) == 36,
                "aarch64 Linux TCGETS struct termios must be 36 bytes");
@@ -121,6 +132,120 @@ static int64_t io_return_zero(host_fd_ref_t *host_ref)
 {
     host_fd_ref_close(host_ref);
     return 0;
+}
+
+void urandom_fd_reset_cache(int guest_fd)
+{
+    if (!RANGE_CHECK(guest_fd, 0, FD_TABLE_SIZE))
+        return;
+
+    pthread_mutex_lock(&urandom_lock);
+    memset(&urandom_cache[guest_fd], 0, sizeof(urandom_cache[guest_fd]));
+    pthread_mutex_unlock(&urandom_lock);
+}
+
+void urandom_fd_cleanup(int guest_fd)
+{
+    if (!RANGE_CHECK(guest_fd, 0, FD_TABLE_SIZE))
+        return;
+
+    urandom_fd_reset_cache(guest_fd);
+}
+
+static int64_t urandom_check_readable(int guest_fd)
+{
+    fd_entry_t snap;
+    if (!fd_snapshot(guest_fd, &snap) || snap.type != FD_URANDOM)
+        return -LINUX_EBADF;
+    if ((snap.linux_flags & 3) == LINUX_O_WRONLY)
+        return -LINUX_EBADF;
+    return 0;
+}
+
+static int64_t urandom_fill_iov(int guest_fd,
+                                const struct iovec *iov,
+                                int iovcnt)
+{
+    int64_t err = urandom_check_readable(guest_fd);
+    if (err < 0)
+        return err;
+
+    size_t total = 0;
+    for (int i = 0; i < iovcnt; i++) {
+        if (iov[i].iov_len > (size_t) SSIZE_MAX - total)
+            return -LINUX_EINVAL;
+        total += iov[i].iov_len;
+    }
+    if (total == 0)
+        return 0;
+
+    pthread_mutex_lock(&urandom_lock);
+    urandom_cache_t *c = &urandom_cache[guest_fd];
+    size_t done = 0;
+    for (int i = 0; i < iovcnt && done < total; i++) {
+        uint8_t *dst = iov[i].iov_base;
+        size_t iov_done = 0;
+        size_t iov_len = iov[i].iov_len;
+        if (iov_len > total - done)
+            iov_len = total - done;
+        while (iov_done < iov_len) {
+            if (c->off == c->len) {
+                arc4random_buf(c->buf, sizeof(c->buf));
+                c->off = 0;
+                c->len = sizeof(c->buf);
+            }
+            size_t chunk = c->len - c->off;
+            if (chunk > iov_len - iov_done)
+                chunk = iov_len - iov_done;
+            memcpy(dst + iov_done, c->buf + c->off, chunk);
+            c->off += chunk;
+            iov_done += chunk;
+            done += chunk;
+        }
+    }
+    pthread_mutex_unlock(&urandom_lock);
+    return (int64_t) done;
+}
+
+static int64_t validate_iov_total(guest_t *g, uint64_t iov_gva, int iovcnt)
+{
+    if (iovcnt <= 0 || iovcnt > SYSCALL_IOV_MAX)
+        return -LINUX_EINVAL;
+
+    size_t total = 0;
+    for (int i = 0; i < iovcnt; i++) {
+        linux_iovec_t giov;
+        if (guest_read_small(g, iov_gva + (uint64_t) i * sizeof(giov), &giov,
+                             sizeof(giov)) < 0)
+            return -LINUX_EFAULT;
+        if (giov.iov_len > (uint64_t) SSIZE_MAX - total)
+            return -LINUX_EINVAL;
+        total += (size_t) giov.iov_len;
+    }
+    return 0;
+}
+
+static int64_t urandom_read(guest_t *g,
+                            int guest_fd,
+                            uint64_t buf_gva,
+                            uint64_t count)
+{
+    if (count > SSIZE_MAX)
+        count = SSIZE_MAX;
+    if (count == 0) {
+        struct iovec empty = {0};
+        return urandom_fill_iov(guest_fd, &empty, 1);
+    }
+
+    uint64_t avail = 0;
+    void *dst = guest_ptr_bound(g, buf_gva, &avail, MEM_PERM_W, count);
+    if (!dst)
+        return -LINUX_EFAULT;
+    if (count > avail)
+        count = avail;
+
+    struct iovec iov = {.iov_base = dst, .iov_len = (size_t) count};
+    return urandom_fill_iov(guest_fd, &iov, 1);
 }
 
 static bool rosetta_ioctl_target_fd(guest_t *g, int host_fd)
@@ -689,12 +814,11 @@ static int64_t io_write_result(ssize_t ret)
 
 int64_t sys_write(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
 {
-    if (RANGE_CHECK(fd, 0, FD_TABLE_SIZE)) {
-        if (fd_table[fd].type == FD_FUSE_DEV)
-            return fuse_dev_write(g, fd, buf_gva, count);
-        if (fd_table[fd].type == FD_EVENTFD)
-            return eventfd_write(fd, g, buf_gva, count);
-    }
+    int type = fd_get_type(fd);
+    if (type == FD_FUSE_DEV)
+        return fuse_dev_write(g, fd, buf_gva, count);
+    if (type == FD_EVENTFD)
+        return eventfd_write(fd, g, buf_gva, count);
 
     host_fd_ref_t host_ref;
     int64_t err = host_fd_ref_open_checked(fd, &host_ref, true);
@@ -741,21 +865,28 @@ int64_t sys_write(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
 
 int64_t sys_read(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
 {
-    if (RANGE_CHECK(fd, 0, FD_TABLE_SIZE)) {
-        if (fd_table[fd].type == FD_FUSE_DEV)
-            return fuse_dev_read(fd, g, buf_gva, count);
-        if (fd_table[fd].type == FD_FUSE_FILE)
-            return fuse_read_fd(g, fd, buf_gva, count);
-        if (fd_table[fd].type == FD_EVENTFD)
-            return eventfd_read(fd, g, buf_gva, count);
-        if (fd_table[fd].type == FD_SIGNALFD)
-            return signalfd_read(fd, g, buf_gva, count);
-        if (fd_table[fd].type == FD_TIMERFD)
-            return timerfd_read(fd, g, buf_gva, count);
-        if (fd_table[fd].type == FD_INOTIFY)
-            return inotify_read(fd, g, buf_gva, count);
-        if (fd_table[fd].type == FD_NETLINK)
-            return netlink_read(fd, g, buf_gva, count);
+    /* Read the type once under fd_lock so a concurrent close/reopen cannot
+     * make different dispatch checks disagree. Each handler still
+     * re-validates internally and returns EBADF if its slot changed.
+     */
+    int type = fd_get_type(fd);
+    switch (type) {
+    case FD_FUSE_DEV:
+        return fuse_dev_read(fd, g, buf_gva, count);
+    case FD_FUSE_FILE:
+        return fuse_read_fd(g, fd, buf_gva, count);
+    case FD_EVENTFD:
+        return eventfd_read(fd, g, buf_gva, count);
+    case FD_SIGNALFD:
+        return signalfd_read(fd, g, buf_gva, count);
+    case FD_TIMERFD:
+        return timerfd_read(fd, g, buf_gva, count);
+    case FD_INOTIFY:
+        return inotify_read(fd, g, buf_gva, count);
+    case FD_NETLINK:
+        return netlink_read(fd, g, buf_gva, count);
+    case FD_URANDOM:
+        return urandom_read(g, fd, buf_gva, count);
     }
 
     host_fd_ref_t host_ref;
@@ -914,11 +1045,23 @@ static int64_t build_host_iov(guest_t *g,
                 free(guest_iov);
             return -LINUX_EFAULT;
         }
-        /* Cap to contiguous permitted bytes */
+        /* Cap to contiguous permitted bytes. When the guest iov entry
+         * spans a non-contiguous boundary (different mapping or
+         * permission), zero every subsequent host iov length so the
+         * host readv/writev returns a POSIX-compliant short I/O rather
+         * than silently packing the truncated tail of buffer i into
+         * buffer i+1 -- which corrupts the guest's data layout.
+         */
         uint64_t len = guest_iov[i].iov_len;
-        if (len > avail)
-            len = avail;
         host_iov[i].iov_base = base;
+        if (len > avail) {
+            host_iov[i].iov_len = avail;
+            for (int j = i + 1; j < iovcnt; j++) {
+                host_iov[j].iov_base = NULL;
+                host_iov[j].iov_len = 0;
+            }
+            break;
+        }
         host_iov[i].iov_len = len;
     }
     if (guest_iov != stack_giov)
@@ -981,29 +1124,49 @@ int64_t sys_readv(guest_t *g, int fd, uint64_t iov_gva, int iovcnt)
         int64_t err = single_guest_iov(g, iov_gva, &giov);
         if (err < 0)
             return err;
+        if (fd_get_type(fd) == FD_URANDOM &&
+            giov.iov_len > (uint64_t) SSIZE_MAX) {
+            err = urandom_check_readable(fd);
+            if (err < 0)
+                return err;
+            return -LINUX_EINVAL;
+        }
         return sys_read(g, fd, giov.iov_base, giov.iov_len);
     }
 
     /* Special FD types need their custom read handlers because glibc may use
      * readv() instead of read() for the same logical operation. Delegate
-     * to the first iov entry's buffer.  Use the first iov's length (not
-     * the sum of all iovs) because the data goes into giov[0].iov_base
-     * which is only giov[0].iov_len bytes long.
+     * scalar special fds to the first iov entry's buffer. Use the first iov's
+     * length (not the sum of all iovs) because the data goes into
+     * giov[0].iov_base which is only giov[0].iov_len bytes long.
      */
-    if (RANGE_CHECK(fd, 0, FD_TABLE_SIZE)) {
-        int type = fd_table[fd].type;
-        if (type == FD_EVENTFD || type == FD_SIGNALFD || type == FD_TIMERFD ||
-            type == FD_INOTIFY) {
-            if (iovcnt <= 0)
-                return -LINUX_EINVAL;
-            /* Use guest_read for the iov array since guest_ptr alone is unsafe
-             * if the array spans a 2MiB block boundary.
-             */
-            linux_iovec_t giov;
-            if (guest_read_small(g, iov_gva, &giov, sizeof(giov)) < 0)
-                return -LINUX_EFAULT;
-            return sys_read(g, fd, giov.iov_base, giov.iov_len);
-        }
+    int type = fd_get_type(fd);
+    if (type == FD_URANDOM) {
+        int64_t err = urandom_check_readable(fd);
+        if (err < 0)
+            return err;
+        err = validate_iov_total(g, iov_gva, iovcnt);
+        if (err < 0)
+            return err;
+        host_iov_buf_t host_iov;
+        err = host_iov_prepare(g, iov_gva, iovcnt, MEM_PERM_W, &host_iov);
+        if (err < 0)
+            return err;
+        int64_t ret = urandom_fill_iov(fd, host_iov.iov, iovcnt);
+        host_iov_free(&host_iov);
+        return ret;
+    }
+    if (type == FD_EVENTFD || type == FD_SIGNALFD || type == FD_TIMERFD ||
+        type == FD_INOTIFY) {
+        if (iovcnt <= 0)
+            return -LINUX_EINVAL;
+        /* Use guest_read for the iov array since guest_ptr alone is unsafe
+         * if the array spans a 2MiB block boundary.
+         */
+        linux_iovec_t giov;
+        if (guest_read_small(g, iov_gva, &giov, sizeof(giov)) < 0)
+            return -LINUX_EFAULT;
+        return sys_read(g, fd, giov.iov_base, giov.iov_len);
     }
 
     host_fd_ref_t host_ref;
@@ -1051,7 +1214,7 @@ int64_t sys_writev(guest_t *g, int fd, uint64_t iov_gva, int iovcnt)
      * sum of all iovs) because the data is at giov.iov_base which is only
      * giov.iov_len bytes.  eventfd expects exactly 8 bytes.
      */
-    if (RANGE_CHECK(fd, 0, FD_TABLE_SIZE) && fd_table[fd].type == FD_EVENTFD) {
+    if (fd_get_type(fd) == FD_EVENTFD) {
         if (iovcnt <= 0)
             return -LINUX_EINVAL;
         linux_iovec_t giov;

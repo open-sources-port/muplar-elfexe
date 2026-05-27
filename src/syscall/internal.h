@@ -59,31 +59,77 @@ void fdtable_init(void);
  */
 int fd_alloc(int type, int host_fd, void (*cleanup)(int));
 
-/* Allocate the lowest available FD >= minfd. Returns -1 if none available. */
-int fd_alloc_from(int minfd, int type, int host_fd);
+/* Allocate the lowest available FD >= minfd. Returns -1 if none available.
+ * cleanup is set atomically under fd_lock (pass NULL for plain fds).
+ */
+int fd_alloc_from(int minfd, int type, int host_fd, void (*cleanup)(int));
 
 /* Allocate the lowest available FD >= minfd with a single-thread fast path.
  * Falls back to fd_alloc_from() when multiple guest threads are active.
  */
-int fd_alloc_from_relaxed(int minfd, int type, int host_fd);
+int fd_alloc_from_relaxed(int minfd,
+                          int type,
+                          int host_fd,
+                          void (*cleanup)(int));
 
-/* Allocate a specific FD slot. Returns -1 if out of range. */
-int fd_alloc_at(int fd, int type, int host_fd);
+/* Allocate a specific FD slot.
+ * Returns -1 if out of range.
+ * cleanup is set atomically under fd_lock (pass NULL for plain fds).
+ */
+int fd_alloc_at(int fd, int type, int host_fd, void (*cleanup)(int));
 
 /* Allocate a specific FD slot with a single-thread fast path.
  * Falls back to fd_alloc_at() when replacement/cleanup must stay serialized.
  */
-int fd_alloc_at_relaxed(int fd, int type, int host_fd);
+int fd_alloc_at_relaxed(int fd, int type, int host_fd, void (*cleanup)(int));
 
 /* Look up a guest FD. Returns host FD or -1 if invalid.
  * Unsafe for concurrent use; see fd_snapshot/fd_to_host_dup.
  */
 int fd_to_host(int guest_fd);
 
-/* Snapshot an fd entry under fd_lock. Thread-safe alternative to
- * direct fd_table[] access. Returns true on success, false if closed.
+/* Snapshot an fd entry under fd_lock. Thread-safe alternative to direct
+ * fd_table[] access.
+ * Returns true on success, false if closed.
  */
 bool fd_snapshot(int guest_fd, fd_entry_t *out);
+
+/* Snapshot an fd entry AND dup its host fd in a single fd_lock critical
+ * section. Eliminates the TOCTOU window between reading the type/metadata
+ * and duplicating the host fd in the dup(2) path. Returns the dup'd host
+ * fd (owned by the caller) on success, -1 on failure. On success the
+ * snapshot in *out is consistent with the dup'd host fd.
+ */
+int fd_snapshot_and_dup(int guest_fd, fd_entry_t *out);
+
+/* Read just the fd type under fd_lock. Returns FD_CLOSED for out-of-range or
+ * closed slots. Cheaper than fd_snapshot when only the type is needed for
+ * dispatch (sys_read/sys_readv/sys_writev fast paths).
+ */
+int fd_get_type(int guest_fd);
+
+/* Type -> cleanup registry. Modules that own a synthetic fd type register
+ * their cleanup at init time; dup and fork-restore paths look up the
+ * cleanup from the type so the binding stays consistent without each path
+ * re-deriving the dispatch table.
+ */
+void fd_register_cleanup(int type, void (*cleanup)(int));
+void (*fd_cleanup_for_type(int type))(int);
+
+/* True for fd types whose host backing (kqueue for timerfd/inotify, pipe
+ * halves for eventfd/signalfd/netlink/pidfd, epoll instance) cannot be
+ * meaningfully inherited across fork IPC: macOS SCM_RIGHTS rejects kqueue
+ * fds, and the per-class side-table state (eventfd counter, signalfd mask,
+ * pidfd target, epoll set, ...) is not serialized. The child must recreate
+ * such fds via the appropriate syscall, so the parent filters them from the
+ * SCM_RIGHTS payload and the receiver drops any that still arrive.
+ */
+static inline bool fd_type_is_synthetic(int type)
+{
+    return type == FD_EVENTFD || type == FD_SIGNALFD || type == FD_TIMERFD ||
+           type == FD_INOTIFY || type == FD_NETLINK || type == FD_PIDFD ||
+           type == FD_EPOLL;
+}
 
 /* Look up a guest FD and return a dup'd host fd owned by the caller.
  * Thread-safe: dup is performed under fd_lock. Returns -1 on failure.

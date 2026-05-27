@@ -111,6 +111,7 @@ void inotify_init(void)
 {
     for (int i = 0; i < INOTIFY_MAX; i++)
         inotify_state[i].guest_fd = -1;
+    fd_register_cleanup(FD_INOTIFY, inotify_close);
 }
 
 static int inotify_find(int guest_fd)

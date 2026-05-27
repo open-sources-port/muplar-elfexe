@@ -21,6 +21,7 @@
 #include "core/bootstrap.h"
 #include "core/rosetta.h"
 #include "core/stack.h"
+#include "core/startup-trace.h"
 #include "core/vdso.h"
 
 #include "runtime/thread.h"
@@ -334,14 +335,17 @@ int guest_bootstrap_prepare(guest_t *g,
     mem_region_t regions[MAX_BOOT_REGIONS];
     int nregions = 0;
     uint64_t native_vdso;
+    uint64_t t0;
 
     memset(boot, 0, sizeof(*boot));
     *guest_initialized = false;
 
+    t0 = startup_trace_now_ns();
     if (elf_load(elf_host_path, &boot->elf_info) < 0) {
         log_error("failed to load ELF: %s", elf_host_path);
         return -1;
     }
+    startup_trace_step("elf_load", t0);
 
     bool want_rosetta = false;
     if (boot->elf_info.e_machine == EM_X86_64) {
@@ -374,10 +378,12 @@ int guest_bootstrap_prepare(guest_t *g,
      * the request is non-fatal in either direction.
      */
     uint32_t req_ipa = want_rosetta ? 48 : 0;
+    t0 = startup_trace_now_ns();
     if (guest_init(g, 0, req_ipa) < 0) {
         log_error("failed to initialize guest");
         return -1;
     }
+    startup_trace_step("guest_init", t0);
     *guest_initialized = true;
     g->is_rosetta = want_rosetta;
     proc_set_rosetta_active(want_rosetta);
@@ -405,11 +411,13 @@ int guest_bootstrap_prepare(guest_t *g,
     } else {
         boot->elf_load_base =
             (boot->elf_info.e_type == ET_DYN) ? PIE_LOAD_BASE : 0;
+        t0 = startup_trace_now_ns();
         if (elf_map_segments(&boot->elf_info, elf_host_path, g->host_base,
                              g->guest_size, boot->elf_load_base) < 0) {
             log_error("failed to map ELF segments");
             return -1;
         }
+        startup_trace_step("elf_map_segments", t0);
 
         /* Track the lowest loaded ELF address so the legacy fork IPC path
          * copies low-linked ET_EXECs (e.g. linked at 0x200000) in full.
@@ -427,8 +435,10 @@ int guest_bootstrap_prepare(guest_t *g,
             g->stack_top = STACK_TOP_DEFAULT;
         g->stack_base = g->stack_top - STACK_SIZE;
 
+        t0 = startup_trace_now_ns();
         if (!load_interpreter(g, sysroot, boot))
             return -1;
+        startup_trace_step("load_interpreter", t0);
     }
 
     if (shim_bin_len > BLOCK_2MIB) {
@@ -436,6 +446,7 @@ int guest_bootstrap_prepare(guest_t *g,
         return -1;
     }
 
+    t0 = startup_trace_now_ns();
     memcpy((uint8_t *) g->host_base + g->shim_base, shim_bin, shim_bin_len);
     log_debug("shim loaded at offset 0x%llx (%zu bytes)",
               (unsigned long long) g->shim_base, shim_bin_len);
@@ -448,12 +459,15 @@ int guest_bootstrap_prepare(guest_t *g,
     }
     sys_icache_invalidate((uint8_t *) g->host_base + g->shim_base,
                           shim_bin_len);
+    startup_trace_step("shim_load_icache", t0);
 
+    t0 = startup_trace_now_ns();
     if (!build_boot_regions(regions, &nregions, g, boot, shim_bin_len)) {
         log_error("too many memory regions (%d >= %d)", nregions,
                   MAX_BOOT_REGIONS);
         return -1;
     }
+    startup_trace_step("build_boot_regions", t0);
 
     /* Rosetta path: append the rosetta image as a non-identity region so the
      * page-table builder maps VA 0x800000000000 -> primary buffer GPA.
@@ -461,24 +475,29 @@ int guest_bootstrap_prepare(guest_t *g,
      * from the same pool that guest_build_page_tables is about to consume).
      */
     if (want_rosetta) {
+        t0 = startup_trace_now_ns();
         if (rosetta_prepare(g, elf_host_path, regions, &nregions,
                             MAX_BOOT_REGIONS, verbose, &rr) < 0) {
             log_error("rosetta_prepare failed for %s", elf_guest_path);
             return -1;
         }
+        startup_trace_step("rosetta_prepare", t0);
     }
 
+    t0 = startup_trace_now_ns();
     boot->ttbr0 = guest_build_page_tables(g, regions, nregions);
     if (!boot->ttbr0) {
         log_error("failed to build page tables");
         return -1;
     }
+    startup_trace_step("guest_build_page_tables", t0);
     /* No TLBI request here: the shim's _start does TLBI VMALLE1IS before
      * enabling the MMU (src/core/shim.S), and the per-vCPU accumulator is the
      * wrong place to stage a bring-up flush -- bootstrap may run on a thread
      * whose slot is later consumed by an unrelated syscall.
      */
 
+    t0 = startup_trace_now_ns();
     if (want_rosetta) {
         /* /proc/self/maps for a rosetta guest reports the rosetta translator
          * as a single anonymous region covering [VA, VA+size). The original
@@ -505,12 +524,14 @@ int guest_bootstrap_prepare(guest_t *g,
     }
 
     register_runtime_regions(g, shim_bin_len);
+    startup_trace_step("register_regions", t0);
 
     log_debug("TTBR0=0x%llx, IPA base=0x%llx", (unsigned long long) boot->ttbr0,
               (unsigned long long) g->ipa_base);
     if (verbose)
         log_initial_page_tables(g, boot->ttbr0);
 
+    t0 = startup_trace_now_ns();
     syscall_init();
     proc_init();
 
@@ -526,6 +547,7 @@ int guest_bootstrap_prepare(guest_t *g,
     proc_set_elf_path(elf_guest_path);
     if (sysroot)
         proc_set_sysroot(sysroot);
+    startup_trace_step("runtime_init", t0);
 
     /* rosetta_finalize pre-opens the x86_64 binary at fd 3, constructs the
      * binfmt_misc argv ([ROSETTA_PATH, binary, original_argv[1..]]), refreshes
@@ -536,18 +558,22 @@ int guest_bootstrap_prepare(guest_t *g,
     int rosetta_argc = 0;
     const char **rosetta_argv = NULL;
     if (want_rosetta) {
+        t0 = startup_trace_now_ns();
         if (rosetta_finalize(g, 0, elf_host_path, elf_host_path_temp,
                              elf_guest_path, guest_argc, guest_argv, &rr,
                              verbose, &rosetta_argc, &rosetta_argv, NULL) < 0) {
             log_error("rosetta_finalize failed");
             return -1;
         }
+        startup_trace_step("rosetta_finalize", t0);
     } else {
         proc_set_cmdline(guest_argc, guest_argv);
     }
     proc_set_environ((const char **) environ);
 
+    t0 = startup_trace_now_ns();
     native_vdso = vdso_build(g);
+    startup_trace_step("vdso_build", t0);
     linux_stack_auxv_t auxv;
     const elf_info_t *stack_elf =
         want_rosetta ? &rr.rosetta_info : &boot->elf_info;
@@ -555,6 +581,7 @@ int guest_bootstrap_prepare(guest_t *g,
     uint64_t stack_interp_base = want_rosetta ? 0 : boot->interp_base;
     int stack_argc = want_rosetta ? rosetta_argc : guest_argc;
     const char **stack_argv = want_rosetta ? rosetta_argv : guest_argv;
+    t0 = startup_trace_now_ns();
     boot->stack_pointer = build_linux_stack(
         g, g->stack_top, stack_argc, stack_argv, (const char **) environ,
         stack_elf, stack_elf_load_base, stack_interp_base, native_vdso, -1,
@@ -564,6 +591,7 @@ int guest_bootstrap_prepare(guest_t *g,
         free(rosetta_argv);
         return -1;
     }
+    startup_trace_step("build_linux_stack", t0);
     /* rosetta_argv was copied into the guest stack; the host allocation is
      * no longer needed. The strings themselves are constants (ROSETTA_PATH)
      * or owned by the caller (binary_path, guest_argv entries) so freeing
@@ -599,6 +627,7 @@ int guest_bootstrap_create_vcpu(guest_t *g,
 {
     uint64_t sctlr;
     uint64_t sctlr_with_mmu;
+    uint64_t t0;
     /* Rosetta needs TTBR1 walks enabled and TBI1=1 so the kbuf window at
      * KBUF_VA_BASE (bits-63-set) resolves and TaggedPointer extraction keeps
      * working. Aarch64 guests stay on the EPD1=1 variant which keeps the
@@ -613,7 +642,9 @@ int guest_bootstrap_create_vcpu(guest_t *g,
     hv_vcpu_t vcpu;
     hv_vcpu_exit_t *vexit;
 
+    t0 = startup_trace_now_ns();
     HV_CHECK(hv_vcpu_create(&vcpu, &vexit, NULL));
+    startup_trace_step("hv_vcpu_create", t0);
     g->vcpu = vcpu;
     g->exit = vexit;
     *out_vcpu = vcpu;
@@ -621,6 +652,7 @@ int guest_bootstrap_create_vcpu(guest_t *g,
 
     thread_register_main(vcpu, vexit, proc_get_pid(), el1_sp);
 
+    t0 = startup_trace_now_ns();
     HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_VBAR_EL1, shim_ipa + 0x800));
     HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_MAIR_EL1, 0xFF00));
     HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TCR_EL1, tcr_value));
@@ -631,6 +663,12 @@ int guest_bootstrap_create_vcpu(guest_t *g,
     HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SPSR_EL1, 0x0));
     HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SP_EL0, sp_ipa));
     HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SP_EL1, el1_sp));
+
+    /* CNTKCTL_EL1.EL0VCTEN | EL0PCTEN: allow EL0 to read CNTVCT_EL0 /
+     * CNTPCT_EL0. Required by the vDSO clock_gettime fast path (and is the
+     * default on native Linux), without which the guest gets 0 back from MRS.
+     */
+    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_CNTKCTL_EL1, 0x3ULL));
 
     HV_CHECK(hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_SCTLR_EL1, &sctlr));
     log_debug("SCTLR_EL1 default=0x%llx", (unsigned long long) sctlr);
@@ -645,6 +683,7 @@ int guest_bootstrap_create_vcpu(guest_t *g,
     sctlr_with_mmu = SCTLR_RES1 | SCTLR_M | SCTLR_C | SCTLR_I | SCTLR_DZE |
                      SCTLR_UCT | SCTLR_UCI;
     HV_CHECK(hv_vcpu_set_reg(vcpu, HV_REG_X0, sctlr_with_mmu));
+    startup_trace_step("hv_vcpu_configure", t0);
 
     log_debug(
         "vCPU configured: PC=0x%llx SCTLR=0x%llx VBAR=0x%llx TTBR0=0x%llx "

@@ -98,7 +98,7 @@ static void recvmsg_close_host_rights(const void *data_src, size_t data_len)
 
 int64_t sys_sendmsg(guest_t *g, int fd, uint64_t msg_gva, int linux_flags)
 {
-    if (RANGE_CHECK(fd, 0, FD_TABLE_SIZE) && fd_table[fd].type == FD_NETLINK)
+    if (fd_get_type(fd) == FD_NETLINK)
         return netlink_sendmsg(fd, g, msg_gva, linux_flags);
 
     host_fd_ref_t host_ref;
@@ -339,7 +339,7 @@ int64_t sys_sendmsg(guest_t *g, int fd, uint64_t msg_gva, int linux_flags)
 
 int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags)
 {
-    if (RANGE_CHECK(fd, 0, FD_TABLE_SIZE) && fd_table[fd].type == FD_NETLINK)
+    if (fd_get_type(fd) == FD_NETLINK)
         return netlink_recvmsg(fd, g, msg_gva, flags);
 
     host_fd_ref_t host_ref;

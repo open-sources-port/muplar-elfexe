@@ -50,6 +50,13 @@ static pidfd_entry_t *pidfd_find_guest_fd_entry(int guest_fd)
     return NULL;
 }
 
+static void pidfd_cleanup(int guest_fd);
+
+void pidfd_init(void)
+{
+    fd_register_cleanup(FD_PIDFD, pidfd_cleanup);
+}
+
 static void pidfd_cleanup(int guest_fd)
 {
     pthread_mutex_lock(&pidfd_lock);

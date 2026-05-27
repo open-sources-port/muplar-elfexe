@@ -396,6 +396,7 @@ static int nl_build_getaddr(netlink_state_t *ns)
 void netlink_init(void)
 {
     memset(nl_state, 0, sizeof(nl_state));
+    fd_register_cleanup(FD_NETLINK, netlink_close);
 }
 
 int64_t netlink_socket(int protocol, int type)

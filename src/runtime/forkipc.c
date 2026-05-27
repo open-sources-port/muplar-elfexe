@@ -1272,7 +1272,7 @@ int64_t sys_clone(hv_vcpu_t vcpu,
      *
      * Rosetta guests are excluded from CoW even when shm-backed: rosetta's
      * JIT state (TLS slabs, code caches, indirect-call tables, block lists)
-     * is process-local and corrupts when COW-shared. The legacy region-copy
+     * is process-local and corrupts when CoW-shared. The legacy region-copy
      * path preserves the parent's JIT state independently per child.
      */
     bool use_shm = (g->shm_fd >= 0) && !g->is_rosetta;

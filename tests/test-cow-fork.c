@@ -1,4 +1,4 @@
-/* COW fork memory isolation tests
+/* CoW fork memory isolation tests
  *
  * Copyright 2026 elfuse contributors
  * Copyright 2025 Moritz Angermann, zw3rk pte. ltd.
@@ -166,11 +166,11 @@ static void test_mmap_isolation(void)
     munmap(region, 4096);
 }
 
-/* Test 4: Large region COW (verify no corruption) */
+/* Test 4: Large region CoW (verify no corruption) */
 
 static void test_large_cow(void)
 {
-    TEST("fork: 1MiB COW integrity");
+    TEST("fork: 1MiB CoW integrity");
 
     int pipefd[2];
     if (pipe(pipefd) != 0) {
@@ -229,7 +229,7 @@ static void test_large_cow(void)
     int status;
     waitpid(pid, &status, 0);
 
-    EXPECT_TRUE(parent_ok && child_ok, "1MiB COW integrity failed");
+    EXPECT_TRUE(parent_ok && child_ok, "1MiB CoW integrity failed");
     munmap(buf, sz);
 }
 
@@ -302,7 +302,7 @@ static void test_brk_isolation(void)
 
 int main(void)
 {
-    printf("test-cow-fork: COW fork memory isolation tests\n");
+    printf("test-cow-fork: CoW fork memory isolation tests\n");
 
     test_stack_isolation();
     test_heap_isolation();

@@ -182,12 +182,55 @@ static void test_large_read_from_split_block(void)
     EXPECT_TRUE(ok, "read returned short count or corrupted data");
 }
 
+static void test_urandom_read_crosses_boundary(void)
+{
+    TEST("/dev/urandom partial read at mapping boundary");
+
+    size_t page = (size_t) sysconf(_SC_PAGESIZE);
+    unsigned char *map = mmap(NULL, page * 2, PROT_READ | PROT_WRITE,
+                              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (map == MAP_FAILED) {
+        FAIL("mmap failed");
+        return;
+    }
+    if (munmap(map + page, page) != 0) {
+        munmap(map, page);
+        FAIL("munmap guard failed");
+        return;
+    }
+
+    memset(map, 0, page);
+
+    int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        munmap(map, page);
+        FAIL("open failed");
+        return;
+    }
+
+    ssize_t ret = read(fd, map, page * 2);
+    close(fd);
+
+    bool any_nonzero = false;
+    for (size_t i = 0; i < page; i++) {
+        if (map[i] != 0) {
+            any_nonzero = true;
+            break;
+        }
+    }
+
+    munmap(map, page);
+    EXPECT_TRUE(ret == (ssize_t) page && any_nonzero,
+                "urandom read did not preserve partial boundary result");
+}
+
 int main(void)
 {
     printf("large I/O boundary tests\n\n");
 
     test_large_write();
     test_large_read_from_split_block();
+    test_urandom_read_crosses_boundary();
 
     SUMMARY("test-large-io-boundary");
     return fails ? 1 : 0;

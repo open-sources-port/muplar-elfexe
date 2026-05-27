@@ -15,6 +15,7 @@
 
 #include "utils.h"
 
+#include "core/vdso.h"
 #include "runtime/thread.h" /* current_thread, guest_tid */
 #include "syscall/abi.h"
 #include "syscall/internal.h"
@@ -252,6 +253,27 @@ int64_t sys_clock_gettime(guest_t *g, int clockid, uint64_t tp_gva)
 
     if (guest_write_small(g, tp_gva, &ts, sizeof(ts)) < 0)
         return -LINUX_EFAULT;
+
+    /* If this trap came from the __kernel_clock_gettime vDSO svc_fallback,
+     * the trampoline parked the guest's CNTVCT_EL0 read in X9 before
+     * issuing SVC, and ELR_EL1 holds the address immediately after that
+     * SVC. Pair X9 with the wall_clock we just computed and seed the vvar
+     * so subsequent calls hit the fast path. Skip the seed for any other
+     * trap (raw syscall(SYS_clock_gettime, ...) from guest code, etc.):
+     * X9 is then arbitrary guest state, and seeding from it would poison
+     * the anchor and break every later fast-path call.
+     */
+    if (clockid == 1 /* CLOCK_MONOTONIC */ && current_thread) {
+        uint64_t elr = 0;
+        uint64_t guest_cntvct = 0;
+        if (hv_vcpu_get_sys_reg(current_thread->vcpu, HV_SYS_REG_ELR_EL1,
+                                &elr) == HV_SUCCESS &&
+            elr == vdso_clock_gettime_svc_pc() + 4 &&
+            hv_vcpu_get_reg(current_thread->vcpu, HV_REG_X9, &guest_cntvct) ==
+                HV_SUCCESS &&
+            guest_cntvct != 0)
+            vdso_seed_anchor(g, guest_cntvct, ts.tv_sec, ts.tv_nsec);
+    }
 
     return 0;
 }

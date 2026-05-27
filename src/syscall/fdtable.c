@@ -169,26 +169,29 @@ int fd_alloc(int type, int host_fd, void (*cleanup)(int))
 /* Allocate the lowest available FD >= minfd. Returns -1 if none available
  * or RLIMIT_NOFILE would be exceeded.
  */
-int fd_alloc_from(int minfd, int type, int host_fd)
+int fd_alloc_from(int minfd, int type, int host_fd, void (*cleanup)(int))
 {
     pthread_mutex_lock(&fd_lock);
-    int fd = fd_alloc_locked(minfd, type, host_fd, NULL);
+    int fd = fd_alloc_locked(minfd, type, host_fd, cleanup);
     pthread_mutex_unlock(&fd_lock);
     return fd;
 }
 
-int fd_alloc_from_relaxed(int minfd, int type, int host_fd)
+int fd_alloc_from_relaxed(int minfd,
+                          int type,
+                          int host_fd,
+                          void (*cleanup)(int))
 {
     if (!thread_is_single_active())
-        return fd_alloc_from(minfd, type, host_fd);
-    return fd_alloc_locked(minfd, type, host_fd, NULL);
+        return fd_alloc_from(minfd, type, host_fd, cleanup);
+    return fd_alloc_locked(minfd, type, host_fd, cleanup);
 }
 
 /* Allocate a specific FD slot. Enforces RLIMIT_NOFILE. Properly cleans up any
  * existing entry (including DIR* for directory FDs) before overwriting. Returns
  * -1 if out of range.
  */
-int fd_alloc_at(int fd, int type, int host_fd)
+int fd_alloc_at(int fd, int type, int host_fd, void (*cleanup)(int))
 {
     if (!RANGE_CHECK(fd, 0, FD_TABLE_SIZE))
         return -1;
@@ -204,7 +207,7 @@ int fd_alloc_at(int fd, int type, int host_fd)
     pthread_mutex_lock(&fd_lock);
     if (fd_table[fd].type != FD_CLOSED)
         old = fd_table[fd];
-    fd_init_entry(fd, type, host_fd, NULL);
+    fd_init_entry(fd, type, host_fd, cleanup);
     pthread_mutex_unlock(&fd_lock);
 
     /* Clean up old resources outside fd_lock */
@@ -214,19 +217,19 @@ int fd_alloc_at(int fd, int type, int host_fd)
     return fd;
 }
 
-int fd_alloc_at_relaxed(int fd, int type, int host_fd)
+int fd_alloc_at_relaxed(int fd, int type, int host_fd, void (*cleanup)(int))
 {
     if (!RANGE_CHECK(fd, 0, FD_TABLE_SIZE))
         return -1;
     if (fd >= rlimit_nofile_cur)
         return -1;
     if (!thread_is_single_active())
-        return fd_alloc_at(fd, type, host_fd);
+        return fd_alloc_at(fd, type, host_fd, cleanup);
 
     if (fd_table[fd].type != FD_CLOSED)
-        return fd_alloc_at(fd, type, host_fd);
+        return fd_alloc_at(fd, type, host_fd, cleanup);
 
-    fd_init_entry(fd, type, host_fd, NULL);
+    fd_init_entry(fd, type, host_fd, cleanup);
     return fd;
 }
 
@@ -332,6 +335,53 @@ bool fd_snapshot(int guest_fd, fd_entry_t *out)
     bool ok = fd_snapshot_locked(guest_fd, out, false);
     pthread_mutex_unlock(&fd_lock);
     return ok;
+}
+
+int fd_snapshot_and_dup(int guest_fd, fd_entry_t *out)
+{
+    out->type = FD_CLOSED;
+    if (!RANGE_CHECK(guest_fd, 0, FD_TABLE_SIZE))
+        return -1;
+    pthread_mutex_lock(&fd_lock);
+    if (!fd_snapshot_locked(guest_fd, out, false)) {
+        pthread_mutex_unlock(&fd_lock);
+        return -1;
+    }
+    int host = (out->host_fd >= 0) ? dup(out->host_fd) : -1;
+    pthread_mutex_unlock(&fd_lock);
+    return host;
+}
+
+int fd_get_type(int guest_fd)
+{
+    if (!RANGE_CHECK(guest_fd, 0, FD_TABLE_SIZE))
+        return FD_CLOSED;
+    pthread_mutex_lock(&fd_lock);
+    int type = fd_table[guest_fd].type;
+    pthread_mutex_unlock(&fd_lock);
+    return type;
+}
+
+/* Sized to cover all FD_* constants in abi.h plus a small headroom. Indexed
+ * by type. Each slot defaults to NULL (no per-type cleanup). Modules that
+ * own a type call fd_register_cleanup() at init time; dup and fork-restore
+ * paths read back the binding via fd_cleanup_for_type().
+ */
+#define FD_TYPE_REGISTRY_SIZE 32
+static void (*fd_type_cleanup[FD_TYPE_REGISTRY_SIZE])(int);
+
+void fd_register_cleanup(int type, void (*cleanup)(int))
+{
+    if (type < 0 || type >= FD_TYPE_REGISTRY_SIZE)
+        return;
+    fd_type_cleanup[type] = cleanup;
+}
+
+void (*fd_cleanup_for_type(int type))(int)
+{
+    if (type < 0 || type >= FD_TYPE_REGISTRY_SIZE)
+        return NULL;
+    return fd_type_cleanup[type];
 }
 
 /* Look up a guest FD and return a dup'd host fd that the caller owns.

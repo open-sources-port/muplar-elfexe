@@ -33,6 +33,21 @@ int64_t sys_timerfd_gettime(guest_t *g, int fd, uint64_t curr_value_gva);
 /* eventfd (emulated via pipe + counter) */
 int64_t sys_eventfd2(unsigned int initval, int flags);
 
+/* Duplicate an eventfd into a new guest_fd slot, sharing the counter and
+ * pipe state with src_fd. Mirrors the Linux contract that dup'd eventfds
+ * share the same underlying kernel object. src_host_fd must be the host
+ * fd snapshotted from fd_table[src_fd].host_fd by the caller; the
+ * implementation uses it to verify under fd_lock + sfd_lock that the source
+ * fd still refers to the same live eventfd between the caller's snapshot and
+ * the dup commit. Returns the new guest_fd or -1 with errno set.
+ */
+int eventfd_dup_fd(int src_fd,
+                   int src_host_fd,
+                   int min_guest_fd,
+                   int fixed_guest_fd,
+                   bool fixed_slot,
+                   int linux_flags);
+
 /* signalfd (emulated via synthetic signal reads) */
 int64_t sys_signalfd4(guest_t *g,
                       int fd,

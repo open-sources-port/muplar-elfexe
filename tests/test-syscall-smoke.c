@@ -6,6 +6,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <signal.h>
@@ -55,6 +56,10 @@
 
 #ifndef SYS_sigaltstack
 #define SYS_sigaltstack 132
+#endif
+
+#ifndef O_PATH
+#define O_PATH 010000000
 #endif
 
 #ifndef SYS_set_tid_address
@@ -623,6 +628,242 @@ static void test_sysv_semaphore_ops(void)
     }
 }
 
+static void test_urandom_byte_reads(void)
+{
+    TEST("/dev/urandom byte reads");
+    int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        FAIL("open");
+        return;
+    }
+
+    unsigned char bytes[32];
+    for (size_t i = 0; i < sizeof(bytes); i++) {
+        ssize_t n = read(fd, &bytes[i], 1);
+        if (n != 1) {
+            close(fd);
+            FAIL("read");
+            return;
+        }
+    }
+    close(fd);
+
+    bool all_same = true;
+    for (size_t i = 1; i < sizeof(bytes); i++) {
+        if (bytes[i] != bytes[0]) {
+            all_same = false;
+            break;
+        }
+    }
+    if (all_same) {
+        FAIL("entropy stream did not vary");
+        return;
+    }
+    PASS();
+}
+
+static void test_urandom_open_flags(void)
+{
+    TEST("/dev/urandom open flags");
+
+    errno = 0;
+    int dirfd = open("/dev/urandom", O_RDONLY | O_DIRECTORY);
+    if (dirfd >= 0) {
+        close(dirfd);
+        FAIL("O_DIRECTORY open succeeded");
+        return;
+    }
+    if (errno != ENOTDIR) {
+        FAIL("O_DIRECTORY errno");
+        return;
+    }
+
+    int pathfd = open("/dev/urandom", O_PATH | O_CLOEXEC);
+    if (pathfd < 0) {
+        FAIL("O_PATH open");
+        return;
+    }
+    unsigned char b = 0;
+    errno = 0;
+    ssize_t n = read(pathfd, &b, 1);
+    int saved_errno = errno;
+    close(pathfd);
+    if (n != -1 || saved_errno != EBADF) {
+        FAIL("O_PATH read");
+        return;
+    }
+
+    int wfd = open("/dev/urandom", O_WRONLY | O_CLOEXEC);
+    if (wfd < 0) {
+        FAIL("O_WRONLY open");
+        return;
+    }
+    int fl = fcntl(wfd, F_GETFL);
+    errno = 0;
+    n = read(wfd, &b, 1);
+    saved_errno = errno;
+    close(wfd);
+    if (fl < 0 || (fl & O_ACCMODE) != O_WRONLY) {
+        FAIL("O_WRONLY F_GETFL");
+        return;
+    }
+    if (n != -1 || saved_errno != EBADF) {
+        FAIL("O_WRONLY read");
+        return;
+    }
+
+    wfd = open("/dev/urandom", O_WRONLY | O_CLOEXEC);
+    if (wfd < 0) {
+        FAIL("O_WRONLY open readv");
+        return;
+    }
+    struct iovec wv[2] = {{&b, 1}, {&b, 1}};
+    errno = 0;
+    n = readv(wfd, wv, 2);
+    saved_errno = errno;
+    close(wfd);
+    if (n != -1 || saved_errno != EBADF) {
+        FAIL("O_WRONLY readv");
+        return;
+    }
+
+    wfd = open("/dev/urandom", O_WRONLY | O_CLOEXEC);
+    if (wfd < 0) {
+        FAIL("O_WRONLY open oversized readv");
+        return;
+    }
+    struct iovec huge_wv[2] = {{&b, SSIZE_MAX}, {&b, 1}};
+    errno = 0;
+    n = readv(wfd, huge_wv, 2);
+    saved_errno = errno;
+    close(wfd);
+    if (n != -1 || saved_errno != EBADF) {
+        FAIL("O_WRONLY oversized readv");
+        return;
+    }
+
+    wfd = open("/dev/urandom", O_WRONLY | O_CLOEXEC);
+    if (wfd < 0) {
+        FAIL("O_WRONLY open oversized single readv");
+        return;
+    }
+    struct iovec huge_one_wv = {&b, (size_t) SSIZE_MAX + 1};
+    errno = 0;
+    n = readv(wfd, &huge_one_wv, 1);
+    saved_errno = errno;
+    close(wfd);
+    if (n != -1 || saved_errno != EBADF) {
+        FAIL("O_WRONLY oversized single readv");
+        return;
+    }
+
+    int rfd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+    if (rfd < 0) {
+        FAIL("O_RDONLY open readv");
+        return;
+    }
+    unsigned char rb[2] = {0};
+    struct iovec rv[2] = {{&rb[0], 1}, {&rb[1], 1}};
+    n = readv(rfd, rv, 2);
+    if (n != 2) {
+        close(rfd);
+        FAIL("O_RDONLY readv");
+        return;
+    }
+
+    struct iovec huge[2] = {{&b, SSIZE_MAX}, {&b, 1}};
+    errno = 0;
+    n = readv(rfd, huge, 2);
+    saved_errno = errno;
+    if (n != -1 || saved_errno != EINVAL) {
+        close(rfd);
+        FAIL("oversized readv");
+        return;
+    }
+
+    struct iovec huge_one = {&b, (size_t) SSIZE_MAX + 1};
+    errno = 0;
+    n = readv(rfd, &huge_one, 1);
+    saved_errno = errno;
+    if (n != -1 || saved_errno != EINVAL) {
+        close(rfd);
+        FAIL("oversized single readv");
+        return;
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(rfd);
+        FAIL("fork inherited urandom");
+        return;
+    }
+    if (pid == 0) {
+        unsigned char child_b = 0;
+        _exit(read(rfd, &child_b, 1) == 1 ? 0 : 1);
+    }
+    int status = 0;
+    waitpid(pid, &status, 0);
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        close(rfd);
+        FAIL("inherited urandom read");
+        return;
+    }
+
+    int p[2];
+    if (pipe(p) != 0) {
+        close(rfd);
+        FAIL("urandom fork pipe");
+        return;
+    }
+    unsigned char seed = 0;
+    if (read(rfd, &seed, 1) != 1) {
+        close(rfd);
+        close(p[0]);
+        close(p[1]);
+        FAIL("prime urandom cache before fork");
+        return;
+    }
+    pid = fork();
+    if (pid < 0) {
+        close(rfd);
+        close(p[0]);
+        close(p[1]);
+        FAIL("fork urandom cache isolation");
+        return;
+    }
+    if (pid == 0) {
+        close(p[0]);
+        unsigned char child_buf[64];
+        ssize_t got = read(rfd, child_buf, sizeof(child_buf));
+        ssize_t put = got == (ssize_t) sizeof(child_buf)
+                          ? write(p[1], child_buf, sizeof(child_buf))
+                          : -1;
+        close(p[1]);
+        _exit(put == (ssize_t) sizeof(child_buf) ? 0 : 1);
+    }
+    close(p[1]);
+    unsigned char parent_buf[64];
+    unsigned char child_buf[64];
+    ssize_t parent_n = read(rfd, parent_buf, sizeof(parent_buf));
+    ssize_t child_n = read(p[0], child_buf, sizeof(child_buf));
+    close(p[0]);
+    status = 0;
+    waitpid(pid, &status, 0);
+    close(rfd);
+    if (parent_n != (ssize_t) sizeof(parent_buf) ||
+        child_n != (ssize_t) sizeof(child_buf) || !WIFEXITED(status) ||
+        WEXITSTATUS(status) != 0) {
+        FAIL("urandom fork cache isolation read");
+        return;
+    }
+    if (memcmp(parent_buf, child_buf, sizeof(parent_buf)) == 0) {
+        FAIL("urandom fork duplicated cached bytes");
+        return;
+    }
+
+    PASS();
+}
+
 int main(int argc, char **argv)
 {
     printf("test-syscall-smoke: direct syscall smoke coverage\n\n");
@@ -642,6 +883,8 @@ int main(int argc, char **argv)
     test_memory_stubs();
     test_accept4();
     test_sysv_semaphore_ops();
+    test_urandom_byte_reads();
+    test_urandom_open_flags();
 
     SUMMARY("test-syscall-smoke");
     return fails > 0 ? 1 : 0;

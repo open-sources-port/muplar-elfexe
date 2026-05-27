@@ -215,7 +215,7 @@ int64_t sys_socketpair(guest_t *g,
 int64_t sys_bind(guest_t *g, int fd, uint64_t addr_gva, uint32_t addrlen)
 {
     /* Netlink sockets use synthetic fd; dispatch to netlink handler */
-    if (RANGE_CHECK(fd, 0, FD_TABLE_SIZE) && fd_table[fd].type == FD_NETLINK)
+    if (fd_get_type(fd) == FD_NETLINK)
         return netlink_bind(fd, g, addr_gva, addrlen);
 
     host_fd_ref_t host_ref;
@@ -469,7 +469,7 @@ int64_t sys_connect(guest_t *g, int fd, uint64_t addr_gva, uint32_t addrlen)
             return linux_errno();
         }
 
-        if (fd_alloc_at(fd, FD_SOCKET, pair[0]) < 0) {
+        if (fd_alloc_at(fd, FD_SOCKET, pair[0], NULL) < 0) {
             close(pair[0]);
             close(pair[1]);
             host_fd_ref_close(&host_ref);

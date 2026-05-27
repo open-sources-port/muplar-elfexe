@@ -38,6 +38,7 @@
 #include <unistd.h>
 
 #include "core/guest.h"
+#include "core/startup-trace.h"
 #include "debug/log.h"
 #include "utils.h"
 #include "runtime/thread.h" /* thread_destroy_all_vcpus */
@@ -202,6 +203,8 @@ static uint64_t *pt_at(const guest_t *g, uint64_t gpa)
 
 int guest_init(guest_t *g, uint64_t size, uint32_t ipa_bits)
 {
+    uint64_t t0;
+
     memset(g, 0, sizeof(*g));
     g->shm_fd = -1;
     g->ipa_base = GUEST_IPA_BASE;
@@ -257,6 +260,7 @@ int guest_init(guest_t *g, uint64_t size, uint32_t ipa_bits)
      * seconds max wait) to handle this gracefully.
      */
     hv_return_t ret = HV_ERROR;
+    t0 = startup_trace_now_ns();
     for (int attempt = 0; attempt < 30; attempt++) {
         hv_vm_config_t config = hv_vm_config_create();
         hv_vm_config_set_ipa_size(config, vm_ipa);
@@ -266,6 +270,7 @@ int guest_init(guest_t *g, uint64_t size, uint32_t ipa_bits)
             break;
         usleep(500000); /* 500ms between attempts */
     }
+    startup_trace_step("hv_vm_create", t0);
     if (ret != HV_SUCCESS) {
         log_error("guest: hv_vm_create failed: %d (ipa_bits=%u)", (int) ret,
                   vm_ipa);
@@ -307,8 +312,10 @@ int guest_init(guest_t *g, uint64_t size, uint32_t ipa_bits)
          * physical memory. Do NOT memset because that would touch every
          * page and defeat demand paging.
          */
+        t0 = startup_trace_now_ns();
         g->host_base = mmap(NULL, try_size, PROT_READ | PROT_WRITE,
                             MAP_ANON | MAP_PRIVATE, -1, 0);
+        startup_trace_step("primary_mmap", t0);
         if (g->host_base == MAP_FAILED) {
             perror("guest: mmap");
             g->host_base = NULL;
@@ -320,6 +327,7 @@ int guest_init(guest_t *g, uint64_t size, uint32_t ipa_bits)
          * path instead of SCM_RIGHTS fd passing.
          */
         char tmppath[] = "/tmp/elfuse-XXXXXX";
+        t0 = startup_trace_now_ns();
         int sfd = mkstemp(tmppath);
         if (sfd >= 0) {
             unlink(tmppath); /* Unlink immediately; fd keeps file alive */
@@ -335,9 +343,12 @@ int guest_init(guest_t *g, uint64_t size, uint32_t ipa_bits)
                 close(sfd);
             }
         }
+        startup_trace_step("cow_shm_upgrade", t0);
 
+        t0 = startup_trace_now_ns();
         ret = hv_vm_map(g->host_base, GUEST_IPA_BASE, try_size,
                         HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC);
+        startup_trace_step("hv_vm_map", t0);
         if (ret == HV_SUCCESS) {
             mapped_size = try_size;
             mapped = true;
@@ -380,6 +391,8 @@ int guest_init_from_shm(guest_t *g,
                         uint64_t size,
                         uint32_t ipa_bits)
 {
+    uint64_t t0;
+
     memset(g, 0, sizeof(*g));
     g->shm_fd = -1; /* Child does not own the shm */
     g->ipa_base = GUEST_IPA_BASE;
@@ -403,8 +416,10 @@ int guest_init_from_shm(guest_t *g,
      * the parent's frozen snapshot; writes are private to this process.
      * macOS CoW is page-granular: only modified pages are duplicated.
      */
+    t0 = startup_trace_now_ns();
     g->host_base =
         mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE, shm_fd, 0);
+    startup_trace_step("shm_mmap", t0);
     if (g->host_base == MAP_FAILED) {
         perror("guest: mmap shm");
         g->host_base = NULL;
@@ -417,6 +432,7 @@ int guest_init_from_shm(guest_t *g,
 
     /* Create HVF VM with the same IPA width as the parent */
     hv_return_t ret = HV_ERROR;
+    t0 = startup_trace_now_ns();
     for (int attempt = 0; attempt < 30; attempt++) {
         hv_vm_config_t config = hv_vm_config_create();
         hv_vm_config_set_ipa_size(config, ipa_bits);
@@ -426,6 +442,7 @@ int guest_init_from_shm(guest_t *g,
             break;
         usleep(500000);
     }
+    startup_trace_step("hv_vm_create_shm", t0);
     if (ret != HV_SUCCESS) {
         log_error("guest: hv_vm_create (shm) failed: %d", (int) ret);
         munmap(g->host_base, size);
@@ -433,8 +450,10 @@ int guest_init_from_shm(guest_t *g,
         return -1;
     }
 
+    t0 = startup_trace_now_ns();
     ret = hv_vm_map(g->host_base, GUEST_IPA_BASE, size,
                     HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC);
+    startup_trace_step("hv_vm_map_shm", t0);
     if (ret != HV_SUCCESS) {
         log_error("guest: hv_vm_map (shm) failed: %d", (int) ret);
         hv_vm_destroy();

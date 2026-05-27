@@ -56,6 +56,7 @@
 #include "syscall/poll.h"
 #include "syscall/path.h"
 #include "syscall/proc.h"
+#include "syscall/proc-pidfd.h"
 #include "syscall/signal.h"
 #include "syscall/sys.h"
 #include "syscall/sysvipc.h"
@@ -95,6 +96,8 @@ void syscall_init(void)
     inotify_init();
     netlink_init();
     fuse_init();
+    pidfd_init();
+    fd_register_cleanup(FD_URANDOM, urandom_fd_cleanup);
     wakeup_pipe_init();
 }
 

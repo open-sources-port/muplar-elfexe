@@ -45,10 +45,12 @@ test-file-ops
 test-sysinfo
 test-io-opt
 test-syscall-smoke
+test-vdso
 test-poll                      # diff=skip
 
 [section] I/O subsystem tests
 test-eventfd
+test-eventfd-dup
 test-signalfd
 test-signalfd-hardening
 test-epoll
@@ -83,8 +85,9 @@ test-clone3                    # diff=skip
 test-fork-exec $TESTDIR/echo-test
 test-fork-lowbase
 
-[section] COW fork isolation tests
+[section] CoW fork isolation tests
 test-cow-fork
+test-fork-synthetic-fd
 
 [section] O_CLOEXEC tests
 test-cloexec

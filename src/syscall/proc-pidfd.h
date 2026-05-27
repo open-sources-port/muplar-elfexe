@@ -10,6 +10,7 @@
 
 #include "core/guest.h"
 
+void pidfd_init(void);
 int pidfd_create(guest_t *g, int64_t target_pid);
 void proc_pidfd_notify_exit(int64_t exited_pid);
 int64_t proc_pidfd_lookup_pid(int guest_fd);

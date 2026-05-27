@@ -494,7 +494,7 @@ run_unit_tests()
     printf "\nNegative tests\n"
     test_check "$runner" "test-negative" "0 failed" "$bindir/test-negative"
 
-    printf "\nCOW fork isolation\n"
+    printf "\nCoW fork isolation\n"
     test_check "$runner" "test-cow-fork" "PASS" "$bindir/test-cow-fork"
 
     printf "\nGuard page / mmap edge cases\n"

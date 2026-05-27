@@ -21,6 +21,7 @@
 #include "debug/log.h"
 #include "syscall/abi.h"
 #include "syscall/internal.h"
+#include "syscall/io.h"
 #include "syscall/mem.h"
 #include "syscall/proc.h"
 
@@ -249,9 +250,19 @@ int fork_ipc_send_fd_table(int ipc_sock)
         if (fd_table[i].type == FD_CLOSED)
             continue;
 
+        /* Synthetic-fd types are filtered here; see fd_type_is_synthetic
+         * in syscall/internal.h for the rationale (kqueue cannot cross
+         * SCM_RIGHTS on macOS, per-class side tables are not serialized).
+         * The child sees these slots as FD_CLOSED and recreates them via
+         * the appropriate syscall.
+         */
+        int t = fd_table[i].type;
+        if (fd_type_is_synthetic(t))
+            continue;
+
         int host_fd;
         bool was_duped = false;
-        if (fd_table[i].type != FD_STDIO) {
+        if (t != FD_STDIO) {
             int duped = dup(fd_table[i].host_fd);
             if (duped < 0)
                 continue;
@@ -315,8 +326,11 @@ int fork_ipc_recv_fd_table(int ipc_fd, guest_t *g)
         return -1;
     }
 
-    if (num_fds == 0)
+    if (num_fds == 0) {
+        for (int fd = 0; fd < 3; fd++)
+            fd_mark_closed(fd);
         return 0;
+    }
 
     ipc_fd_entry_t *fd_entries = calloc(num_fds, sizeof(ipc_fd_entry_t));
     if (!fd_entries)
@@ -327,6 +341,16 @@ int fork_ipc_recv_fd_table(int ipc_fd, guest_t *g)
         free(fd_entries);
         return -1;
     }
+
+    bool low_fd_present[3] = {false, false, false};
+    for (uint32_t i = 0; i < num_fds; i++) {
+        int gfd = fd_entries[i].guest_fd;
+        if (RANGE_CHECK(gfd, 0, 3) && !fd_type_is_synthetic(fd_entries[i].type))
+            low_fd_present[gfd] = true;
+    }
+    for (int fd = 0; fd < 3; fd++)
+        if (!low_fd_present[fd])
+            fd_mark_closed(fd);
 
     int *host_fds = calloc(num_fds, sizeof(int));
     if (!host_fds) {
@@ -364,12 +388,30 @@ int fork_ipc_recv_fd_table(int ipc_fd, guest_t *g)
             memcpy(fd_table[gfd].proc_path, fd_entries[i].proc_path,
                    sizeof(fd_table[gfd].proc_path));
             fd_table[gfd].seals = fd_entries[i].seals;
+        } else if (fd_type_is_synthetic(fd_entries[i].type)) {
+            /* Defense in depth: the parent's fork_ipc_send_fd_table
+             * already filters synthetic types out of the SCM_RIGHTS
+             * payload (see fd_type_is_synthetic in syscall/internal.h).
+             * If anything still arrives here, drop the inherited host
+             * fd and leave the slot FD_CLOSED so the child must
+             * recreate the fd via the appropriate syscall.
+             */
+            log_debug(
+                "fork-child: dropping unexpected synthetic-type fd %d (type "
+                "%d)",
+                gfd, fd_entries[i].type);
+            close(host_fds[i]);
+            fd_mark_closed(gfd);
+            continue;
         } else {
-            fd_alloc_at(gfd, fd_entries[i].type, host_fds[i]);
+            void (*cleanup)(int) = fd_cleanup_for_type(fd_entries[i].type);
+            fd_alloc_at(gfd, fd_entries[i].type, host_fds[i], cleanup);
             fd_table[gfd].linux_flags = fd_entries[i].linux_flags;
             memcpy(fd_table[gfd].proc_path, fd_entries[i].proc_path,
                    sizeof(fd_table[gfd].proc_path));
             fd_table[gfd].seals = fd_entries[i].seals;
+            if (fd_entries[i].type == FD_URANDOM)
+                urandom_fd_reset_cache(gfd);
 
             if (fd_entries[i].type != FD_DIR)
                 continue;

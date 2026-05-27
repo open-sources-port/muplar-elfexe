@@ -639,6 +639,7 @@ typedef struct {
 #define FD_FUSE_DEV 14
 #define FD_FUSE_FILE 15
 #define FD_FUSE_DIR 16
+#define FD_URANDOM 17
 #define FD_VIRTUAL_PATH_MAX 64
 
 /* File sealing flags (F_SEAL_*) for memfd_create. Tracked per-FD. */
