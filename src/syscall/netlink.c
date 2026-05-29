@@ -188,8 +188,12 @@ static size_t nl_put_attr(uint8_t *buf,
     return aligned;
 }
 
-/* Build RTM_GETLINK response from host getifaddrs(). */
-static int nl_build_getlink(netlink_state_t *ns)
+/* Build RTM_GETLINK response from host getifaddrs(). A non-empty name_filter
+ * or non-zero index_filter restricts the reply to one matching link.
+ */
+static int nl_build_getlink(netlink_state_t *ns,
+                            const char *name_filter,
+                            uint32_t index_filter)
 {
     struct ifaddrs *ifalist, *ifa;
     if (getifaddrs(&ifalist) < 0)
@@ -208,6 +212,11 @@ static int nl_build_getlink(netlink_state_t *ns)
     for (ifa = ifalist; ifa; ifa = ifa->ifa_next) {
         unsigned int idx = if_nametoindex(ifa->ifa_name);
         if (idx == 0)
+            continue;
+
+        if (name_filter[0] && strcmp(ifa->ifa_name, name_filter) != 0)
+            continue;
+        if (index_filter != 0 && idx != index_filter)
             continue;
 
         /* Check if already seen */
@@ -459,6 +468,96 @@ int64_t netlink_bind(int guest_fd,
     return 0;
 }
 
+/* Extract the LinkByName/LinkByIndex filter (ifi_index plus an optional
+ * IFLA_IFNAME) from a RTM_GETLINK request. Empty name / zero index = no filter.
+ */
+static void nl_parse_link_filter(const uint8_t *req,
+                                 size_t reqlen,
+                                 char *name_out,
+                                 size_t name_cap,
+                                 uint32_t *index_out)
+{
+    name_out[0] = '\0';
+    *index_out = 0;
+
+    if (reqlen < (size_t) NLMSG_HDRLEN + sizeof(ifinfomsg_t))
+        return;
+
+    ifinfomsg_t ifi;
+    memcpy(&ifi, req + NLMSG_HDRLEN, sizeof(ifi));
+    if (ifi.ifi_index > 0)
+        *index_out = (uint32_t) ifi.ifi_index;
+
+    uint32_t nlmsg_len;
+    memcpy(&nlmsg_len, req, sizeof(nlmsg_len));
+    size_t total = (nlmsg_len < reqlen) ? nlmsg_len : reqlen;
+
+    size_t off = NLMSG_HDRLEN + NLMSG_ALIGN(sizeof(ifinfomsg_t));
+    while (off + RTA_HDRLEN <= total) {
+        rtattr_t rta;
+        memcpy(&rta, req + off, sizeof(rta));
+        if (rta.rta_len < RTA_HDRLEN || off + rta.rta_len > total)
+            break;
+        if (rta.rta_type == IFLA_IFNAME) {
+            size_t dlen = rta.rta_len - RTA_HDRLEN;
+            size_t i = 0;
+            for (; i < dlen && i + 1 < name_cap && req[off + RTA_HDRLEN + i];
+                 i++)
+                name_out[i] = (char) req[off + RTA_HDRLEN + i];
+            name_out[i] = '\0';
+        }
+        off += RTA_ALIGN(rta.rta_len);
+    }
+}
+
+/* Build the reply for one rtnetlink request (already copied into req). Mutates
+ * ns->buf/seq. Returns 0 on success (including a built NLMSG_ERROR reply for
+ * unsupported types), or a negative LINUX_E* on a build failure. Caller holds
+ * nl_lock. req is guaranteed to be at least NLMSG_HDRLEN bytes.
+ */
+static int nl_process_request(netlink_state_t *ns,
+                              const uint8_t *req,
+                              size_t reqlen)
+{
+    nlmsghdr_t req_hdr;
+    memcpy(&req_hdr, req, sizeof(req_hdr));
+    ns->seq = req_hdr.nlmsg_seq;
+
+    int ret;
+    switch (req_hdr.nlmsg_type) {
+    case RTM_GETLINK: {
+        char name[64];
+        uint32_t index;
+        nl_parse_link_filter(req, reqlen, name, sizeof(name), &index);
+        ret = nl_build_getlink(ns, name, index);
+        break;
+    }
+    case RTM_GETADDR:
+        ret = nl_build_getaddr(ns);
+        break;
+    default:
+        /* Unsupported request: return NLMSG_ERROR with EOPNOTSUPP */
+        if ((size_t) NLMSG_HDRLEN + 4 <= NETLINK_BUF_SIZE) {
+            size_t off = 0;
+            nlmsghdr_t err_hdr = {
+                .nlmsg_len = NLMSG_HDRLEN + 4,
+                .nlmsg_type = NLMSG_ERROR,
+                .nlmsg_seq = ns->seq,
+                .nlmsg_pid = ns->pid,
+            };
+            memcpy(ns->buf + off, &err_hdr, sizeof(err_hdr));
+            off += NLMSG_HDRLEN;
+            int32_t errcode = -95; /* -EOPNOTSUPP */
+            memcpy(ns->buf + off, &errcode, 4);
+            ns->buf_len = off + 4;
+            ns->buf_pos = 0;
+        }
+        return 0;
+    }
+
+    return (ret < 0) ? -LINUX_EIO : 0;
+}
+
 int64_t netlink_sendmsg(int guest_fd, guest_t *g, uint64_t msg_gva, int flags)
 {
     (void) flags;
@@ -491,54 +590,151 @@ int64_t netlink_sendmsg(int guest_fd, guest_t *g, uint64_t msg_gva, int flags)
         goto out;
     }
 
-    if (iov.iov_len < NLMSG_HDRLEN) {
+    if (iov.iov_len < (uint64_t) NLMSG_HDRLEN) {
         result = -LINUX_EINVAL;
         goto out;
     }
 
-    nlmsghdr_t req_hdr;
-    if (guest_read_small(g, iov.iov_base, &req_hdr, sizeof(req_hdr)) < 0) {
+    /* Copy the whole request: the dispatcher inspects filter attributes past
+     * the fixed nlmsghdr.
+     */
+    uint8_t req[512];
+    size_t rlen = (iov.iov_len < sizeof(req)) ? iov.iov_len : sizeof(req);
+    if (guest_read(g, iov.iov_base, req, rlen) < 0) {
         result = -LINUX_EFAULT;
         goto out;
     }
 
-    ns->seq = req_hdr.nlmsg_seq;
-
-    /* Dispatch based on request type */
-    int ret;
-    switch (req_hdr.nlmsg_type) {
-    case RTM_GETLINK:
-        ret = nl_build_getlink(ns);
-        break;
-    case RTM_GETADDR:
-        ret = nl_build_getaddr(ns);
-        break;
-    default:
-        /* Unsupported request: return NLMSG_ERROR with EOPNOTSUPP */
-        if (ns->buf_len + NLMSG_HDRLEN + 4 <= NETLINK_BUF_SIZE) {
-            size_t off = 0;
-            nlmsghdr_t err_hdr = {
-                .nlmsg_len = NLMSG_HDRLEN + 4,
-                .nlmsg_type = NLMSG_ERROR,
-                .nlmsg_seq = ns->seq,
-                .nlmsg_pid = ns->pid,
-            };
-            memcpy(ns->buf + off, &err_hdr, sizeof(err_hdr));
-            off += NLMSG_HDRLEN;
-            int32_t errcode = -95; /* -EOPNOTSUPP */
-            memcpy(ns->buf + off, &errcode, 4);
-            ns->buf_len = off + 4;
-            ns->buf_pos = 0;
-        }
-        result = (int64_t) iov.iov_len;
-        goto out;
-    }
-
-    result = (ret < 0) ? -LINUX_EIO : (int64_t) iov.iov_len;
+    int ret = nl_process_request(ns, req, rlen);
+    result = (ret < 0) ? ret : (int64_t) iov.iov_len;
 
 out:
     pthread_mutex_unlock(&nl_lock);
     return result;
+}
+
+/* sendto(2) on a netlink socket: a flat request buffer (no msghdr). */
+int64_t netlink_send(int guest_fd, guest_t *g, uint64_t buf_gva, uint64_t len)
+{
+    pthread_mutex_lock(&nl_lock);
+    netlink_state_t *ns = nl_find(guest_fd);
+    if (!ns) {
+        pthread_mutex_unlock(&nl_lock);
+        return -LINUX_EBADF;
+    }
+
+    int64_t result;
+    if (len < (uint64_t) NLMSG_HDRLEN) {
+        result = -LINUX_EINVAL;
+        goto out;
+    }
+
+    uint8_t req[512];
+    size_t rlen = (len < sizeof(req)) ? len : sizeof(req);
+    if (guest_read(g, buf_gva, req, rlen) < 0) {
+        result = -LINUX_EFAULT;
+        goto out;
+    }
+
+    int ret = nl_process_request(ns, req, rlen);
+    result = (ret < 0) ? ret : (int64_t) len;
+
+out:
+    pthread_mutex_unlock(&nl_lock);
+    return result;
+}
+
+/* recvfrom(2) on a netlink socket: drain whole messages; write back a kernel
+ * sockaddr_nl (nl_pid 0) when src is requested.
+ */
+int64_t netlink_recv(int guest_fd,
+                     guest_t *g,
+                     uint64_t buf_gva,
+                     uint64_t len,
+                     uint64_t src_gva,
+                     uint64_t addrlen_gva)
+{
+    pthread_mutex_lock(&nl_lock);
+    netlink_state_t *ns = nl_find(guest_fd);
+    if (!ns) {
+        pthread_mutex_unlock(&nl_lock);
+        return -LINUX_EBADF;
+    }
+
+    if (ns->buf_pos >= ns->buf_len) {
+        pthread_mutex_unlock(&nl_lock);
+        return 0;
+    }
+
+    size_t avail = ns->buf_len - ns->buf_pos;
+    size_t to_copy = (avail < len) ? avail : len;
+
+    /* Return complete netlink messages only (same walk as netlink_recvmsg). */
+    size_t msg_end = 0, pos = ns->buf_pos;
+    while (pos < ns->buf_len && (pos - ns->buf_pos + NLMSG_HDRLEN) <= to_copy) {
+        nlmsghdr_t *hdr = (nlmsghdr_t *) (ns->buf + pos);
+        if (hdr->nlmsg_len < NLMSG_HDRLEN)
+            break;
+        size_t msg_bytes = pos - ns->buf_pos + NLMSG_ALIGN(hdr->nlmsg_len);
+        if (msg_bytes > to_copy)
+            break;
+        pos += NLMSG_ALIGN(hdr->nlmsg_len);
+        msg_end = pos - ns->buf_pos;
+    }
+    if (msg_end == 0)
+        msg_end = to_copy;
+
+    if (guest_write(g, buf_gva, ns->buf + ns->buf_pos, msg_end) < 0) {
+        pthread_mutex_unlock(&nl_lock);
+        return -LINUX_EFAULT;
+    }
+    ns->buf_pos += msg_end;
+
+    if (src_gva && addrlen_gva) {
+        sockaddr_nl_t snl = {
+            .nl_family = LINUX_AF_NETLINK,
+            .nl_pid = 0, /* From kernel */
+        };
+        guest_write_small(g, src_gva, &snl, sizeof(snl));
+        uint32_t namelen = sizeof(sockaddr_nl_t);
+        guest_write_small(g, addrlen_gva, &namelen, sizeof(namelen));
+    }
+
+    pthread_mutex_unlock(&nl_lock);
+    return (int64_t) msg_end;
+}
+
+/* getsockname(2) on a netlink socket: returns the bound/auto-assigned pid. */
+int64_t netlink_getsockname(int guest_fd,
+                            guest_t *g,
+                            uint64_t addr_gva,
+                            uint64_t addrlen_gva)
+{
+    pthread_mutex_lock(&nl_lock);
+    netlink_state_t *ns = nl_find(guest_fd);
+    if (!ns) {
+        pthread_mutex_unlock(&nl_lock);
+        return -LINUX_EBADF;
+    }
+    uint32_t pid = ns->pid;
+    pthread_mutex_unlock(&nl_lock);
+
+    uint32_t cap = 0;
+    if (guest_read_small(g, addrlen_gva, &cap, sizeof(cap)) < 0)
+        return -LINUX_EFAULT;
+
+    sockaddr_nl_t snl = {
+        .nl_family = LINUX_AF_NETLINK,
+        .nl_pid = pid,
+    };
+    size_t n = (cap < sizeof(snl)) ? cap : sizeof(snl);
+    if (n > 0 && guest_write(g, addr_gva, &snl, n) < 0)
+        return -LINUX_EFAULT;
+
+    uint32_t actual = sizeof(snl);
+    if (guest_write_small(g, addrlen_gva, &actual, sizeof(actual)) < 0)
+        return -LINUX_EFAULT;
+    return 0;
 }
 
 int64_t netlink_recvmsg(int guest_fd, guest_t *g, uint64_t msg_gva, int flags)

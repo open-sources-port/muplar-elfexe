@@ -190,11 +190,24 @@ int64_t netlink_sendmsg(int guest_fd, guest_t *g, uint64_t msg_gva, int flags);
 /* Netlink recvmsg: return buffered response data. */
 int64_t netlink_recvmsg(int guest_fd, guest_t *g, uint64_t msg_gva, int flags);
 
-/* Netlink read: return buffered response data without msghdr metadata. */
 int64_t netlink_read(int guest_fd,
                      guest_t *g,
                      uint64_t buf_gva,
                      uint64_t count);
+
+int64_t netlink_send(int guest_fd, guest_t *g, uint64_t buf_gva, uint64_t len);
+
+int64_t netlink_recv(int guest_fd,
+                     guest_t *g,
+                     uint64_t buf_gva,
+                     uint64_t len,
+                     uint64_t src_gva,
+                     uint64_t addrlen_gva);
+
+int64_t netlink_getsockname(int guest_fd,
+                            guest_t *g,
+                            uint64_t addr_gva,
+                            uint64_t addrlen_gva);
 
 /* Clean up abstract socket filesystem entry for a fd being closed. */
 void absock_unregister_fd(int guest_fd);

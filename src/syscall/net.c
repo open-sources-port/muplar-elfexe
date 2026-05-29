@@ -509,6 +509,9 @@ int64_t sys_getsockname(guest_t *g,
                         uint64_t addr_gva,
                         uint64_t addrlen_gva)
 {
+    if (fd_get_type(fd) == FD_NETLINK)
+        return netlink_getsockname(fd, g, addr_gva, addrlen_gva);
+
     host_fd_ref_t host_ref;
     if (host_fd_ref_open(fd, &host_ref) < 0)
         return -LINUX_EBADF;
@@ -639,6 +642,9 @@ int64_t sys_sendto(guest_t *g,
                    uint64_t dest_gva,
                    uint32_t addrlen)
 {
+    if (fd_get_type(fd) == FD_NETLINK)
+        return netlink_send(fd, g, buf_gva, len);
+
     host_fd_ref_t host_ref;
     if (host_fd_ref_open(fd, &host_ref) < 0)
         return -LINUX_EBADF;
@@ -706,6 +712,9 @@ int64_t sys_recvfrom(guest_t *g,
                      uint64_t src_gva,
                      uint64_t addrlen_gva)
 {
+    if (fd_get_type(fd) == FD_NETLINK)
+        return netlink_recv(fd, g, buf_gva, len, src_gva, addrlen_gva);
+
     host_fd_ref_t host_ref;
     if (host_fd_ref_open(fd, &host_ref) < 0)
         return -LINUX_EBADF;
