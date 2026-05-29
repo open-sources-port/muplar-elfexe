@@ -119,12 +119,38 @@ static uint8_t *vdso_host_page(guest_t *g)
  *   [2] __kernel_clock_gettime
  *   [3] __kernel_gettimeofday
  *   [4] __kernel_getcpu
+ *
+ * Page layout (4 KiB):
+ *   0x000  EHDR
+ *   0x040  NT_GNU_ABI_TAG note (32 B)
+ *   0x0B0  vvar (seqlock counter, attention, anchor pairs)
+ *   0x0E0  rt_sigreturn trampoline
+ *   0x0EC  clock_getres / clock_gettime / gettimeofday / getcpu trampolines
+ *   ...    dynstr / dynsym / hash / versym / verdef / dynamic / shdr
+ *   0x4B0  section header table (8 entries)
+ *   0x6B0  program header table (3 entries: PT_LOAD, PT_DYNAMIC, PT_NOTE)
+ *
+ * The PHDR table sits at the bottom of the structural area so that the
+ * 4-byte-aligned NT_GNU_ABI_TAG note can occupy the old PHDR window and
+ * glibc 2.41's dynamic-linker vDSO probe finds the expected note without
+ * any of the trampoline / section offsets shifting.
  */
 
-/* Offsets within the 4KiB page */
+/* Offsets within the 4KiB page.
+ *
+ * The PHDR table now sits past the SHDR area at 0x6B0 (the EHDR's e_phoff
+ * field follows it there). This leaves the old PHDR slot at 0x040 free for
+ * the NT_GNU_ABI_TAG note data that glibc 2.41 expects to find via the
+ * PT_NOTE entry, without disturbing VVAR (0xB0), SIGRET (0xE0), or any of
+ * the trampoline / section offsets. PT_LOAD still maps the whole page so
+ * the note is loaded with the rest.
+ */
 #define VDSO_OFF_EHDR 0x000
-#define VDSO_OFF_PHDR 0x040
-#define VDSO_OFF_PHDR1 0x078
+/* NT_GNU_ABI_TAG note data lives at the old PHDR slot; 32 bytes fits
+ * comfortably inside the 112-byte gap up to VVAR.
+ */
+#define VDSO_OFF_NOTE 0x040
+#define VDSO_NOTE_SIZE 0x20
 
 /* vvar at fixed offset; host writes the wall-clock anchor on first
  * clock_gettime SVC, after the guest trampoline has stored its own
@@ -240,6 +266,16 @@ static uint8_t *vdso_host_page(guest_t *g)
 
 /* 8 * 64 = 512, 0x4B0 + 512 = 0x6B0 (fits in 4 KiB) */
 
+/* Program header table sits after the section headers so the old PHDR
+ * window at 0x040 can host the NT_GNU_ABI_TAG note data. Three entries
+ * (PT_LOAD, PT_DYNAMIC, PT_NOTE) at 56 bytes each end at 0x758, leaving
+ * the rest of the page reserved for future growth.
+ */
+#define VDSO_OFF_PHDR 0x6B0
+#define VDSO_OFF_PHDR1 (VDSO_OFF_PHDR + 0x38)
+#define VDSO_OFF_PHDR2 (VDSO_OFF_PHDR1 + 0x38)
+#define VDSO_PHDR_TABLE_END (VDSO_OFF_PHDR2 + 0x38)
+
 #define VDSO_NUM_SYMS 5
 #define HASH_NCHAIN (VDSO_NUM_SYMS + 1)
 #define HASH_NBUCKET 1
@@ -247,6 +283,41 @@ static uint8_t *vdso_host_page(guest_t *g)
 #define VERSYM_SIZE ((VDSO_NUM_SYMS + 1) * sizeof(uint16_t))
 #define VERDEF_SIZE (sizeof(elf64_verdef_t) + sizeof(elf64_verdaux_t))
 #define VDSO_NUM_DYN 9
+
+/* NT_GNU_ABI_TAG note. glibc 2.41's vDSO setup expects this entry to be
+ * present alongside the dynamic symbol table; without it the dynamic
+ * linker still maps the page but skips the per-symbol fast-path lookup,
+ * forcing the dynamically-linked guest into the SVC tail of every
+ * trampoline. The note layout matches what the upstream Linux kernel
+ * emits from arch/arm64/kernel/vdso/note.S:
+ *
+ *   namesz : 4   (uint32, "GNU\0")
+ *   descsz : 16  (uint32, four-word descriptor)
+ *   type   : 1   (NT_GNU_ABI_TAG)
+ *   name   : "GNU\0"
+ *   desc   : { 0 (Linux), major, minor, sublevel } as uint32 each
+ *
+ * The desc declares the minimum supported kernel ABI. 2.6.39 matches the
+ * LINUX_2.6.39 symbol version already exposed through DT_VERDEF -- both
+ * say "this vDSO speaks the 2.6.39 ABI" -- so a glibc that accepts the
+ * symbol version also accepts the note.
+ */
+#define NT_GNU_ABI_TAG 1
+#define ELF_NOTE_OS_LINUX 0
+#define VDSO_NOTE_KERNEL_MAJOR 2
+#define VDSO_NOTE_KERNEL_MINOR 6
+#define VDSO_NOTE_KERNEL_SUBLEVEL 39
+
+typedef struct {
+    uint32_t namesz;
+    uint32_t descsz;
+    uint32_t type;
+    char name[4]; /* "GNU\0" */
+    uint32_t desc[4];
+} elf64_note_gnu_abi_tag_t;
+
+_Static_assert(sizeof(elf64_note_gnu_abi_tag_t) == VDSO_NOTE_SIZE,
+               "GNU ABI tag note must match VDSO_NOTE_SIZE");
 
 /* .dynstr data */
 static const char dynstr_data[] =
@@ -899,12 +970,31 @@ uint64_t vdso_build(guest_t *g)
     ehdr->e_flags = 0;
     ehdr->e_ehsize = sizeof(elf64_ehdr_t);
     ehdr->e_phentsize = sizeof(elf64_phdr_t);
-    ehdr->e_phnum = 2;
+    ehdr->e_phnum = 3;
     ehdr->e_shentsize = sizeof(elf64_shdr_t);
     ehdr->e_shnum = 8;
     ehdr->e_shstrndx = 2;
     _Static_assert(VDSO_OFF_SHDR + 8 * sizeof(elf64_shdr_t) <= VDSO_SIZE,
                    "vDSO sections overflow the 4 KiB page");
+    _Static_assert(VDSO_PHDR_TABLE_END <= VDSO_SIZE,
+                   "vDSO program headers overflow the 4 KiB page");
+    _Static_assert(VDSO_OFF_NOTE + VDSO_NOTE_SIZE <= VDSO_OFF_VVAR,
+                   "GNU ABI tag note must not encroach on vvar");
+
+    /* NT_GNU_ABI_TAG note. PT_LOAD covers the whole page so the note is
+     * already mapped; PT_NOTE simply tags this offset for the dynamic
+     * linker's vDSO probe.
+     */
+    elf64_note_gnu_abi_tag_t *note =
+        (elf64_note_gnu_abi_tag_t *) (page + VDSO_OFF_NOTE);
+    note->namesz = sizeof(note->name);
+    note->descsz = sizeof(note->desc);
+    note->type = NT_GNU_ABI_TAG;
+    memcpy(note->name, "GNU", sizeof(note->name));
+    note->desc[0] = ELF_NOTE_OS_LINUX;
+    note->desc[1] = VDSO_NOTE_KERNEL_MAJOR;
+    note->desc[2] = VDSO_NOTE_KERNEL_MINOR;
+    note->desc[3] = VDSO_NOTE_KERNEL_SUBLEVEL;
 
     /* Program header 0: PT_LOAD. */
     elf64_phdr_t *phdr0 = (elf64_phdr_t *) (page + VDSO_OFF_PHDR);
@@ -927,6 +1017,17 @@ uint64_t vdso_build(guest_t *g)
     phdr1->p_filesz = VDSO_NUM_DYN * sizeof(elf64_dyn_t);
     phdr1->p_memsz = VDSO_NUM_DYN * sizeof(elf64_dyn_t);
     phdr1->p_align = 8;
+
+    /* Program header 2: PT_NOTE pointing at the NT_GNU_ABI_TAG above. */
+    elf64_phdr_t *phdr2 = (elf64_phdr_t *) (page + VDSO_OFF_PHDR2);
+    phdr2->p_type = PT_NOTE;
+    phdr2->p_flags = PF_R;
+    phdr2->p_offset = VDSO_OFF_NOTE;
+    phdr2->p_vaddr = VDSO_OFF_NOTE;
+    phdr2->p_paddr = VDSO_OFF_NOTE;
+    phdr2->p_filesz = VDSO_NOTE_SIZE;
+    phdr2->p_memsz = VDSO_NOTE_SIZE;
+    phdr2->p_align = 4;
 
     /* Text trampolines. rt_sigreturn keeps the 12-byte SVC pattern; the
      * other four entries are fast paths (CNTVCT for clock_gettime /

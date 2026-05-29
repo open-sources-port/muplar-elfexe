@@ -169,6 +169,40 @@ static void test_vdso(void)
     EXPECT(ehdr->e_machine == EM_AARCH64, "vDSO e_machine");
     EXPECT(ehdr->e_type == ET_DYN, "vDSO e_type");
 
+    /* NT_GNU_ABI_TAG note. glibc 2.41's vDSO probe expects a Linux ABI tag
+     * note alongside the dynamic symbol table; walk every PT_NOTE segment
+     * the EHDR advertises and confirm exactly one entry matches the
+     * (name="GNU", type=NT_GNU_ABI_TAG, desc[0]=Linux) shape with a
+     * minimum-kernel descriptor that is at least 2.6.39 (matching the
+     * LINUX_2.6.39 symbol version this vDSO exports).
+     */
+    const Elf64_Phdr *probe_phdr =
+        (const Elf64_Phdr *) ((const uint8_t *) ehdr + ehdr->e_phoff);
+    int gnu_abi_tag_count = 0;
+    for (int i = 0; i < ehdr->e_phnum; i++) {
+        if (probe_phdr[i].p_type != PT_NOTE)
+            continue;
+        const uint8_t *note_base =
+            (const uint8_t *) ehdr + probe_phdr[i].p_offset;
+        uint32_t namesz = *(const uint32_t *) (note_base + 0);
+        uint32_t descsz = *(const uint32_t *) (note_base + 4);
+        uint32_t type = *(const uint32_t *) (note_base + 8);
+        const char *name = (const char *) (note_base + 12);
+        if (type != 1 /* NT_GNU_ABI_TAG */ || namesz != 4 || descsz != 16)
+            continue;
+        if (memcmp(name, "GNU\0", 4) != 0)
+            continue;
+        const uint32_t *desc = (const uint32_t *) (note_base + 12 + 4);
+        EXPECT(desc[0] == 0, "NT_GNU_ABI_TAG OS == Linux");
+        uint32_t k = (desc[1] << 24) | (desc[2] << 16) | (desc[3] << 8);
+        uint32_t want = (2 << 24) | (6 << 16) | (39 << 8);
+        EXPECT(k >= want, "NT_GNU_ABI_TAG kernel ABI >= 2.6.39");
+        gnu_abi_tag_count++;
+    }
+    EXPECT(gnu_abi_tag_count == 1,
+           "exactly one PT_NOTE carrying NT_GNU_ABI_TAG");
+    printf("vDSO NT_GNU_ABI_TAG: count=%d\n", gnu_abi_tag_count);
+
     vdso_t v;
     EXPECT(parse_vdso(ehdr, &v) == 0, "vDSO dynamic section parse");
     if (!v.symtab || !v.strtab || !v.hash)
