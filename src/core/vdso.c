@@ -230,14 +230,18 @@ static uint8_t *vdso_host_page(guest_t *g)
  */
 #define VDSO_GETTIMEOFDAY_SVC_PC (TEXT_OFF_GETTOD + 0x98)
 
-/* Anchor-age cap. The clock_gettime / gettimeofday trampolines refuse to
- * interpolate once (cntvct - anchor_cntvct) exceeds (1ULL << ANCHOR_AGE_SHIFT)
- * cycles. With Apple Silicon CNTFRQ = 24 MHz, shift 31 caps at ~89 seconds;
- * shift 24 would cap at ~0.7 s (too aggressive). The trampoline implements
- * this with LSR + CBNZ on the delta. The host's drift check in
- * sys_clock_gettime uses the same shift to decide when an anchor is stale.
+/* Anchor-age cap. The trampolines refuse to interpolate once
+ * (cntvct - anchor_cntvct) exceeds (1ULL << ANCHOR_AGE_SHIFT) cycles,
+ * checked via LSR + CBNZ on the delta. With CNTFRQ = 24 MHz, shift 22
+ * caps the delta at ~0.175 s (~175e6 ns).
+ *
+ * Shift 22 is load-bearing: it keeps delta_ns + anchor_nsec below 2e9,
+ * so the sub-1e9 carry collapses to one SUBS + CSEL + CINC instead of a
+ * UDIV-by-1e9. Loosening the cap or raising CNTFRQ past that bound
+ * requires restoring a real division. The host drift check in
+ * sys_clock_gettime must use the same shift to stay coherent.
  */
-#define VDSO_ANCHOR_AGE_SHIFT 31
+#define VDSO_ANCHOR_AGE_SHIFT 22
 
 /* dynstr, dynsym, hash, GNU version metadata, dynamic, shdr follow.
  * TEXT_END is 0x2C4 after the dmb-ishld insertion in gettime/gettod.
@@ -398,6 +402,7 @@ static uint32_t enc_adr(unsigned rd, int32_t pc_rel)
 /* B.cond imm19. cond is the 4-bit AArch64 condition (NE=0x1, LO=0x3, etc.). */
 #define COND_EQ 0x0
 #define COND_NE 0x1
+#define COND_HS 0x2 /* unsigned >=, alias CS */
 #define COND_LO 0x3
 #define COND_HI 0x8
 static uint32_t enc_bcond_imm19(unsigned cond, int32_t pc_rel)
@@ -431,6 +436,24 @@ static uint32_t enc_mul_x(unsigned rd, unsigned rn, unsigned rm)
 static uint32_t enc_udiv_x(unsigned rd, unsigned rn, unsigned rm)
 {
     return 0x9AC00800U | ((rm & 0x1F) << 16) | ((rn & 0x1F) << 5) | (rd & 0x1F);
+}
+
+/* CSEL Xd, Xn, Xm, cond: if cond Xd=Xn else Xd=Xm. */
+static uint32_t enc_csel_x(unsigned rd, unsigned rn, unsigned rm, unsigned cond)
+{
+    return 0x9A800000U | ((rm & 0x1F) << 16) | ((cond & 0xF) << 12) |
+           ((rn & 0x1F) << 5) | (rd & 0x1F);
+}
+
+/* CSINC Xd, Xn, Xm, cond: if cond Xd=Xn else Xd=Xm+1.
+ * Encodes CINC Xd, Xn, cond as CSINC Xd, Xn, Xn, invert(cond). */
+static uint32_t enc_csinc_x(unsigned rd,
+                            unsigned rn,
+                            unsigned rm,
+                            unsigned cond)
+{
+    return 0x9A800400U | ((rm & 0x1F) << 16) | ((cond & 0xF) << 12) |
+           ((rn & 0x1F) << 5) | (rd & 0x1F);
 }
 
 static uint32_t enc_msub_x(unsigned rd, unsigned rn, unsigned rm, unsigned ra)
@@ -574,7 +597,8 @@ static uint32_t enc_cmp_w_reg(unsigned rn, unsigned rm)
  *
  * Layout (42 instructions, 0xA8 bytes):
  *
- *   0x00  mrs  x9, cntvct_el0           ; always read first
+ *   0x00  mrs  x9, cntvct_el0           ; always read first; x9 stays live
+ *                                       ; to feed host CNTVCT to fallback SVC
  *   0x04  cbz  w0, .Lreal               ; clockid==0 -> CLOCK_REALTIME
  *   0x08  cmp  w0, #1                   ; clockid==1 -> CLOCK_MONOTONIC
  *   0x0C  b.ne svc_fallback              ; other clockid -> SVC
@@ -594,25 +618,28 @@ static uint32_t enc_cmp_w_reg(unsigned rn, unsigned rm)
  *   0x44  ldp  x4, x5, [x8]              ; x4=anchor_sec, x5=anchor_nsec
  *   0x48  subs x6, x9, x3                ; cntvct delta
  *   0x4C  b.lo svc_fallback              ; underflow -> SVC
- *   0x50  lsr  x7, x6, #ANCHOR_AGE_SHIFT ; anchor-age cap (~89 s at 24 MHz)
+ *   0x50  lsr  x7, x6, #ANCHOR_AGE_SHIFT ; anchor-age cap (~0.175 s @ 24 MHz)
  *   0x54  cbnz x7, svc_fallback          ; stale anchor -> SVC, host reseeds
- *   ... (math identical to original: delta*125/3 ns, +nsec, carry into sec)
+ *   ... (math: delta_ns = (delta * 699050666) >> 24; nsec += delta_ns;
+ *        SUBS + CSEL + CINC carries the sub-1e9 fraction into sec.
+ *        See the inline code[22-31] comments for the multiplier and
+ *        carry-collapse rationale.)
  *   0x80  dmb  ishld                     ; load barrier before recheck
  *   0x84  ldar w12, [x2]                 ; seqlock recheck (acquire)
  *   0x88  cmp  w11, w12
- *   0x8C  b.ne svc_fallback              ; race detected -> SVC
+ *   0x8C  b.ne svc_fallback              ; race -> SVC; x9 still = CNTVCT
  *   0x90  stp  x4, x5, [x1]              ; store {sec, nsec}
  *   0x94  mov  x0, #0
  *   0x98  ret
  *   0x9C  svc_fallback: mov x8, #113
- *   0xA0  svc  #0
+ *   0xA0  svc  #0                        ; ELR_EL1 + 4 == SVC_PC
  *   0xA4  ret
  *
  * Both clockids share the same CNTVCT delta math; only the anchor pair
  * loaded via LDP changes. Picking via a runtime offset register avoids
  * duplicating the entire math block per clockid. The age check clobbers
  * x7 (which has already been consumed by `add x8, x2, x7`) before the
- * math reloads x7 with #125.
+ * math reloads x7 with the mult+shift constant.
  *
  * The seqlock recheck runs after all anchor field reads and the math but
  * before the user-visible store. The preceding DMB ISHLD is critical:
@@ -662,19 +689,36 @@ static void emit_clock_gettime_trampoline(uint32_t *code,
     /* lsr x7, x6, #ANCHOR_AGE_SHIFT */
     code[21] = enc_cbnz_x(7, svc_fallback_off - 0x54);
     /* cbnz x7, svc_fallback (age cap) */
-    code[22] = enc_movz_x(7, 125);
-    code[23] = enc_mul_x(6, 6, 7); /* delta * 125        */
-    code[24] = enc_movz_x(7, 3);
-    code[25] = enc_udiv_x(6, 6, 7); /* delta_ns           */
-    code[26] = enc_add_x(5, 5, 6);  /* nsec += delta_ns   */
+    /* delta_ns = (delta * 699050666) >> 24. 699050666 is floor((1e9 << 24)
+     * / 24e6), the mult+shift form Linux's arm64 vDSO uses for CNTFRQ =
+     * 24 MHz; an LSR (~1 cycle) in place of any 64-bit UDIV (~10-22 cycles
+     * on Apple Silicon). Rounding down keeps the trampoline tick slightly
+     * slower than the host so the next reseed never steps time backwards.
+     * The age cap bounds delta < 2^22, so delta * 699050666 < 2^52 -- no
+     * overflow.
+     */
+    code[22] = enc_movz_x(7, 0xAAAA);
+    code[23] = enc_movk_x_lsl16(7, 0x29AA); /* w7 = 699050666     */
+    code[24] = enc_mul_x(6, 6, 7);          /* delta * mult       */
+    code[25] = enc_lsr_x_imm(6, 6, 24);     /* delta_ns           */
+    code[26] = enc_add_x(5, 5, 6);          /* nsec += delta_ns   */
     code[27] = enc_movz_x(7, 0xCA00);
     code[28] = enc_movk_x_lsl16(7, 0x3B9A); /* x7 = 1e9           */
-    code[29] = enc_udiv_x(8, 5, 7);         /* sec_carry          */
-    code[30] = enc_msub_x(5, 8, 7, 5);      /* nsec %= 1e9        */
-    code[31] = enc_add_x(4, 4, 8);          /* sec += carry       */
-    code[32] = VDSO_INSN_DMB_ISHLD;         /* dmb ishld          */
-    code[33] = enc_ldar_w(12, 2);           /* seqlock recheck    */
-    code[34] = enc_cmp_w_reg(11, 12);       /* cmp w11, w12       */
+    /* sub-1e9 carry: the age cap guarantees nsec < 2e9, so the /1e9
+     * quotient is always 0 or 1 and SUBS + CSEL + CINC suffices in place
+     * of a UDIV. Sequence:
+     *   subs x8, x5, x7       ; x8 = nsec - 1e9, C set iff nsec >= 1e9
+     *   csel x5, x8, x5, HS   ; if HS, nsec -= 1e9
+     *   cinc x4, x4, HS       ; if HS, sec++
+     * CINC has no direct encoder; emit it as CSINC Xd, Xn, Xn with the
+     * inverted condition (HS -> LO).
+     */
+    code[29] = enc_subs_x(8, 5, 7);
+    code[30] = enc_csel_x(5, 8, 5, COND_HS);
+    code[31] = enc_csinc_x(4, 4, 4, COND_LO);
+    code[32] = VDSO_INSN_DMB_ISHLD;   /* dmb ishld          */
+    code[33] = enc_ldar_w(12, 2);     /* seqlock recheck    */
+    code[34] = enc_cmp_w_reg(11, 12); /* cmp w11, w12     */
     code[35] = enc_bcond_imm19(COND_NE, svc_fallback_off - 0x8C);
     /* b.ne svc_fallback (race) */
     code[36] = enc_stp_x_imm7(4, 5, 1, 0); /* stp x4, x5, [x1]   */
@@ -714,10 +758,10 @@ _Static_assert(TEXT_GETTIME_SIZE == 42 * sizeof(uint32_t),
  *   0x30  b.lo svc_fallback
  *   0x34  lsr  x7, x6, #ANCHOR_AGE_SHIFT
  *   0x38  cbnz x7, svc_fallback
- *   0x3C  mov  w7, #125
- *   0x40  mul  x6, x6, x7
- *   0x44  mov  w7, #3
- *   0x48  udiv x6, x6, x7              ; delta_ns
+ *   0x3C  movz w7, #0xAAAA
+ *   0x40  movk w7, #0x29AA, lsl #16    ; w7 = 699050666 (mult)
+ *   0x44  mul  x6, x6, x7
+ *   0x48  lsr  x6, x6, #24             ; delta_ns
  *   0x4C  add  x5, x5, x6              ; nsec += delta_ns
  *   0x50  mov  w7, #0xCA00
  *   0x54  movk x7, #0x3B9A, lsl #16    ; x7 = 1e9
@@ -766,10 +810,13 @@ static void emit_gettimeofday_trampoline(uint32_t *code,
     code[12] = enc_bcond_imm19(COND_LO, svc_fallback_off - 0x30);
     code[13] = enc_lsr_x_imm(7, 6, VDSO_ANCHOR_AGE_SHIFT);
     code[14] = enc_cbnz_x(7, svc_fallback_off - 0x38);
-    code[15] = enc_movz_x(7, 125);
-    code[16] = enc_mul_x(6, 6, 7);
-    code[17] = enc_movz_x(7, 3);
-    code[18] = enc_udiv_x(6, 6, 7);
+    /* Same mult+shift CNTVCT-to-ns conversion as clock_gettime; see
+     * emit_clock_gettime_trampoline for the multiplier rationale.
+     */
+    code[15] = enc_movz_x(7, 0xAAAA);
+    code[16] = enc_movk_x_lsl16(7, 0x29AA); /* w7 = 699050666 */
+    code[17] = enc_mul_x(6, 6, 7);          /* delta * mult */
+    code[18] = enc_lsr_x_imm(6, 6, 24);     /* delta_ns */
     code[19] = enc_add_x(5, 5, 6);
     code[20] = enc_movz_x(7, 0xCA00);
     code[21] = enc_movk_x_lsl16(7, 0x3B9A);
@@ -1404,22 +1451,19 @@ bool vdso_realtime_drift_exceeded(guest_t *g,
     if (current_cntvct < a.cntvct)
         return true;
 
-    /* If the anchor is older than the cap, declare drift up front: an
-     * anchor stale enough to age out is also stale enough to refresh,
-     * and short-circuiting here keeps the subsequent delta_cycles * 125
-     * multiply far away from uint64 overflow even if a caller invokes
-     * this helper directly with a multi-decade delta.
+    /* An anchor past the age cap also needs a refresh, so declare drift
+     * up front. Short-circuiting here also keeps the mult below uint64
+     * even if a caller invokes this helper with a multi-decade delta.
      */
     uint64_t delta_cycles = current_cntvct - a.cntvct;
     if (delta_cycles >> VDSO_ANCHOR_AGE_SHIFT)
         return true;
 
-    /* Predict REALTIME from anchor + CNTVCT delta. Trampoline math:
-     * delta_ns = (cntvct - anchor_cntvct) * 125 / 3 (CNTFRQ = 24 MHz).
-     * Bounded by VDSO_ANCHOR_AGE_SHIFT above, the multiply stays inside
-     * uint64.
+    /* Predict REALTIME from anchor + delta using the same mult+shift the
+     * trampoline applies, so trampoline rounding never registers as a
+     * host-clock step.
      */
-    uint64_t delta_ns = (delta_cycles * 125ULL) / 3ULL;
+    uint64_t delta_ns = (delta_cycles * 699050666ULL) >> 24;
     int64_t delta_sec = (int64_t) (delta_ns / 1000000000ULL);
     int64_t delta_nsec = (int64_t) (delta_ns % 1000000000ULL);
 

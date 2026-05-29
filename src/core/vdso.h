@@ -43,6 +43,15 @@ uint64_t vdso_build(guest_t *g);
  * snapshot/recheck. Callers (sys_clock_gettime / sys_gettimeofday) only
  * need to invoke this when an SVC trap from the vDSO trampoline carries a
  * trustworthy guest CNTVCT in X9.
+ *
+ * Overflow invariant: this function, the trampoline math, and
+ * vdso_realtime_drift_exceeded all depend on VDSO_ANCHOR_AGE_SHIFT == 22
+ * capping the per-call CNTVCT delta below 2^22. That bound keeps
+ * (delta * 699050666) below 2^52 (no uint64 overflow) and keeps
+ * anchor_nsec + delta_ns below 2e9 (so the trampoline's sub-1e9 carry
+ * collapses to a single SUBS + CSEL + CINC instead of a UDIV). The
+ * host-side drift check must apply the same formula and the same cap;
+ * any divergence lets the trampoline interpolate from a stale anchor.
  */
 void vdso_seed_anchor(guest_t *g,
                       uint64_t guest_cntvct,
