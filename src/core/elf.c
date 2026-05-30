@@ -327,13 +327,30 @@ int elf_map_segments(const elf_info_t *info,
             return -1;
         }
 
-        /* The host memset zeros PAGE_ALIGN_UP(memsz) bytes, not just memsz,
-         * so the infra-overlap check has to use the same rounded extent.
-         * Without the rounding here, a segment that ends just below
-         * infra_lo passes the check and still spills up to PAGE_SIZE-1
-         * bytes of zero into the infra reserve via the page tail.
+        /* PT_LOAD with memsz == 0 maps no bytes, but the page-tail zero
+         * extent below still rounds up to the next page boundary. For an
+         * unaligned gpa that means a crafted ELF could splat zeros across
+         * the tail of a previously loaded segment in the same page, or
+         * trip the infra-overlap check with no live mapping behind it.
+         * Linux ignores zero-memsz PT_LOADs; mirror that here.
          */
-        uint64_t zero_len = PAGE_ALIGN_UP(memsz);
+        if (memsz == 0) {
+            seg_idx++;
+            continue;
+        }
+
+        /* The host memset zeros up to the next page boundary AFTER the
+         * segment ends, so the infra-overlap check has to use the same
+         * rounded extent. The end is PAGE_ALIGN_UP(gpa + memsz) rather
+         * than gpa + PAGE_ALIGN_UP(memsz) because gpa is not always
+         * page-aligned (e.g. ld.so's RW segment at vaddr 0x2f650): with
+         * the older bytes-from-gpa formula the page covering the last
+         * memsz byte kept its mid-page tail untouched, and execve into a
+         * dynamic-linked target then read stale state from the prior
+         * incarnation of the same interpreter at offsets ld.so allocates
+         * from beyond memsz (e.g. the first link_map in _dl_new_object).
+         */
+        uint64_t zero_len = PAGE_ALIGN_UP(gpa + memsz) - gpa;
         if (gpa + zero_len > guest_size)
             zero_len = guest_size - gpa;
         if (infra_active && gpa < infra_hi && gpa + zero_len > infra_lo) {

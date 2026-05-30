@@ -593,9 +593,7 @@ correctly. `elf_resolve_interp()` in `src/core/elf.c` is shared between
 
 ### Known Limitations
 
-- `timeout` fails: it uses `fork`/`clone` to create a child process with a
-  timer, and the forked child inherits the dynamic-linker state but the
-  fork+exec path has issues in interpreter space.
+None currently tracked for the aarch64-linux dynamic-linker path.
 
 ## GDB Stub
 
