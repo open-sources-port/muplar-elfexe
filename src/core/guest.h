@@ -245,21 +245,86 @@ typedef enum {
     TLBI_NONE = 0,
     TLBI_BROADCAST = 1,
     TLBI_RANGE = 2,
+    TLBI_RANGE_LARGE = 3, /* FEAT_TLBIRANGE single-shot TLBI RVAE1IS for
+                           * ranges that exceed TLBI_SELECTIVE_MAX_PAGES but
+                           * stay within TLBI_RVAE_MAX_PAGES; encoded as
+                           * X8 = 4 on the wire. */
 } tlbi_kind_t;
 
-/* Cap selective TLBI at this many 4 KiB pages. Beyond this, fall back to
- * TLBI_BROADCAST: each TLBI VAE1IS broadcasts to all cores, so for large
- * ranges the per-instruction issue cost outweighs the benefit of preserving
- * unrelated TLB entries. 16 pages == 64 KiB covers RELRO and other typical
- * mprotect / munmap targets.
+/* Cap selective per-page TLBI VAE1IS at this many 4 KiB pages. Beyond this,
+ * use TLBI RVAE1IS if FEAT_TLBIRANGE is available, else fall back to
+ * TLBI_BROADCAST: per-instruction issue cost outweighs the benefit once the
+ * range is large. 16 pages == 64 KiB covers RELRO and other typical mprotect
+ * / munmap targets.
  */
 #define TLBI_SELECTIVE_MAX_PAGES 16
 
+/* Cap single-shot TLBI RVAE1IS at this many 4 KiB pages. With SCALE=0 the
+ * RVAE1IS operand encoding covers (NUM+1)*2 pages with NUM in [0..31], so a
+ * single instruction reaches 64 pages == 256 KiB. Beyond that the host would
+ * need SCALE=1 (NUM*64 step), which over-invalidates for the typical
+ * dynamic-linker RELRO / glibc-bring-up storm sizes seen in practice; stay
+ * at SCALE=0 for now and broadcast above 64 pages.
+ */
+#define TLBI_RVAE_MAX_PAGES 64
+
+/* TLBI RVAE1IS operand bit-field constants. Per ARM ARM DDI 0487J.a D8.7.6
+ * the operand layout is:
+ *   bits [36:0]   BaseADDR  (VA[48:12] for 4 KiB granule, DS=0)
+ *   bits [38:37]  TTL       (0 = any level)
+ *   bits [43:39]  NUM
+ *   bits [45:44]  SCALE
+ *   bits [47:46]  TG        (00 = RESERVED, 01 = 4 KiB, 10 = 16 KiB,
+ *                            11 = 64 KiB)
+ *   bits [63:48]  ASID
+ * elfuse only ever issues 4 KiB-granule TLBIs (TCR_EL1.TG0 = 4 KiB), so
+ * TG is hard-pinned to 01 and the corresponding bit is named here. */
+#define RVAE_OPERAND_BADDR_MASK ((1ULL << 37) - 1)
+#define RVAE_OPERAND_NUM_SHIFT 39
+#define RVAE_OPERAND_TG_4KB (1ULL << 46)
+
+/* Pure encoder: build the TLBI RVAE1IS Xt operand from a 4 KiB-aligned VA
+ * and a page count in the SCALE=0 range (1..TLBI_RVAE_MAX_PAGES). Lives in
+ * the header as `static inline` so tlbi_request_emit_to_vcpu and any
+ * future caller (host-side unit tests included) compile to the same
+ * expression. NUM = ceil(pages / 2) - 1 over-invalidates odd page counts
+ * by exactly one page, which is a perf-only side effect (the extra
+ * invalidation evicts a neighbour TLB entry that the guest's next access
+ * reloads). pages < 2 is clamped to 2 because SCALE=0 NUM=0 means 2
+ * pages -- the encoder cannot represent a single page through RVAE1IS;
+ * single-page callers go through the per-page VAE1IS path instead, but
+ * the clamp keeps the encoder total in any pathological input. */
+static inline uint64_t tlbi_rvae1is_operand(uint64_t start_va, uint16_t pages)
+{
+    if (pages < 2)
+        pages = 2;
+    uint64_t baddr = (start_va >> 12) & RVAE_OPERAND_BADDR_MASK;
+    uint64_t num = ((pages + 1) / 2) - 1;
+    if (num > 31)
+        num = 31;
+    return baddr | (num << RVAE_OPERAND_NUM_SHIFT) | RVAE_OPERAND_TG_4KB;
+}
+
+/* Runtime feature flag: TRUE when the host PE implements FEAT_TLBIRANGE
+ * (ARMv8.4+, present on every Apple Silicon M1+). Probed once at bootstrap.
+ * Read-only after startup so callers do not need an atomic load. */
+extern bool g_tlbi_range_supported;
+
 typedef struct {
-    uint8_t kind;   /* tlbi_kind_t */
-    uint16_t pages; /* Page count when kind == TLBI_RANGE (1..MAX) */
-    uint64_t start; /* Page-aligned VA when kind == TLBI_RANGE */
+    uint8_t kind;         /* tlbi_kind_t */
+    uint8_t icache_flush; /* 1 = the change introduced executable content
+                           *     visible to EL0, so the shim must IC IALLU
+                           *     after the TLBI sequence. 0 = data-only
+                           *     change, skip the I-cache invalidation. */
+    uint16_t pages;       /* Page count when kind == TLBI_RANGE (1..MAX) */
+    uint64_t start;       /* Page-aligned VA when kind == TLBI_RANGE */
 } tlbi_request_t;
+/* Layout contract: 16 bytes (1+1+2+4 padding+8). Documents the padding and
+ * pins the TLS slot size so future field additions surface as a build break
+ * rather than silently growing the per-vCPU footprint. */
+_Static_assert(sizeof(tlbi_request_t) == 16,
+               "tlbi_request_t must stay 16 bytes; update tlbi_request_clear "
+               "and the syscall epilogue if the layout changes");
 
 /* Multi-region IPA mapping.
  *
@@ -486,6 +551,7 @@ extern _Thread_local tlbi_request_t cpu_tlbi_req;
 static inline void tlbi_request_clear(void)
 {
     cpu_tlbi_req.kind = TLBI_NONE;
+    cpu_tlbi_req.icache_flush = 0;
     cpu_tlbi_req.pages = 0;
     cpu_tlbi_req.start = 0;
 }
@@ -493,6 +559,72 @@ static inline void tlbi_request_clear(void)
 static inline void tlbi_request_broadcast(void)
 {
     cpu_tlbi_req.kind = TLBI_BROADCAST;
+}
+
+/* True if the accumulator is already at TLBI_BROADCAST. PT mutation helpers
+ * use this to skip the per-page bounding-box bookkeeping (changed_lo /
+ * changed_hi tracking and the final tlbi_request_range call) once a broadcast
+ * is already promised; the inline tlbi_request_range itself short-circuits
+ * for the same reason but the call-site loops still pay for the compares.
+ */
+static inline bool tlbi_request_is_broadcast(void)
+{
+    return cpu_tlbi_req.kind == TLBI_BROADCAST;
+}
+
+/* Mark that the current syscall's PT mutation introduced executable content
+ * visible to EL0 (a new X mapping, or an mprotect that added MEM_PERM_X to
+ * a previously-NX page). The shim consults this via X11 on syscall return
+ * to decide whether IC IALLU is needed after the TLBI sequence. Data-only
+ * page-table changes (mprotect RW<->R, munmap of data, etc.) leave this
+ * cleared so the I-cache invalidation is skipped.
+ */
+static inline void tlbi_request_mark_icache(void)
+{
+    cpu_tlbi_req.icache_flush = 1;
+}
+
+/* Encode the pending TLBI request into the vCPU's X8/X9/X10/X11 registers
+ * for the shim's post-HVC dispatch and clear the per-vCPU accumulator.
+ * Both the syscall HVC #5 epilogue and the HVC #11 EL0-fault handler use
+ * this so the same X8 wire codes (and X11 I-cache hint) drive every TLBI
+ * the host issues on behalf of the guest. Keeping the helper inline lets
+ * the call sites compile to the same switch in both files.
+ */
+static inline void tlbi_request_emit_to_vcpu(hv_vcpu_t vcpu)
+{
+    switch ((tlbi_kind_t) cpu_tlbi_req.kind) {
+    case TLBI_BROADCAST:
+        hv_vcpu_set_reg(vcpu, HV_REG_X8, 1);
+        hv_vcpu_set_reg(vcpu, HV_REG_X11, cpu_tlbi_req.icache_flush ? 1 : 0);
+        break;
+    case TLBI_RANGE:
+        hv_vcpu_set_reg(vcpu, HV_REG_X8, 3);
+        hv_vcpu_set_reg(vcpu, HV_REG_X9, cpu_tlbi_req.start);
+        hv_vcpu_set_reg(vcpu, HV_REG_X10, cpu_tlbi_req.pages);
+        hv_vcpu_set_reg(vcpu, HV_REG_X11, cpu_tlbi_req.icache_flush ? 1 : 0);
+        break;
+    case TLBI_RANGE_LARGE: {
+        /* Single-shot TLBI RVAE1IS for ranges in (16..64] pages. The
+         * operand format and the SCALE=0 / TG=01 / ASID=0 assumptions are
+         * documented at tlbi_rvae1is_operand above. ASID stays 0 because
+         * the shim runs single-ASID (TCR_EL1.A1=0, TTBR0 ASID=0; rosetta
+         * does not allocate a separate ASID). If a future change
+         * introduces non-zero ASIDs, the helper signature and the
+         * tlbi_request_t accumulator both need an ASID field. */
+        uint64_t operand =
+            tlbi_rvae1is_operand(cpu_tlbi_req.start, cpu_tlbi_req.pages);
+        hv_vcpu_set_reg(vcpu, HV_REG_X8, 4);
+        hv_vcpu_set_reg(vcpu, HV_REG_X9, operand);
+        hv_vcpu_set_reg(vcpu, HV_REG_X11, cpu_tlbi_req.icache_flush ? 1 : 0);
+        break;
+    }
+    case TLBI_NONE:
+    default:
+        hv_vcpu_set_reg(vcpu, HV_REG_X8, 0);
+        break;
+    }
+    tlbi_request_clear();
 }
 
 static inline void tlbi_request_range(uint64_t start, uint64_t end)
@@ -513,26 +645,34 @@ static inline void tlbi_request_range(uint64_t start, uint64_t end)
     uint64_t s = start & ~mask;
     uint64_t e = (end + mask) & ~mask;
     uint64_t n = (e - s) >> 12;
-    if (n > TLBI_SELECTIVE_MAX_PAGES) {
+    /* Two thresholds. (a) <= TLBI_SELECTIVE_MAX_PAGES uses the per-page
+     * VAE1IS loop, which preserves the most TLB entries. (b) <=
+     * TLBI_RVAE_MAX_PAGES uses a single TLBI RVAE1IS via FEAT_TLBIRANGE,
+     * which still preserves unrelated TLB entries but costs only one
+     * instruction issue. Above TLBI_RVAE_MAX_PAGES or when the feature is
+     * absent, broadcast (TLBI VMALLE1IS). */
+    uint64_t large_cap =
+        g_tlbi_range_supported ? TLBI_RVAE_MAX_PAGES : TLBI_SELECTIVE_MAX_PAGES;
+    if (n > large_cap) {
         tlbi_request_broadcast();
         return;
     }
     if (cpu_tlbi_req.kind == TLBI_NONE) {
-        cpu_tlbi_req.kind = TLBI_RANGE;
+        cpu_tlbi_req.kind =
+            (n > TLBI_SELECTIVE_MAX_PAGES) ? TLBI_RANGE_LARGE : TLBI_RANGE;
         cpu_tlbi_req.start = s;
         cpu_tlbi_req.pages = (uint16_t) n;
         return;
     }
-    /* TLBI_RANGE: coalesce by union. Disjoint ranges still produce a single
-     * bounding interval; if it stays within the cap, the per-page TLBI loop
-     * still wins over a full flush by preserving the rest of the TLB.
+    /* Coalesce by union. Disjoint ranges still produce a single bounding
+     * interval; if it stays within the active cap, the range TLBI still
+     * wins over a full flush by preserving unrelated TLB entries.
      */
     uint64_t es = cpu_tlbi_req.start;
     uint64_t pe = (uint64_t) cpu_tlbi_req.pages * 4096ULL;
-    /* The accumulator only ever holds page counts <= TLBI_SELECTIVE_MAX_PAGES
-     * (see the cap check above), so es + pe never overflows on real callers,
-     * but be explicit.
-     */
+    /* The accumulator only ever holds page counts <= large_cap (enforced by
+     * the cap check above), so es + pe never overflows on real callers, but
+     * be explicit. */
     if (es > UINT64_MAX - pe) {
         tlbi_request_broadcast();
         return;
@@ -541,12 +681,17 @@ static inline void tlbi_request_range(uint64_t start, uint64_t end)
     uint64_t us = s < es ? s : es;
     uint64_t ue = e > ee ? e : ee;
     uint64_t un = (ue - us) >> 12;
-    if (un > TLBI_SELECTIVE_MAX_PAGES) {
+    if (un > large_cap) {
         tlbi_request_broadcast();
         return;
     }
     cpu_tlbi_req.start = us;
     cpu_tlbi_req.pages = (uint16_t) un;
+    /* Promote kind if the coalesced range now exceeds the per-page cap. The
+     * inverse direction (LARGE -> RANGE) is impossible because un >= pe / 4096
+     * after coalescing. */
+    if (un > TLBI_SELECTIVE_MAX_PAGES)
+        cpu_tlbi_req.kind = TLBI_RANGE_LARGE;
 }
 
 /* Convert a guest offset (0-based) to an IPA/VA (ipa_base + offset) */

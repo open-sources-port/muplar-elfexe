@@ -1883,33 +1883,17 @@ fast_done:
         hv_vcpu_set_reg(vcpu, HV_REG_X0, (uint64_t) result);
 
         /* Signal the shim to flush TLB if this vCPU modified page tables.
-         * Protocol after HVC #5 (X8 carries the request):
-         *   0 -> skip
-         *   1 -> broadcast TLBI VMALLE1IS
-         *   2 -> reserved for execve (set by sys_execve, never reached here)
-         *   3 -> selective TLBI VAE1IS over X10 pages starting at X9
-         * Must explicitly write X8 because the shim reads its post-HVC value;
-         * the pre-syscall X8 is the syscall number (always non-zero) and would
-         * spuriously TLBI on every return.
+         * Protocol after HVC #5 lives in tlbi_request_emit_to_vcpu (see
+         * src/core/guest.h); the helper also handles the HVC #11 EL0-fault
+         * lazy-materialize path so both call sites use the same wire codes.
+         * Must call the emit helper because the shim reads X8 unconditionally
+         * on return; the pre-syscall X8 is the syscall number (always
+         * non-zero) and would spuriously TLBI on every return.
          *
          * cpu_tlbi_req is a per-vCPU TLS slot, so this read needs no lock and
          * cannot be drained or torn by another vCPU's epilogue.
          */
-        switch ((tlbi_kind_t) cpu_tlbi_req.kind) {
-        case TLBI_BROADCAST:
-            hv_vcpu_set_reg(vcpu, HV_REG_X8, 1);
-            break;
-        case TLBI_RANGE:
-            hv_vcpu_set_reg(vcpu, HV_REG_X8, 3);
-            hv_vcpu_set_reg(vcpu, HV_REG_X9, cpu_tlbi_req.start);
-            hv_vcpu_set_reg(vcpu, HV_REG_X10, cpu_tlbi_req.pages);
-            break;
-        case TLBI_NONE:
-        default:
-            hv_vcpu_set_reg(vcpu, HV_REG_X8, 0);
-            break;
-        }
-        tlbi_request_clear();
+        tlbi_request_emit_to_vcpu(vcpu);
     }
 
     return should_exit;

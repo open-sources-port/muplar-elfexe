@@ -131,6 +131,16 @@ $(BUILD_DIR)/test-multi-vcpu: $(BUILD_DIR)/test-multi-vcpu.o | $(BUILD_DIR)
 $(BUILD_DIR)/test-rwx: $(BUILD_DIR)/test-rwx.o | $(BUILD_DIR)
 	$(call link-and-sign,$@,$<)
 
+## Build the TLBI RVAE1IS operand encoder unit test (native macOS binary).
+# Pure C; no HVF entitlement needed. Verifies the architectural bit-layout
+# of tlbi_rvae1is_operand so a future regression that drops TG=01 (which
+# the Apple Silicon integration tests would silently tolerate) fails CI
+# immediately.
+$(BUILD_DIR)/test-tlbi-encoder-host: $(BUILD_DIR)/test-tlbi-encoder-host.o \
+		| $(BUILD_DIR)
+	@echo "  LD      $@"
+	$(Q)$(CC) $(CFLAGS) -o $@ $^
+
 ## Build the proctitle argv-tail regression test (native macOS binary)
 # Links against the project-built proctitle.o so the exact in-tree code is
 # exercised; no HVF entitlement is needed because the test only manipulates
@@ -164,6 +174,12 @@ $(BUILD_DIR)/test-pthread: tests/test-pthread.c | $(BUILD_DIR)
 # test-shim-cred-race spawns a pthread reader while the main thread
 # toggles setresuid; the reader spins on the identity fast path.
 $(BUILD_DIR)/test-shim-cred-race: tests/test-shim-cred-race.c | $(BUILD_DIR)
+	@echo "  CROSS   $< (with -lpthread)"
+	$(Q)$(CROSS_COMPILE)gcc -D_GNU_SOURCE -static -O2 -o $@ $< -lpthread
+
+# test-mprotect-mt stresses multi-vCPU mprotect under concurrent reader
+# threads to surface stale-TLB regressions.
+$(BUILD_DIR)/test-mprotect-mt: tests/test-mprotect-mt.c | $(BUILD_DIR)
 	@echo "  CROSS   $< (with -lpthread)"
 	$(Q)$(CROSS_COMPILE)gcc -D_GNU_SOURCE -static -O2 -o $@ $< -lpthread
 
