@@ -35,8 +35,11 @@ define RUN_OPTIONAL_SKIP77
 endef
 
 ## Run the unit test suite plus busybox applet validation
-check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage
+check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage \
+		$(BUILD_DIR)/test-tlbi-encoder-host
 	@bash tests/driver.sh -e $(ELFUSE_BIN) -d $(TEST_DIR) -v
+	@printf "\n$(BLUE)━━━ TLBI RVAE1IS encoder unit test ━━━$(RESET)\n"
+	@$(BUILD_DIR)/test-tlbi-encoder-host
 	@printf "\n$(BLUE)━━━ proctitle argv-tail regression ━━━$(RESET)\n"
 	@$(MAKE) --no-print-directory test-proctitle-host
 	@printf "\n$(BLUE)━━━ proctitle low-stack regression ━━━$(RESET)\n"

@@ -35,6 +35,7 @@
 #include <string.h>
 #include <pthread.h>
 #include <sys/mman.h>
+#include <sys/sysctl.h>
 #include <unistd.h>
 
 #include "core/guest.h"
@@ -47,6 +48,13 @@
  * by virtue of TLS default-zeroing, which maps to TLBI_NONE.
  */
 _Thread_local tlbi_request_t cpu_tlbi_req;
+
+/* FEAT_TLBIRANGE host capability flag. Set once at bootstrap by
+ * guest_probe_tlbi_range and treated as read-only thereafter. Apple Silicon
+ * M1+ implements ARMv8.5-A which mandates FEAT_TLBIRANGE; the probe stays
+ * conservative and defaults to false until the flag is explicitly set so
+ * future ports to non-Apple aarch64 hosts inherit the safe fallback. */
+bool g_tlbi_range_supported = false;
 
 static void guest_region_clear(guest_t *g);
 
@@ -202,9 +210,50 @@ static uint64_t *pt_at(const guest_t *g, uint64_t gpa)
 
 /* Public API */
 
+/* FEAT_TLBIRANGE probe -- runs exactly once via pthread_once. ARMv8.4
+ * introduced TLBI RVAE1IS for single-shot range invalidation; ARMv8.5+
+ * makes it mandatory. macOS does not surface a sysctl entry for
+ * FEAT_TLBIRANGE directly, so use FEAT_LSE2 as a proxy -- both became
+ * mandatory in ARMv8.4 and Apple ships them together across the entire
+ * M-series. A future non-Apple aarch64 host or an older ARM PE without
+ * FEAT_TLBIRANGE would otherwise trap the shim's `tlbi rvae1is, x9` to
+ * BAD_VEC; the proxy probe keeps the accumulator on the per-page VAE1IS /
+ * VMALLE1IS path in that case.
+ *
+ * Width-tolerant read: macOS currently exposes the boolean as a 4-byte int,
+ * but a future kernel could widen it to uint64_t. Read into a 64-bit slot
+ * and accept any non-zero answer for any length sysctl actually returned.
+ *
+ * ELFUSE_DISABLE_TLBI_RANGE=1 forces the broadcast fallback so the
+ * VAE1IS-only / VMALLE1IS path stays exercisable in CI on Apple Silicon --
+ * otherwise the fallback is unreachable on any host where the sysctl probe
+ * succeeds.
+ *
+ * pthread_once gates the probe so a re-bootstrap path (sys_execve, fork
+ * IPC restore) cannot race a live vCPU reading the flag. The first
+ * guest_init wins and the result is immutable for the process lifetime. */
+static pthread_once_t tlbi_range_probe_once = PTHREAD_ONCE_INIT;
+
+static void tlbi_range_probe_run(void)
+{
+    const char *disable_env = getenv("ELFUSE_DISABLE_TLBI_RANGE");
+    if (disable_env && disable_env[0] && disable_env[0] != '0') {
+        g_tlbi_range_supported = false;
+        return;
+    }
+    uint64_t lse2_raw = 0;
+    size_t lse2_len = sizeof(lse2_raw);
+    g_tlbi_range_supported =
+        (sysctlbyname("hw.optional.arm.FEAT_LSE2", &lse2_raw, &lse2_len, NULL,
+                      0) == 0) &&
+        lse2_raw != 0;
+}
+
 int guest_init(guest_t *g, uint64_t size, uint32_t ipa_bits)
 {
     uint64_t t0;
+
+    pthread_once(&tlbi_range_probe_once, tlbi_range_probe_run);
 
     memset(g, 0, sizeof(*g));
     g->shm_fd = -1;
@@ -929,6 +978,10 @@ int guest_map_va_range(guest_t *g,
         return -1;
 
     uint64_t cur_gpa = gpa_start;
+    uint64_t changed_lo = UINT64_MAX, changed_hi = 0;
+    bool bcast = tlbi_request_is_broadcast();
+    if (perms & MEM_PERM_X)
+        tlbi_request_mark_icache();
     for (uint64_t va = va_start; va < va_end;
          va += BLOCK_2MIB, cur_gpa += BLOCK_2MIB) {
         unsigned l0_idx = (unsigned) (va / (512ULL * BLOCK_1GIB));
@@ -976,12 +1029,22 @@ int guest_map_va_range(guest_t *g,
             continue;
         }
         l2[l2_idx] = make_block_desc(cur_gpa, perms);
+        if (!bcast) {
+            if (va < changed_lo)
+                changed_lo = va;
+            if (va + BLOCK_2MIB > changed_hi)
+                changed_hi = va + BLOCK_2MIB;
+        }
     }
 
     /* The new entries are visible to the host immediately; the shim flushes
-     * the matching TLBs on syscall return via the per-vCPU accumulator.
+     * the matching TLBs on syscall return via the per-vCPU accumulator. Skip
+     * the request when every block was already mapped (no negative TLB
+     * entries can apply since the prior install already invalidated them),
+     * or when the accumulator already promised a broadcast.
      */
-    tlbi_request_range(va_start, va_end);
+    if (!bcast && changed_hi > changed_lo)
+        tlbi_request_range(changed_lo, changed_hi);
     guest_pt_gen_bump(g);
     return 0;
 }
@@ -2438,6 +2501,13 @@ int guest_extend_page_tables(guest_t *g,
             (unsigned long long) start, (unsigned long long) end);
         return -1;
     }
+    /* Defensive: end is bounded by guest_size above, so the ALIGN_2MIB_UP
+     * below cannot wrap on any reachable input. The explicit guard documents
+     * the contract and matches the wrap guards in guest_invalidate_ptes /
+     * guest_update_perms; keeps the three sites in sync if a future caller
+     * lifts the guest_size cap. */
+    if (end > UINT64_MAX - (BLOCK_2MIB - 1))
+        return -1;
 
     uint64_t base = g->ipa_base;
 
@@ -2445,8 +2515,18 @@ int guest_extend_page_tables(guest_t *g,
     uint64_t l0_gpa_off = g->ttbr0 - base;
     uint64_t *l0 = pt_at(g, l0_gpa_off);
 
-    /* Walk 2MiB blocks in [start, end) */
+    /* Walk 2MiB blocks in [start, end). Track the smallest sub-range whose
+     * L2 entry actually transitioned from unmapped to mapped; blocks that
+     * were already valid get no new descriptor and need no TLBI
+     * (false-positive elimination mirrors guest_update_perms). Once the
+     * accumulator is already TLBI_BROADCAST, the bookkeeping is wasted
+     * work.
+     */
+    if (perms & MEM_PERM_X)
+        tlbi_request_mark_icache();
     uint64_t addr_start = ALIGN_2MIB_DOWN(start), addr_end = ALIGN_2MIB_UP(end);
+    uint64_t changed_lo = UINT64_MAX, changed_hi = 0;
+    bool bcast = tlbi_request_is_broadcast();
 
     for (uint64_t addr = addr_start; addr < addr_end; addr += BLOCK_2MIB) {
         uint64_t ipa = base + addr;
@@ -2492,18 +2572,33 @@ int guest_extend_page_tables(guest_t *g,
 
         unsigned l2_idx = (unsigned) ((ipa % BLOCK_1GIB) / BLOCK_2MIB);
 
-        /* Only map if not already mapped */
-        if (!(l2[l2_idx] & PT_BLOCK)) {
-            l2[l2_idx] = make_block_desc(ipa, perms);
+        /* Only map if not already mapped. A negative TLB entry from a prior
+         * translation fault is possible only for VAs that were unmapped at
+         * the time of the fault, so the TLBI is only needed for blocks
+         * actually installed by this call.
+         */
+        /* At L2 a valid descriptor is either a 2 MiB block (bits[1:0] = 01)
+         * or a table descriptor pointing to an L3 page table (bits[1:0] = 11).
+         * Both indicate the slot is already mapped at some granule, so the
+         * extend has nothing to install; skip without flushing. The previous
+         * `& PT_BLOCK` test relied on PT_BLOCK == PT_VALID == bit 0 to cover
+         * both cases by coincidence -- write it as an explicit PT_VALID test
+         * so the intent survives a future descriptor-bit renumbering.
+         */
+        if (l2[l2_idx] & PT_VALID)
+            continue;
+        l2[l2_idx] = make_block_desc(ipa, perms);
+        if (!bcast) {
+            if (addr < changed_lo)
+                changed_lo = addr;
+            if (addr + BLOCK_2MIB > changed_hi)
+                changed_hi = addr + BLOCK_2MIB;
         }
     }
 
-    /* Use the page-aligned bounds the loop actually covered. Extend grows
-     * the mapped range; existing VAs may carry negative TLB entries from
-     * prior translation faults at this address, so a flush is still needed.
-     * Large extends will exceed the selective cap and become broadcast.
-     */
-    tlbi_request_range(addr_start + base, addr_end + base);
+    /* Large extends will exceed the selective cap and become broadcast. */
+    if (!bcast && changed_hi > changed_lo)
+        tlbi_request_range(base + changed_lo, base + changed_hi);
     guest_pt_gen_bump(g);
     return 0;
 }
@@ -2632,8 +2727,23 @@ static uint64_t *find_l2_entry(guest_t *g, uint64_t va)
 }
 
 /* Split a 2MiB L2 block descriptor into 512 x 4KiB L3 page descriptors.
- * The caller provides the L2 entry via find_l2_entry.
- * Extracts the output IPA from the existing descriptor.
+ * The caller provides the L2 entry via find_l2_entry. Extracts the output
+ * IPA from the existing descriptor.
+ *
+ * No TLBI is issued by the split itself. The block-to-table transition
+ * preserves the output address, permissions, and attributes of every page
+ * in the 2 MiB range, so any cached translation from the old block
+ * descriptor remains semantically correct. Per ARM ARM (FEAT_BBM Level 2),
+ * a CPU that implements level-2 break-before-make support allows
+ * block <-> table changes that preserve the resulting translation in all
+ * other respects without a BBM sequence. Apple Silicon implements
+ * FEAT_BBM Level 2 across M1+; the split-heavy stress paths in tests/
+ * (test-stress mprotect cycling, test-shim-urandom-toctou rapid flips,
+ * test-mprotect-mt R<->RW toggling, plus dynamic-linker RELRO setup)
+ * run cleanly. A future PE without FEAT_BBM Level 2 would need either
+ * a real BBM sequence here (invalidate, TLBI, write table) or an
+ * unconditional broadcast TLBI on every split; revisit if that ever
+ * surfaces a TLB conflict abort.
  */
 static int split_l2_block(guest_t *g, uint64_t *l2_entry)
 {
@@ -2681,9 +2791,17 @@ int guest_invalidate_ptes(guest_t *g, uint64_t start, uint64_t end)
 {
     uint64_t base = g->ipa_base;
 
-    /* Page-align the range */
+    /* Page-align the range. The ALIGN_UP step on end could wrap to 0 for
+     * inputs within PAGE_SIZE-1 of UINT64_MAX, silently turning the
+     * invalidation into a no-op against a 0-length loop. Reject the
+     * pathological input rather than allow a stale mapping to survive.
+     */
+    if (end > UINT64_MAX - (PAGE_SIZE - 1))
+        return -1;
     start = start & ~(PAGE_SIZE - 1);
     end = (end + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    if (end <= start)
+        return 0;
 
     for (uint64_t addr = start; addr < end;) {
         uint64_t *l2_entry = find_l2_entry(g, addr);
@@ -2723,20 +2841,36 @@ int guest_invalidate_ptes(guest_t *g, uint64_t start, uint64_t end)
                 return -1;
         }
 
-        /* L3 table: invalidate individual 4KiB page descriptors */
+        /* L3 table: invalidate individual 4KiB page descriptors. Track the
+         * smallest sub-range whose descriptor actually transitioned from
+         * mapped to invalid; a page that was already 0 needs no TLBI
+         * (false-positive elimination mirrors the guest_update_perms path).
+         * Skip the per-page bookkeeping once a broadcast is already pending.
+         */
         uint64_t l3_ipa = *l2_entry & 0xFFFFFFFFF000ULL;
         uint64_t *l3 = pt_at(g, l3_ipa - base);
 
         uint64_t page_start = (addr > block_start) ? addr : block_start;
         uint64_t page_end = (end < block_end) ? end : block_end;
+        uint64_t changed_lo = UINT64_MAX, changed_hi = 0;
+        bool bcast = tlbi_request_is_broadcast();
 
         for (uint64_t pa = page_start; pa < page_end; pa += PAGE_SIZE) {
             unsigned l3_idx =
                 (unsigned) (((base + pa) % BLOCK_2MIB) / PAGE_SIZE);
-            l3[l3_idx] = 0; /* Invalid descriptor */
+            if (l3[l3_idx] != 0) {
+                l3[l3_idx] = 0; /* Invalid descriptor */
+                if (!bcast) {
+                    if (pa < changed_lo)
+                        changed_lo = pa;
+                    if (pa + PAGE_SIZE > changed_hi)
+                        changed_hi = pa + PAGE_SIZE;
+                }
+            }
         }
 
-        tlbi_request_range(base + page_start, base + page_end);
+        if (!bcast && changed_hi > changed_lo)
+            tlbi_request_range(base + changed_lo, base + changed_hi);
         addr = page_end;
     }
 
@@ -2748,9 +2882,23 @@ int guest_update_perms(guest_t *g, uint64_t start, uint64_t end, int perms)
 {
     uint64_t base = g->ipa_base;
 
-    /* Page-align the range */
+    /* Page-align the range. The ALIGN_UP on end could wrap to 0 for inputs
+     * within PAGE_SIZE-1 of UINT64_MAX, silently degrading the call to a
+     * no-op against a 0-length loop. Reject the pathological input rather
+     * than leave stale perms in place.
+     */
+    if (end > UINT64_MAX - (PAGE_SIZE - 1))
+        return -1;
     start = start & ~(PAGE_SIZE - 1);
     end = (end + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    if (end <= start)
+        return 0;
+
+    /* New perms include exec: the shim must IC IALLU on syscall return so a
+     * VA that previously held NX content fetches the new instructions. The
+     * inverse (removing exec) leaves no new code visible. */
+    if (perms & MEM_PERM_X)
+        tlbi_request_mark_icache();
 
     /* Aliasing-proof invariant: TTBR1 maps the kbuf RW + UXN + PXN. The same
      * physical pages will be dual-mapped at KBUF_USER_VA under TTBR0 by the
@@ -2825,10 +2973,15 @@ int guest_update_perms(guest_t *g, uint64_t start, uint64_t end, int perms)
         /* Update pages within this 2MiB block that fall in [start, end). Track
          * the smallest sub-range that actually changed so the TLBI request only
          * covers descriptors whose value changed (false-positive elimination).
+         * Once the accumulator has already promoted to TLBI_BROADCAST, the
+         * bounding-box bookkeeping is wasted work -- the broadcast invalidates
+         * everything regardless -- so the loop skips the compares in that
+         * mode while still writing every changed descriptor.
          */
         uint64_t page_start = (addr > block_start) ? addr : block_start;
         uint64_t page_end = (end < block_end) ? end : block_end;
         uint64_t changed_lo = UINT64_MAX, changed_hi = 0;
+        bool bcast = tlbi_request_is_broadcast();
 
         for (uint64_t pa = page_start; pa < page_end; pa += PAGE_SIZE) {
             unsigned l3_idx =
@@ -2858,14 +3011,16 @@ int guest_update_perms(guest_t *g, uint64_t start, uint64_t end, int perms)
             uint64_t new_desc = make_page_desc(page_ipa, perms);
             if (l3[l3_idx] != new_desc) {
                 l3[l3_idx] = new_desc;
-                if (pa < changed_lo)
-                    changed_lo = pa;
-                if (pa + PAGE_SIZE > changed_hi)
-                    changed_hi = pa + PAGE_SIZE;
+                if (!bcast) {
+                    if (pa < changed_lo)
+                        changed_lo = pa;
+                    if (pa + PAGE_SIZE > changed_hi)
+                        changed_hi = pa + PAGE_SIZE;
+                }
             }
         }
 
-        if (changed_hi > changed_lo)
+        if (!bcast && changed_hi > changed_lo)
             tlbi_request_range(base + changed_lo, base + changed_hi);
         addr = page_end;
     }
@@ -2908,13 +3063,19 @@ int guest_install_va_pages(guest_t *g,
 
     uint64_t base = g->ipa_base;
     uint64_t end = va + length;
+    uint64_t changed_lo = UINT64_MAX, changed_hi = 0;
+    bool bcast = tlbi_request_is_broadcast();
+    if (perms & MEM_PERM_X)
+        tlbi_request_mark_icache();
 
     /* Walk one 4 KiB page at a time. find_l2_entry locates the L2 slot for
      * each VA; split_l2_block converts an L2 block descriptor into a table
      * lazily so individual L3 entries can be written. The L3 entry is then
      * unconditionally overwritten with the requested gpa + perms, so a prior
      * invalidation (or a fresh split inheriting the wrong block address)
-     * cannot leave behind a stale or zero descriptor.
+     * cannot leave behind a stale or zero descriptor. Pages whose descriptor
+     * is already identical are no-ops for TLBI purposes; skip them. Skip the
+     * per-page bookkeeping once a broadcast is already pending.
      */
     for (uint64_t v = va, p = gpa; v < end; v += PAGE_SIZE, p += PAGE_SIZE) {
         uint64_t *l2_entry = find_l2_entry(g, v);
@@ -2931,10 +3092,20 @@ int guest_install_va_pages(guest_t *g,
         if (!l3)
             return -1;
         unsigned l3_idx = (unsigned) (((base + v) % BLOCK_2MIB) / PAGE_SIZE);
-        l3[l3_idx] = make_page_desc(base + p, perms);
+        uint64_t new_desc = make_page_desc(base + p, perms);
+        if (l3[l3_idx] != new_desc) {
+            l3[l3_idx] = new_desc;
+            if (!bcast) {
+                if (v < changed_lo)
+                    changed_lo = v;
+                if (v + PAGE_SIZE > changed_hi)
+                    changed_hi = v + PAGE_SIZE;
+            }
+        }
     }
 
-    tlbi_request_range(va, end);
+    if (!bcast && changed_hi > changed_lo)
+        tlbi_request_range(changed_lo, changed_hi);
     guest_pt_gen_bump(g);
     return 0;
 }

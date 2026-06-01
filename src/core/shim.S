@@ -22,11 +22,32 @@
  *                            2 = execve replaced register state (full flush
  *                                + drop frame + ERET without GPR restore)
  *                            3 = selective: TLBI VAE1IS over X10 pages
- *                                starting at page-aligned VA in X9)
+ *                                starting at page-aligned VA in X9
+ *                            4 = single-shot TLBI RVAE1IS (FEAT_TLBIRANGE);
+ *                                X9 carries the pre-encoded RVAE1IS operand
+ *                                (baddr | NUM<<39 | SCALE<<44 | TTL<<37 |
+ *                                ASID<<48; SCALE=0, TTL=0, ASID=0 today)
+ *                          X11 carries the I-cache hint for X8 in {1, 3, 4}:
+ *                          1 = IC IALLU after the TLBI sequence (new
+ *                          executable content visible to EL0), 0 = skip the
+ *                          I-cache invalidation (data-only PT change). The
+ *                          X8 == 2 exec_drop_frame path always flushes
+ *                          regardless because execve loads new code. The
+ *                          shim restores X11 from the saved frame before
+ *                          ERET so the EL0 caller never observes this hint.)
  *   #7  MRS trap          (host reads reg from ESR ISS; returns value in x0)
  *   #9  W^X toggle        (x0=FAR, x1=type: 0=exec->RX, 1=write->RW)
  *   #10 BRK from EL0      (SIGTRAP delivery / ptrace-stop; GPRs in frame)
- *   #11 EL0 fault         (SIGSEGV/SIGILL delivery; GPRs in frame)
+ *   #11 EL0 fault         (SIGSEGV/SIGILL delivery; GPRs in frame.
+ *                          On return the host sets X8 to the same TLBI
+ *                          wire code as SVC #5 above (0/1/3/4 only;
+ *                          X8 == 2 exec_drop_frame is rejected and falls
+ *                          through to the conservative full flush). The
+ *                          lazy MAP_NORESERVE materialize path uses this
+ *                          to invalidate any negative TLB entry the EL0
+ *                          retry would otherwise re-fault on. Eret tail
+ *                          preserves X0/X1/X2/X30 so signal_deliver's
+ *                          register writes survive.)
  *   #12 System instr trap (cache maintenance logging: DC CVAU, IC IVAU, etc.)
  *
  * macOS as uses ';' as a comment character on AArch64, NOT as a statement
@@ -115,6 +136,35 @@
     ldp x26, x27, [sp, #208]
     ldp x28, x29, [sp, #224]
     ldr x30, [sp, #240]
+    add sp, sp, #256
+.endm
+
+/* RESTORE_GPRS_KEEP_SIGFRAME: load X3-X29 from the saved frame and pop it,
+ * leaving X0/X1/X2/X30 untouched. signal_deliver writes the signum, siginfo
+ * pointer, ucontext pointer, and sa_restorer address into those live regs
+ * via hv_vcpu_set_reg before returning from HVC #11; the standard
+ * RESTORE_GPRS_KEEP_X0 tail would clobber X1/X2/X30 with their pre-fault
+ * EL0 values. Used by the HVC #11 post-handler so the lazy-materialize
+ * path can run TLBI ops (which clobber X11/X12/X13 as scratch) while
+ * still preserving signal_deliver's register writes on the SIGSEGV /
+ * SIGILL delivery path. The caller is responsible for setting X8 = 0
+ * if no TLBI is needed; X8 is loaded from the frame here regardless.
+ */
+.macro RESTORE_GPRS_KEEP_SIGFRAME
+    ldr x3, [sp, #24]
+    ldp x4, x5, [sp, #32]
+    ldp x6, x7, [sp, #48]
+    ldp x8, x9, [sp, #64]
+    ldp x10, x11, [sp, #80]
+    ldp x12, x13, [sp, #96]
+    ldp x14, x15, [sp, #112]
+    ldp x16, x17, [sp, #128]
+    ldp x18, x19, [sp, #144]
+    ldp x20, x21, [sp, #160]
+    ldp x22, x23, [sp, #176]
+    ldp x24, x25, [sp, #192]
+    ldp x26, x27, [sp, #208]
+    ldp x28, x29, [sp, #224]
     add sp, sp, #256
 .endm
 
@@ -743,19 +793,104 @@ handle_data_abort:
  * EC=0x00 (undefined) or other -> SIGILL.
  */
 handle_el0_fault:
-    /* Restore all GPRs from stack frame (host needs EL0 state) */
-    RESTORE_GPRS
+    /* Load EL0 GPRs from the saved frame WITHOUT popping it. The frame
+     * must stay live across HVC #11 so the post-HVC dispatch below can
+     * restore X3-X29 via the frameless RESTORE_GPRS_KEEP_SIGFRAME tail
+     * after the host has overwritten X0/X1/X2/X30 via hv_vcpu_set_reg
+     * (signal_deliver) and the inline TLBI handlers have clobbered
+     * X11/X12/X13 as scratch.
+     */
+    LOAD_GPRS
 
-    /* Forward to host for SIGSEGV delivery.
-     * Host reads ESR_EL1 (fault syndrome), FAR_EL1 (faulting address), and
-     * ELR_EL1 (PC at fault) to decode the fault and build the signal frame.
+    /* Forward to host. Host paths:
+     *   (1) signal delivery -> writes X0=signum, X1=siginfo*, X2=ucontext*,
+     *       X30=sa_restorer via hv_vcpu_set_reg; host leaves X8=0.
+     *   (2) lazy MAP_NORESERVE materialize -> populates cpu_tlbi_req via
+     *       guest_extend_page_tables / guest_update_perms / friends, then
+     *       calls tlbi_request_emit_to_vcpu(vcpu) which writes
+     *       X8/X9/X10/X11 per the same wire protocol the SVC #5 epilogue
+     *       uses. Single-shot RVAE1IS via X8=4 is included.
+     *
+     * The dispatch below mirrors handle_svc_0's TLBI dispatch. exec_drop
+     * (X8=2) is rejected on this path (the host never sets it here); fall
+     * through to the conservative full flush rather than silently skip.
      */
     hvc #11
 
-    /* Host has set up signal frame (if SIGSEGV handler registered) or
-     * flagged for termination (default SIGSEGV = core dump). ERET to
-     * new PC (handler address or unchanged if terminating).
+    cbz x8, .Lel0_fault_eret_only
+    cmp x8, #1
+    b.eq .Lel0_fault_tlbi_full
+    cmp x8, #3
+    b.eq .Lel0_fault_tlbi_sel
+    cmp x8, #4
+    b.eq .Lel0_fault_tlbi_rvae
+    /* Unknown X8: conservative broadcast + I-cache flush. */
+    mov x11, #1
+    b .Lel0_fault_tlbi_full
+
+.Lel0_fault_tlbi_full:
+    /* Broadcast TLB + conditional I-cache flush. X11=0 skips IC IALLU. */
+    tlbi vmalle1is
+    dsb ish
+    cbz x11, .Lel0_fault_full_no_ic
+    ic iallu
+    dsb ish
+.Lel0_fault_full_no_ic:
+    isb
+    b .Lel0_fault_eret_restore
+
+.Lel0_fault_tlbi_sel:
+    /* Selective per-page TLBI VAE1IS loop. X9 = page-aligned VA,
+     * X10 = page count (1..TLBI_SELECTIVE_MAX_PAGES). X11 carries the
+     * I-cache hint on entry; save into X13 before the loop clobbers X11.
+     * ubfx (not plain lsr) pins the VA to the 44-bit [43:0] field so a
+     * future LPA2 / TTL / tagged-address change cannot leak high bits
+     * into the operand's TTL [47:44] or ASID [63:48] fields. */
+    cbz x10, .Lel0_fault_eret_only
+    mov x13, x11
+    ubfx x11, x9, #12, #44
+    mov x12, x10
+4:  tlbi vae1is, x11
+    add x11, x11, #1
+    subs x12, x12, #1
+    b.ne 4b
+    dsb ish
+    cbz x13, .Lel0_fault_sel_no_ic
+    ic iallu
+    dsb ish
+.Lel0_fault_sel_no_ic:
+    isb
+    b .Lel0_fault_eret_restore
+
+.Lel0_fault_tlbi_rvae:
+    /* Single-shot TLBI RVAE1IS (FEAT_TLBIRANGE). X9 carries the pre-encoded
+     * operand (baddr | NUM<<39 | TG=01<<46); X11 the I-cache hint. */
+    tlbi rvae1is, x9
+    dsb ish
+    cbz x11, .Lel0_fault_rvae_no_ic
+    ic iallu
+    dsb ish
+.Lel0_fault_rvae_no_ic:
+    isb
+    /* fall through */
+
+.Lel0_fault_eret_restore:
+    /* TLBI clobbered X11/X12/X13 (and possibly X9/X10 in the selective
+     * path). Reload X3-X29 from the saved frame so the EL0 retry sees the
+     * same scratch state as pre-fault; skip X0/X1/X2/X30 in case
+     * signal delivery set them. On lazy materialization and conservative
+     * unknown-X8 fallback paths, the skipped registers still match the frame.
      */
+    RESTORE_GPRS_KEEP_SIGFRAME
+    eret
+
+.Lel0_fault_eret_only:
+    /* X8 == 0: no TLBI requested. signal-delivery and no-delivery paths
+     * land here after the host wrote X8 as the post-HVC protocol value.
+     * Reload X3-X29 so EL0 sees the pre-fault scratch state, while keeping
+     * X0/X1/X2/X30 live for a materialized signal handler.
+     */
+    RESTORE_GPRS_KEEP_SIGFRAME
     eret
 
 /* Shared exit paths for exception handlers
@@ -768,7 +903,11 @@ tlbi_restore_eret:
      * raise further exceptions, so FAR_EL1 is preserved.
      */
     mrs x0, far_el1
-    lsr x0, x0, #12          /* TLBI VAE1IS operand: VA[55:12] */
+    /* TLBI VAE1IS operand: VA[55:12] held in bits [43:0]. ubfx pins the
+     * 44-bit width so future LPA2 / TTL / tagged-address support cannot
+     * leak VA bits into the TTL [47:44] or ASID [63:48] operand fields.
+     */
+    ubfx x0, x0, #12, #44
     tlbi vae1is, x0
     dsb ish
     ic iallu
@@ -856,31 +995,39 @@ handle_svc_0:
     b.eq tlbi_full
     cmp x8, #3
     b.eq tlbi_selective
+    cmp x8, #4
+    b.eq tlbi_range_large
     cmp x8, #2
     b.eq exec_drop_frame
-    /* Unknown X8: be conservative, broadcast and continue. */
+    /* Unknown X8: be conservative, broadcast, flush I-cache, and continue. */
+    mov x11, #1
 
 tlbi_full:
-    /* Broadcast TLB + I-cache flush. Used for page-table edits whose
-     * affected range exceeds the selective cap, or any time the host could
-     * not bound the change.
+    /* Broadcast TLB + (conditional) I-cache flush. Used for page-table edits
+     * whose affected range exceeds the selective cap, or any time the host
+     * could not bound the change. X11 carries the I-cache hint: non-zero
+     * means the host introduced executable content visible to EL0 (new X
+     * mapping, NX->X mprotect, lazy materialize from a region that may
+     * include exec), so the shim must IC IALLU; zero means a data-only
+     * PT change and the I-cache invalidation is skipped.
      */
     tlbi vmalle1is
     dsb ish
+    cbz x11, .Ltlbi_full_skip_ic
     ic iallu
     dsb ish
+.Ltlbi_full_skip_ic:
     isb
-    b 1f
+    b svc_restore_eret
 
 tlbi_selective:
     /* Selective TLBI VAE1IS loop.
      *   x9  = page-aligned VA of the first page to invalidate
      *   x10 = page count (1..TLBI_SELECTIVE_MAX_PAGES, see core/guest.h)
+     *   x11 = I-cache hint (see tlbi_full above)
      * TLBI VAE1IS takes a Xt operand of (VA[55:12] | (ASID << 48)). The
      * guest runs single-ASID at EL0, so just shift the VA right by 12.
-     * Issue all TLBI ops, then a single DSB ISH + IC IALLU + DSB + ISB
-     * matches broadcast semantics (preserves I-cache invalidation behavior
-     * for callers like file-backed mmap of executable pages).
+     * Issue all TLBI ops, then DSB ISH + (conditional) IC IALLU + DSB + ISB.
      *
      * Defensive: if x10 == 0, skip the loop. The per-vCPU host-side
      * accumulator (cpu_tlbi_req in core/guest.h) never sets pages == 0
@@ -888,17 +1035,43 @@ tlbi_selective:
      * write ever produced the pair X8=3, X10=0, the subs x12, x12, #1
      * below would underflow to 0xFFFFFFFFFFFFFFFF and the b.ne would loop
      * ~2^64 iterations, hanging this vCPU. Cheap guard.
+     *
+     * x11 is the I-cache hint on entry but the per-page TLBI operand is
+     * also computed from x9 -- save the hint into x13 before clobbering.
      */
     cbz x10, 1f
-    lsr x11, x9, #12          /* x11 = VA >> 12 (current page operand) */
+    mov x13, x11              /* x13 = saved I-cache hint */
+    /* TLBI VAE1IS operand: VA[55:12] held in bits [43:0]. ubfx pins the
+     * 44-bit width so future LPA2 / TTL / tagged-address support cannot
+     * leak VA bits into the TTL [47:44] or ASID [63:48] operand fields. */
+    ubfx x11, x9, #12, #44    /* x11 = VA[55:12] (current page operand) */
     mov x12, x10              /* x12 = remaining page counter */
 3:  tlbi vae1is, x11
     add x11, x11, #1          /* next page (operand is in 4 KiB units) */
     subs x12, x12, #1
     b.ne 3b
     dsb ish
+    cbz x13, .Ltlbi_sel_skip_ic
     ic iallu
     dsb ish
+.Ltlbi_sel_skip_ic:
+    isb
+    b svc_restore_eret
+
+tlbi_range_large:
+    /* Single-shot TLBI RVAE1IS (FEAT_TLBIRANGE, ARMv8.4+). The host has
+     * encoded the full operand in X9: baddr (VA >> 12), TTL=0, NUM in bits
+     * [43:39], SCALE=0, ASID=0. One instruction covers up to 64 pages,
+     * avoiding the broadcast TLBI VMALLE1IS that the prior selective cap
+     * forced for 17..64-page ranges. X11 carries the I-cache hint as in
+     * tlbi_full / tlbi_selective.
+     */
+    tlbi rvae1is, x9
+    dsb ish
+    cbz x11, .Ltlbi_rvae_skip_ic
+    ic iallu
+    dsb ish
+.Ltlbi_rvae_skip_ic:
     isb
     b svc_restore_eret
 

@@ -1585,70 +1585,25 @@ int vcpu_run_loop(hv_vcpu_t vcpu,
 
                     uint32_t fault_ec = (uint32_t) ((esr >> 26) & 0x3F);
 
-                    int signum, si_code;
-                    uint64_t si_addr;
-
-                    if (fault_ec == 0x20 || fault_ec == 0x24) {
-                        /* Instruction or data abort -> check lazy page
-                         * materialization before delivering SIGSEGV.
-                         */
-                        uint32_t fsc = (uint32_t) (esr & 0x3F);
-                        uint32_t fsc_type = (fsc >> 2) & 0xF;
-
-                        /* Translation faults have xFSC[5:2] == 0x1; the low
-                         * bits select the translation table level. These may
-                         * come from a MAP_NORESERVE region with deferred page
-                         * table creation, so try to materialize the page
-                         * before declaring SIGSEGV.
-                         */
-                        if (fsc_type == 0x01) {
-                            uint64_t fault_off = far_addr - g->ipa_base;
-                            pthread_mutex_lock(&mmap_lock);
-                            int mat = guest_materialize_lazy(g, fault_off);
-                            pthread_mutex_unlock(&mmap_lock);
-                            if (mat == 0) {
-                                /* Page materialized; TLBI and retry the
-                                 * faulting instruction. Set X8=1 to request
-                                 * TLBI from the shim before ERET.
-                                 */
-                                hv_vcpu_set_reg(vcpu, HV_REG_X8, 1);
-                                break;
-                            }
-                        }
-
-                        signum = LINUX_SIGSEGV;
-                        /* Permission faults have xFSC[5:2] == 0x3. Address
-                         * size, translation, and access-flag faults remain
-                         * mapping errors for Linux-visible SIGSEGV delivery.
-                         */
-                        si_code = (fsc_type == 0x03) ? LINUX_SEGV_ACCERR
-                                                     : LINUX_SEGV_MAPERR;
-                        si_addr = far_addr;
-
-                        if (verbose) {
-                            const char *fault_type =
-                                (fault_ec == 0x20) ? "inst" : "data";
-                            const char *code_name =
-                                (si_code == LINUX_SEGV_MAPERR) ? "MAPERR"
-                                                               : "ACCERR";
-                            log_debug(
-                                "%s: EL0 %s fault at 0x%llx "
-                                "PC=0x%llx (ESR=0x%llx FSC=0x%x) "
-                                "-> SIGSEGV/%s",
-                                prefix, fault_type,
-                                (unsigned long long) far_addr,
-                                (unsigned long long) elr_addr,
-                                (unsigned long long) esr, fsc, code_name);
-                        }
-                    } else {
-                        /* EC=0x00 (undefined instruction) or other unrecognized
-                         * EC from EL0 -> SIGILL. Use ELR_EL1 as si_addr because
-                         * FAR_EL1 is UNKNOWN for non-abort exceptions.
-                         */
-                        signum = LINUX_SIGILL;
-                        si_code = LINUX_ILL_ILLOPC;
-                        si_addr = elr_addr;
-
+                    /* Non-abort EC -> SIGILL. Branch out early so the
+                     * abort / SIGSEGV path below stays at the case-body
+                     * indent rather than nested inside an else branch.
+                     * FAR_EL1 is UNKNOWN for non-abort exceptions, so use
+                     * ELR_EL1 for si_addr.
+                     *
+                     * Only EC 0x20 (instruction abort from a lower EL) and
+                     * EC 0x24 (data abort from a lower EL) are intentionally
+                     * routed to the SIGSEGV path that follows. Every other
+                     * forwarded EC -- 0x00 (undefined instruction), 0x18
+                     * (system instruction trap), 0x32/0x33 (software
+                     * step), 0x3C (BRK), and any unrecognized class --
+                     * lands here as SIGILL. If a future change adds a new
+                     * lower-EL abort class (e.g. 0x21 / 0x25 for higher
+                     * exception levels) that should map to SIGSEGV, the
+                     * test below needs explicit widening; do NOT relax
+                     * the check casually.
+                     */
+                    if (fault_ec != 0x20 && fault_ec != 0x24) {
                         if (verbose)
                             log_debug(
                                 "%s: EL0 undefined insn at "
@@ -1656,18 +1611,91 @@ int vcpu_run_loop(hv_vcpu_t vcpu,
                                 "-> SIGILL/ILL_ILLOPC",
                                 prefix, (unsigned long long) elr_addr,
                                 (unsigned long long) esr, fault_ec);
+                        signal_set_fault_info(LINUX_ILL_ILLOPC, elr_addr, esr);
+                        signal_queue(LINUX_SIGILL);
+                        int sig_ret = signal_deliver(vcpu, g, &exit_code);
+                        /* HVC #11 consumes X8 as the post-fault TLBI opcode.
+                         * signal_deliver() may leave it unchanged when no
+                         * handler is materialized, or set the syscall-path
+                         * frame-drop marker when one is. Neither is a TLBI
+                         * request here; lazy materialization emits its own
+                         * request and exits before this path.
+                         */
+                        hv_vcpu_set_reg(vcpu, HV_REG_X8, 0);
+                        if (verbose)
+                            log_debug("%s: signal %d deliver returned %d",
+                                      prefix, LINUX_SIGILL, sig_ret);
+                        if (sig_ret < 0)
+                            running = false; /* SIG_DFL core => terminate. */
+                        break;
                     }
 
-                    signal_set_fault_info(si_code, si_addr, esr);
-                    signal_queue(signum);
+                    /* Instruction or data abort. Try lazy page materialization
+                     * before declaring SIGSEGV: translation faults
+                     * (xFSC[5:2] == 0x1) may come from a MAP_NORESERVE region
+                     * with deferred page-table creation.
+                     */
+                    uint32_t fsc = (uint32_t) (esr & 0x3F);
+                    uint32_t fsc_type = (fsc >> 2) & 0xF;
+                    if (fsc_type == 0x01) {
+                        uint64_t fault_off = far_addr - g->ipa_base;
+                        pthread_mutex_lock(&mmap_lock);
+                        int mat = guest_materialize_lazy(g, fault_off);
+                        pthread_mutex_unlock(&mmap_lock);
+                        if (mat == 0) {
+                            /* Page materialized; the helpers inside
+                             * guest_materialize_lazy populated the
+                             * per-vCPU TLBI accumulator with the range
+                             * just installed (plus the I-cache hint if
+                             * the region's prot includes PROT_EXEC).
+                             * Drain it through the shared emit helper
+                             * so the shim's post-HVC-11 dispatch
+                             * (handle_el0_fault) actually issues the
+                             * TLBI before ERET. Without this, a PE that
+                             * caches translation-fault (negative)
+                             * entries would re-fault on the retry,
+                             * looping until the entry self-evicts. */
+                            tlbi_request_emit_to_vcpu(vcpu);
+                            break;
+                        }
+                    }
+
+                    /* Real SIGSEGV. Permission faults (xFSC[5:2] == 0x3) map
+                     * to SEGV_ACCERR; address size, translation, and
+                     * access-flag faults map to SEGV_MAPERR for Linux.
+                     */
+                    int si_code = (fsc_type == 0x03) ? LINUX_SEGV_ACCERR
+                                                     : LINUX_SEGV_MAPERR;
+                    if (verbose) {
+                        const char *fault_type =
+                            (fault_ec == 0x20) ? "inst" : "data";
+                        const char *code_name = (si_code == LINUX_SEGV_MAPERR)
+                                                    ? "MAPERR"
+                                                    : "ACCERR";
+                        log_debug(
+                            "%s: EL0 %s fault at 0x%llx "
+                            "PC=0x%llx (ESR=0x%llx FSC=0x%x) "
+                            "-> SIGSEGV/%s",
+                            prefix, fault_type, (unsigned long long) far_addr,
+                            (unsigned long long) elr_addr,
+                            (unsigned long long) esr, fsc, code_name);
+                    }
+                    signal_set_fault_info(si_code, far_addr, esr);
+                    signal_queue(LINUX_SIGSEGV);
                     int sig_ret = signal_deliver(vcpu, g, &exit_code);
+                    /* HVC #11 consumes X8 as the post-fault TLBI opcode.
+                     * signal_deliver() may leave it unchanged when no
+                     * handler is materialized, or set the syscall-path
+                     * frame-drop marker when one is. Neither is a TLBI
+                     * request here; lazy materialization emits its own
+                     * request and exits before this path.
+                     */
+                    hv_vcpu_set_reg(vcpu, HV_REG_X8, 0);
                     if (verbose)
                         log_debug("%s: signal %d deliver returned %d", prefix,
-                                  signum, sig_ret);
-                    if (sig_ret < 0) {
-                        /* Core dispositions terminate without a core file. */
-                        running = false;
-                    }
+                                  LINUX_SIGSEGV, sig_ret);
+                    if (sig_ret < 0)
+                        running = false; /* SIG_DFL core => terminate. */
                     break;
                 }
 
