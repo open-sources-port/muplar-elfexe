@@ -6,6 +6,10 @@ BUILD_DIR := build
 ELFUSE_BIN := $(BUILD_DIR)/elfuse
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "unknown")
 
+# Private pseudo-syscall number used by translated guests to invoke the
+# embedder HVC 6 hook. This is not a Linux syscall number.
+ELFUSE_NR_EMBEDDER_HVC6 ?= 999
+
 # Test binary directory: either pre-built via GUEST_TEST_BINARIES,
 # auto-detected from build/bin, or locally cross-compiled via $(CROSS_COMPILE)gcc.
 ifeq ($(origin GUEST_TEST_BINARIES), undefined)
@@ -51,3 +55,7 @@ CFLAGS := -O2 -Wall -Wextra -Wpedantic \
           -Wshadow -Wstrict-prototypes -Wmissing-prototypes \
           -Wformat=2 -Wimplicit-fallthrough -Wundef \
           -Wnull-dereference -Wno-unused-parameter
+
+ifneq ($(strip $(ELFUSE_NR_EMBEDDER_HVC6)),)
+CFLAGS += -DELFUSE_NR_EMBEDDER_HVC6=$(ELFUSE_NR_EMBEDDER_HVC6)
+endif

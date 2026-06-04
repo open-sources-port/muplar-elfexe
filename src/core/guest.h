@@ -512,7 +512,14 @@ typedef struct {
     _Atomic uint64_t pt_gen;
 
     /*
-     * Optional HVC #6 embedder extension hook.
+     * Optional HVC 6 embedder extension hook.
+     *
+     * Native AArch64 guests reach this through HVC 6. When the build enables
+     * ELFUSE_NR_EMBEDDER_HVC6, translated Rosetta guests may reach the same
+     * handler through a private pseudo-syscall gated on g->is_rosetta.
+     *
+     * Handler implementations must treat call_nr and args as untrusted guest
+     * input and allowlist supported call numbers.
      *
      * The handler may be invoked concurrently from multiple host threads once
      * the guest becomes multi-threaded, so implementations must be thread-safe.

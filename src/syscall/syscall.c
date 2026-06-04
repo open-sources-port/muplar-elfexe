@@ -1706,6 +1706,12 @@ static int64_t sc_futex_waitv(guest_t *g,
 #error "SC_TABLE_SIZE must exceed SC_MAX_SYSCALL_NUM"
 #endif
 
+#if defined(ELFUSE_NR_EMBEDDER_HVC6) && (ELFUSE_NR_EMBEDDER_HVC6 + 0 > 0)
+_Static_assert(ELFUSE_NR_EMBEDDER_HVC6 > SC_TABLE_SIZE,
+               "ELFUSE_NR_EMBEDDER_HVC6 must be outside syscall_table");
+#define ELFUSE_ROSETTA_EMBEDDER_SYSCALL 1
+#endif
+
 typedef struct {
     syscall_handler_t handler;
     bool needs_extra_regs;
@@ -1887,6 +1893,37 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, bool verbose)
 
 slow_path:
     entry = RANGE_CHECK(nr, 0, SC_TABLE_SIZE) ? &syscall_table[nr] : NULL;
+
+/*
+ * Private embedder pseudo-syscall for translated guests.
+ *
+ * This is not a Linux syscall number. Translated x86_64 guests cannot
+ * issue native AArch64 HVC instructions, so elfuse uses this private
+ * build-selected syscall number as the translated counterpart to HVC 6.
+ *
+ * This path is gated on g->is_rosetta so native AArch64 guests cannot
+ * reach the embedder hook through SVC.
+ *
+ * Layout:
+ *   x8 = ELFUSE_ROSETTA_EMBEDDER_SYSCALL
+ *   x0 = embedder call number
+ *   x1 = guest virtual address of uint64_t args[8]
+ */
+#ifdef ELFUSE_ROSETTA_EMBEDDER_SYSCALL
+    if (g->is_rosetta && nr == ELFUSE_NR_EMBEDDER_HVC6 && g->hvc6_handler) {
+        uint64_t call_nr = 0;
+        uint64_t args_gva = 0;
+        hv_vcpu_get_reg(vcpu, HV_REG_X0, &call_nr);
+        hv_vcpu_get_reg(vcpu, HV_REG_X1, &args_gva);
+        uint64_t guest_args[8] = {0};
+        if (guest_read_small(g, args_gva, guest_args, sizeof(guest_args)) < 0) {
+            result = -LINUX_EFAULT;
+        } else {
+            result = g->hvc6_handler(call_nr, guest_args, g->hvc6_userdata);
+        }
+        goto fast_done;
+    }
+#endif
 
     hv_vcpu_get_reg(vcpu, HV_REG_X0, &x0);
     hv_vcpu_get_reg(vcpu, HV_REG_X1, &x1);
