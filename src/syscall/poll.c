@@ -58,49 +58,19 @@ void wakeup_pipe_signal(void)
 
 /* polling/select. */
 
-#define PPOLL_FD_CACHE_SIZE 512
-
 typedef struct {
     int host_fd;
     uint16_t word;
     uint8_t bit_index;
+    short events;
+    short revents;
+    host_fd_ref_t ref;
 } pselect_req_t;
 
-static int ppoll_lookup_host_fd(const int *cached_guest_fds,
-                                const int *cached_host_fds,
-                                int guest_fd)
+static inline void host_fd_refs_close(host_fd_ref_t *refs, uint32_t n)
 {
-    unsigned int slot =
-        ((unsigned int) guest_fd * 2654435761u) & (PPOLL_FD_CACHE_SIZE - 1);
-
-    for (int probes = 0; probes < PPOLL_FD_CACHE_SIZE; probes++) {
-        if (cached_guest_fds[slot] == -1)
-            return -1;
-        if (cached_guest_fds[slot] == guest_fd)
-            return cached_host_fds[slot];
-        slot = (slot + 1) & (PPOLL_FD_CACHE_SIZE - 1);
-    }
-
-    return -1;
-}
-
-static void ppoll_cache_host_fd(int *cached_guest_fds,
-                                int *cached_host_fds,
-                                int guest_fd,
-                                int host_fd)
-{
-    unsigned int slot =
-        ((unsigned int) guest_fd * 2654435761u) & (PPOLL_FD_CACHE_SIZE - 1);
-
-    for (int probes = 0; probes < PPOLL_FD_CACHE_SIZE; probes++) {
-        if (cached_guest_fds[slot] == -1 ||
-            cached_guest_fds[slot] == guest_fd) {
-            cached_guest_fds[slot] = guest_fd;
-            cached_host_fds[slot] = host_fd;
-            return;
-        }
-        slot = (slot + 1) & (PPOLL_FD_CACHE_SIZE - 1);
-    }
+    for (uint32_t i = 0; i < n; i++)
+        host_fd_ref_close(&refs[i]);
 }
 
 int64_t sys_ppoll(guest_t *g,
@@ -122,37 +92,19 @@ int64_t sys_ppoll(guest_t *g,
 
     /* Translate guest FDs to host FDs */
     struct pollfd host_fds[256];
-    int cached_guest_fds[PPOLL_FD_CACHE_SIZE];
-    int cached_host_fds[PPOLL_FD_CACHE_SIZE];
-    int seen_guest_fds[32], seen_host_fds[32];
-    uint32_t seen_count = 0;
-    bool use_linear_cache = (nfds <= 32);
-
-    if (!use_linear_cache)
-        memset(cached_guest_fds, 0xff, sizeof(cached_guest_fds));
-
+    host_fd_ref_t host_refs[256];
+    bool need_pollnval[256] = {false};
+    uint32_t invalid_count = 0;
     for (uint32_t i = 0; i < nfds; i++) {
-        int guest_fd = guest_fds[i].fd, host_fd = -1;
-        if (use_linear_cache) {
-            for (uint32_t j = 0; j < seen_count; j++) {
-                if (seen_guest_fds[j] == guest_fd) {
-                    host_fd = seen_host_fds[j];
-                    break;
-                }
-            }
-            if (host_fd < 0) {
-                host_fd = fd_to_host(guest_fd);
-                seen_guest_fds[seen_count] = guest_fd;
-                seen_host_fds[seen_count] = host_fd;
-                seen_count++;
-            }
-        } else {
-            host_fd = ppoll_lookup_host_fd(cached_guest_fds, cached_host_fds,
-                                           guest_fd);
-            if (host_fd < 0) {
-                host_fd = fd_to_host(guest_fd);
-                ppoll_cache_host_fd(cached_guest_fds, cached_host_fds, guest_fd,
-                                    host_fd);
+        host_refs[i] = (host_fd_ref_t) {.fd = -1, .owned = false};
+        int guest_fd = guest_fds[i].fd;
+        int host_fd = -1;
+        if (guest_fd >= 0) {
+            if (host_fd_ref_open_io(guest_fd, &host_refs[i]) < 0) {
+                need_pollnval[i] = true;
+                invalid_count++;
+            } else {
+                host_fd = host_refs[i].fd;
             }
         }
         host_fds[i].fd = host_fd;
@@ -198,11 +150,15 @@ int64_t sys_ppoll(guest_t *g,
     int timeout_ms = -1; /* Infinite by default */
     if (timeout_gva != 0) {
         linux_timespec_t lts;
-        if (guest_read_small(g, timeout_gva, &lts, sizeof(lts)) < 0)
+        if (guest_read_small(g, timeout_gva, &lts, sizeof(lts)) < 0) {
+            host_fd_refs_close(host_refs, nfds);
             return -LINUX_EFAULT;
+        }
         /* Linux returns EINVAL for negative timeout values */
-        if (lts.tv_sec < 0 || !RANGE_CHECK(lts.tv_nsec, 0, 1000000000LL))
+        if (lts.tv_sec < 0 || !RANGE_CHECK(lts.tv_nsec, 0, 1000000000LL)) {
+            host_fd_refs_close(host_refs, nfds);
             return -LINUX_EINVAL;
+        }
         /* Guard against overflow: tv_sec * 1000 can exceed INT64_MAX */
         int64_t ms64;
         if (lts.tv_sec > INT64_MAX / 1000)
@@ -217,12 +173,13 @@ int64_t sys_ppoll(guest_t *g,
     bool mask_installed = false;
     if (sigmask_gva != 0) {
         uint64_t new_mask;
-        if (guest_read_small(g, sigmask_gva, &new_mask, sizeof(new_mask)) ==
-            0) {
-            saved_mask = signal_save_blocked();
-            signal_set_blocked(new_mask);
-            mask_installed = true;
+        if (guest_read_small(g, sigmask_gva, &new_mask, sizeof(new_mask)) < 0) {
+            host_fd_refs_close(host_refs, nfds);
+            return -LINUX_EFAULT;
         }
+        saved_mask = signal_save_blocked();
+        signal_set_blocked(new_mask);
+        mask_installed = true;
     }
 
     /* For indefinite polls, add the wakeup pipe so exit_group can
@@ -238,10 +195,19 @@ int64_t sys_ppoll(guest_t *g,
         added_wakeup = true;
     }
 
+    /* When any guest fd is invalid, Linux still polls the rest and returns
+     * POLLNVAL on the bad ones alongside revents on the good ones. Force a
+     * non-blocking poll() so valid fds with pending events still get reported
+     * in the same call.
+     */
+    int poll_timeout_ms = timeout_ms;
+    if (invalid_count > 0)
+        poll_timeout_ms = 0;
+
     int ret;
     do {
         ret = poll(host_fds, nfds + added_wakeup,
-                   timeout_ms < 0 ? 200 : timeout_ms);
+                   poll_timeout_ms < 0 ? 200 : poll_timeout_ms);
 
         /* Check for exit_group / futex_interrupt after waking */
         if (proc_exit_group_requested() || futex_interrupt_pending()) {
@@ -254,7 +220,18 @@ int64_t sys_ppoll(guest_t *g,
          * and nothing happened, loop back. If the caller had a real timeout,
          * poll emulation only called poll once with that timeout, so break.
          */
-    } while (ret == 0 && timeout_ms < 0);
+    } while (ret == 0 && poll_timeout_ms < 0);
+
+    /* POSIX poll() ignores entries with fd < 0 and resets revents to 0,
+     * so re-stamp POLLNVAL on the invalid slots and credit them to the
+     * return count.
+     */
+    if (ret >= 0 && invalid_count > 0) {
+        for (uint32_t i = 0; i < nfds; i++)
+            if (need_pollnval[i])
+                host_fds[i].revents = POLLNVAL;
+        ret += (int) invalid_count;
+    }
 
     int saved_errno = errno;
 
@@ -272,6 +249,8 @@ int64_t sys_ppoll(guest_t *g,
     /* Restore original signal mask */
     if (mask_installed)
         signal_restore_blocked(saved_mask);
+
+    host_fd_refs_close(host_refs, nfds);
 
     if (ret < 0) {
         errno = saved_errno;
@@ -400,10 +379,22 @@ int64_t sys_pselect6(guest_t *g,
                 int bit_index = bit_ctz64(requested);
                 int i = word * 64 + bit_index;
                 uint64_t bit = BIT64(bit_index);
-                int host_fd = fd_to_host(i);
+                host_fd_ref_t ref = {.fd = -1, .owned = false};
+                if (host_fd_ref_open_io(i, &ref) < 0)
+                    goto pselect_badf;
+                int host_fd = ref.fd;
                 reqs[req_count].host_fd = host_fd;
                 reqs[req_count].word = (uint16_t) word;
                 reqs[req_count].bit_index = (uint8_t) bit_index;
+                reqs[req_count].events = 0;
+                reqs[req_count].revents = 0;
+                if (rbits && (rbits[word] & bit))
+                    reqs[req_count].events |= POLLIN;
+                if (wbits && (wbits[word] & bit))
+                    reqs[req_count].events |= POLLOUT;
+                if (ebits && (ebits[word] & bit))
+                    reqs[req_count].events |= POLLPRI;
+                reqs[req_count].ref = ref;
                 req_count++;
                 if (RANGE_CHECK(host_fd, 0, FD_SETSIZE)) {
                     if (host_fd > max_host_fd)
@@ -444,15 +435,18 @@ int64_t sys_pselect6(guest_t *g,
         struct {
             uint64_t ss, ss_len;
         } ssarg;
-        if (guest_read_small(g, sigmask_gva, &ssarg, sizeof(ssarg)) == 0 &&
-            ssarg.ss != 0 && ssarg.ss_len == 8) {
+        if (guest_read_small(g, sigmask_gva, &ssarg, sizeof(ssarg)) < 0)
+            goto pselect_fault;
+        if (ssarg.ss != 0) {
+            /* Linux requires ss_len == sizeof(sigset_t). */
+            if (ssarg.ss_len != 8)
+                goto pselect_inval;
             uint64_t new_mask;
-            if (guest_read_small(g, ssarg.ss, &new_mask, sizeof(new_mask)) ==
-                0) {
-                saved_blocked = signal_save_blocked();
-                signal_set_blocked(new_mask);
-                mask_applied = true;
-            }
+            if (guest_read_small(g, ssarg.ss, &new_mask, sizeof(new_mask)) < 0)
+                goto pselect_fault;
+            saved_blocked = signal_save_blocked();
+            signal_set_blocked(new_mask);
+            mask_applied = true;
         }
     }
 
@@ -461,9 +455,11 @@ int64_t sys_pselect6(guest_t *g,
      */
     bool added_wakeup = false;
     if (!has_timeout && wakeup_pipe_rd >= 0) {
-        FD_SET(wakeup_pipe_rd, &read_set);
-        if (wakeup_pipe_rd > max_host_fd)
-            max_host_fd = wakeup_pipe_rd;
+        if (RANGE_CHECK(wakeup_pipe_rd, 0, FD_SETSIZE)) {
+            FD_SET(wakeup_pipe_rd, &read_set);
+            if (wakeup_pipe_rd > max_host_fd)
+                max_host_fd = wakeup_pipe_rd;
+        }
         added_wakeup = true;
         read_setp = &read_set;
     }
@@ -484,7 +480,18 @@ int64_t sys_pselect6(guest_t *g,
             saved_except = except_set;
     }
 
+    bool use_poll_fallback = false;
+    for (int i = 0; i < req_count; i++) {
+        if (!RANGE_CHECK(reqs[i].host_fd, 0, FD_SETSIZE)) {
+            use_poll_fallback = true;
+            break;
+        }
+    }
+    if (added_wakeup && !RANGE_CHECK(wakeup_pipe_rd, 0, FD_SETSIZE))
+        use_poll_fallback = true;
+
     int ret;
+    bool poll_wakeup_fired = false;
     do {
         if (!has_timeout) {
             if (read_setp)
@@ -495,8 +502,52 @@ int64_t sys_pselect6(guest_t *g,
                 except_set = saved_except;
         }
 
-        ret = pselect(max_host_fd + 1, read_setp, write_setp, except_setp,
-                      has_timeout ? &ts : &poll_ts, NULL);
+        if (use_poll_fallback) {
+            struct pollfd poll_stack[64];
+            struct pollfd *poll_fds = poll_stack;
+            struct pollfd *poll_heap = NULL;
+            int poll_count = req_count + (added_wakeup ? 1 : 0);
+            if (poll_count > (int) ARRAY_SIZE(poll_stack)) {
+                poll_heap = malloc((size_t) poll_count * sizeof(*poll_heap));
+                if (!poll_heap) {
+                    ret = -1;
+                    errno = ENOMEM;
+                    break;
+                }
+                poll_fds = poll_heap;
+            }
+            for (int i = 0; i < req_count; i++) {
+                poll_fds[i].fd = reqs[i].host_fd;
+                poll_fds[i].events = reqs[i].events;
+                poll_fds[i].revents = 0;
+            }
+            if (added_wakeup) {
+                poll_fds[req_count].fd = wakeup_pipe_rd;
+                poll_fds[req_count].events = POLLIN;
+                poll_fds[req_count].revents = 0;
+            }
+
+            const struct timespec *wait_ts = has_timeout ? &ts : &poll_ts;
+            int64_t ms64;
+            if (wait_ts->tv_sec > INT64_MAX / 1000)
+                ms64 = INT64_MAX;
+            else
+                ms64 = wait_ts->tv_sec * (int64_t) 1000 +
+                       (wait_ts->tv_nsec + 999999) / 1000000;
+            int timeout_ms = (ms64 > INT_MAX) ? INT_MAX : (int) ms64;
+
+            ret = poll(poll_fds, (nfds_t) poll_count, timeout_ms);
+            if (ret >= 0) {
+                for (int i = 0; i < req_count; i++)
+                    reqs[i].revents = poll_fds[i].revents;
+                poll_wakeup_fired =
+                    added_wakeup && (poll_fds[req_count].revents & POLLIN);
+            }
+            free(poll_heap);
+        } else {
+            ret = pselect(max_host_fd + 1, read_setp, write_setp, except_setp,
+                          has_timeout ? &ts : &poll_ts, NULL);
+        }
 
         if (proc_exit_group_requested() || futex_interrupt_pending()) {
             ret = -1;
@@ -510,11 +561,16 @@ int64_t sys_pselect6(guest_t *g,
     /* Drain wakeup pipe if it fired, and subtract from count since the wakeup
      * pipe is not visible to the guest.
      */
-    if (added_wakeup && FD_ISSET(wakeup_pipe_rd, &read_set)) {
+    bool wakeup_fired =
+        added_wakeup &&
+        (use_poll_fallback ? poll_wakeup_fired
+                           : FD_ISSET(wakeup_pipe_rd, &read_set));
+    if (wakeup_fired) {
         uint8_t drain;
         while (read(wakeup_pipe_rd, &drain, 1) > 0)
             ;
-        FD_CLR(wakeup_pipe_rd, &read_set);
+        if (!use_poll_fallback)
+            FD_CLR(wakeup_pipe_rd, &read_set);
         if (ret > 0)
             ret--;
     }
@@ -522,6 +578,9 @@ int64_t sys_pselect6(guest_t *g,
     /* Restore original signal mask */
     if (mask_applied)
         signal_restore_blocked(saved_blocked);
+
+    for (int i = 0; i < req_count; i++)
+        host_fd_ref_close(&reqs[i].ref);
 
     if (ret < 0) {
         errno = save_errno;
@@ -551,7 +610,15 @@ int64_t sys_pselect6(guest_t *g,
         for (int i = 0; i < req_count; i++) {
             int host_fd = reqs[i].host_fd, word = reqs[i].word;
             uint64_t bit = BIT64(reqs[i].bit_index);
-            if (RANGE_CHECK(host_fd, 0, FD_SETSIZE)) {
+            if (use_poll_fallback) {
+                short revents = reqs[i].revents;
+                if (rbits && (revents & (POLLIN | POLLHUP | POLLERR)))
+                    rbits[word] |= bit;
+                if (wbits && (revents & (POLLOUT | POLLHUP | POLLERR)))
+                    wbits[word] |= bit;
+                if (ebits && (revents & POLLPRI))
+                    ebits[word] |= bit;
+            } else if (RANGE_CHECK(host_fd, 0, FD_SETSIZE)) {
                 if (rbits && FD_ISSET(host_fd, &read_set))
                     rbits[word] |= bit;
                 if (wbits && FD_ISSET(host_fd, write_setp))
@@ -572,13 +639,20 @@ int64_t sys_pselect6(guest_t *g,
     free(reqs_heap);
     return ret;
 
+    int64_t err;
 pselect_fault:
-    free(reqs_heap);
-    return -LINUX_EFAULT;
-
+    err = -LINUX_EFAULT;
+    goto pselect_cleanup;
 pselect_inval:
+    err = -LINUX_EINVAL;
+    goto pselect_cleanup;
+pselect_badf:
+    err = -LINUX_EBADF;
+pselect_cleanup:
+    for (int i = 0; i < req_count; i++)
+        host_fd_ref_close(&reqs[i].ref);
     free(reqs_heap);
-    return -LINUX_EINVAL;
+    return err;
 }
 
 /* epoll emulation via kqueue

@@ -1607,7 +1607,7 @@ int signal_rt_sigreturn(hv_vcpu_t vcpu, guest_t *g)
 
     /* Read the rt_sigframe from guest stack */
     linux_rt_sigframe_t frame;
-    if (guest_read(g, sp, &frame, sizeof(frame)) < 0)
+    if (guest_read_small(g, sp, &frame, sizeof(frame)) < 0)
         return -LINUX_EFAULT;
 
     /* Validate SROP cookie from uc_flags. Zero means the cookie was

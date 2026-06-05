@@ -28,6 +28,18 @@
 /* Linux SCM_MAX_FD: maximum number of file descriptors in SCM_RIGHTS */
 #define LINUX_SCM_MAX_FD 253
 
+/* Linux only delivers SCM_CREDENTIALS on AF_UNIX sockets even when
+ * SO_PASSCRED is set, so PASSCRED toggled on AF_INET / AF_INET6 must
+ * stay a no-op.
+ */
+static bool host_socket_is_unix(int host_fd)
+{
+    struct sockaddr_storage ss;
+    socklen_t slen = sizeof(ss);
+    return getsockname(host_fd, (struct sockaddr *) &ss, &slen) == 0 &&
+           ss.ss_family == AF_UNIX;
+}
+
 static int translate_scm_rights_fds(int *fds, size_t nfds)
 {
     if (nfds > LINUX_SCM_MAX_FD)
@@ -597,7 +609,7 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags)
         int passcred_val = 0;
         if (net_socket_cached_int_get(fd, LINUX_SOL_SOCKET, LINUX_SO_PASSCRED,
                                       &passcred_val) &&
-            passcred_val) {
+            passcred_val && host_socket_is_unix(host_ref.fd)) {
             linux_ucred_t cred = {
                 .pid = (int32_t) proc_get_pid(),
                 .uid = proc_get_uid(),
@@ -655,7 +667,7 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags)
         int injected = 0, passcred_val = 0;
         if (net_socket_cached_int_get(fd, LINUX_SOL_SOCKET, LINUX_SO_PASSCRED,
                                       &passcred_val) &&
-            passcred_val) {
+            passcred_val && host_socket_is_unix(host_ref.fd)) {
             linux_ucred_t cred = {
                 .pid = (int32_t) proc_get_pid(),
                 .uid = proc_get_uid(),

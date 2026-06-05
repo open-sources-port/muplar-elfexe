@@ -682,6 +682,12 @@ enum {
     SOCK_OPT_TCP_KEEPINTVL,
     SOCK_OPT_IPV6_V6ONLY,
     SOCK_OPT_PASSCRED,
+    SOCK_OPT_IP_TOS,
+    SOCK_OPT_IP_TTL,
+    SOCK_OPT_IP_HDRINCL,
+    SOCK_OPT_IP_PKTINFO,
+    SOCK_OPT_IP_RECVTTL,
+    SOCK_OPT_IP_RECVTOS,
     /* IP_MTU_DISCOVER value stored verbatim so getsockopt round-trips the
      * Linux PMTUD mode the guest set. The host accepts the value but does
      * not honour every Linux mode; see sys_setsockopt for the IP_DONTFRAG
@@ -697,10 +703,11 @@ typedef struct {
 } sock_opt_cache_t;
 
 typedef struct {
-    int type;        /* FD_CLOSED, FD_STDIO, FD_REGULAR, FD_DIR */
-    int host_fd;     /* Underlying macOS file descriptor */
-    int linux_flags; /* Linux open flags (for CLOEXEC tracking) */
-    void *dir;       /* DIR* for FD_DIR entries (NULL otherwise) */
+    int type;            /* FD_CLOSED, FD_STDIO, FD_REGULAR, FD_DIR */
+    int host_fd;         /* Underlying macOS file descriptor */
+    uint64_t generation; /* Bumped each time this guest fd slot is reused. */
+    int linux_flags;     /* Linux open flags (for CLOEXEC tracking) */
+    void *dir;           /* DIR* for FD_DIR entries (NULL otherwise) */
     char proc_path[FD_VIRTUAL_PATH_MAX]; /* Virtual /proc dir root for *at */
     int seals; /* F_SEAL_* bits (non-zero only for memfd_create fds) */
     sock_opt_cache_t sock; /* Socket option cache (zeroed for non-sockets) */

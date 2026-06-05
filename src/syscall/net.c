@@ -112,7 +112,7 @@ int64_t sys_socket(guest_t *g, int domain, int type, int protocol)
             return linux_errno();
         }
 
-        int gfd = fd_alloc(FD_SOCKET, fd, NULL);
+        int gfd = fd_alloc(FD_SOCKET, fd, absock_unregister_fd);
         if (gfd < 0) {
             close(fd);
             return -LINUX_EMFILE;
@@ -138,7 +138,7 @@ int64_t sys_socket(guest_t *g, int domain, int type, int protocol)
     int one = 1;
     setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
 
-    int gfd = fd_alloc(FD_SOCKET, fd, NULL);
+    int gfd = fd_alloc(FD_SOCKET, fd, absock_unregister_fd);
     if (gfd < 0) {
         close(fd);
         return -LINUX_EMFILE;
@@ -180,13 +180,13 @@ int64_t sys_socketpair(guest_t *g,
         setsockopt(fds[i], SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
     }
 
-    int gfd0 = fd_alloc(FD_SOCKET, fds[0], NULL);
+    int gfd0 = fd_alloc(FD_SOCKET, fds[0], absock_unregister_fd);
     if (gfd0 < 0) {
         close(fds[0]);
         close(fds[1]);
         return -LINUX_EMFILE;
     }
-    int gfd1 = fd_alloc(FD_SOCKET, fds[1], NULL);
+    int gfd1 = fd_alloc(FD_SOCKET, fds[1], absock_unregister_fd);
     if (gfd1 < 0) {
         fd_mark_closed(gfd0);
         close(fds[0]);
@@ -268,6 +268,7 @@ int64_t sys_bind(guest_t *g, int fd, uint64_t addr_gva, uint32_t addrlen)
     }
     if (absock_idx >= 0)
         absock_bind_commit(absock_idx);
+
     host_fd_ref_close(&host_ref);
     return 0;
 }
@@ -295,9 +296,40 @@ static int64_t do_accept(guest_t *g,
                          int nonblock,
                          int cloexec)
 {
-    host_fd_ref_t host_ref;
-    if (host_fd_ref_open(fd, &host_ref) < 0)
+    if (!RANGE_CHECK(fd, 0, FD_TABLE_SIZE))
         return -LINUX_EBADF;
+
+    host_fd_ref_t host_ref = {.fd = -1, .owned = false};
+    uint64_t listener_generation = 0;
+    int listener_passcred_fallback = 0;
+    int listener_type = FD_CLOSED;
+
+    if (thread_is_single_active()) {
+        if (host_fd_ref_open(fd, &host_ref) < 0)
+            return -LINUX_EBADF;
+        listener_type = fd_table[fd].type;
+        listener_generation = fd_table[fd].generation;
+        if (listener_type == FD_SOCKET)
+            (void) sock_opt_get(&fd_table[fd], SOCK_OPT_PASSCRED,
+                                &listener_passcred_fallback);
+    } else {
+        fd_entry_t listener_snap = {.type = FD_CLOSED};
+        int host_fd = fd_snapshot_and_dup(fd, &listener_snap);
+        if (host_fd < 0)
+            return -LINUX_EBADF;
+        host_ref.fd = host_fd;
+        host_ref.owned = true;
+        listener_type = listener_snap.type;
+        listener_generation = listener_snap.generation;
+        if (listener_type == FD_SOCKET)
+            (void) sock_opt_get(&listener_snap, SOCK_OPT_PASSCRED,
+                                &listener_passcred_fallback);
+    }
+
+    if (listener_type != FD_SOCKET) {
+        host_fd_ref_close(&host_ref);
+        return -LINUX_ENOTSOCK;
+    }
 
     struct sockaddr_storage mac_sa;
     socklen_t mac_len = sizeof(mac_sa);
@@ -306,6 +338,11 @@ static int64_t do_accept(guest_t *g,
     host_fd_ref_close(&host_ref);
     if (new_fd < 0)
         return linux_errno();
+
+    int listener_passcred = listener_passcred_fallback;
+    (void) net_socket_cached_int_get_if_generation(
+        fd, listener_generation, LINUX_SOL_SOCKET, LINUX_SO_PASSCRED,
+        &listener_passcred);
 
     if ((nonblock && fd_set_nonblock(new_fd) < 0) ||
         (cloexec && fd_set_cloexec(new_fd) < 0)) {
@@ -316,13 +353,13 @@ static int64_t do_accept(guest_t *g,
     int one = 1;
     setsockopt(new_fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
 
-    int gfd = fd_alloc(FD_SOCKET, new_fd, NULL);
+    int gfd = fd_alloc(FD_SOCKET, new_fd, absock_unregister_fd);
     if (gfd < 0) {
         close(new_fd);
         return -LINUX_EMFILE;
     }
     fd_table[gfd].linux_flags = cloexec ? LINUX_O_CLOEXEC : 0;
-    net_socket_cache_init_accept(gfd);
+    net_socket_cache_init_accept(gfd, listener_passcred);
 
     /* Write back peer address if requested. The accept has already succeeded
      * and gfd is valid; EFAULT here mirrors Linux kernel behavior (close the
@@ -469,7 +506,7 @@ int64_t sys_connect(guest_t *g, int fd, uint64_t addr_gva, uint32_t addrlen)
             return linux_errno();
         }
 
-        if (fd_alloc_at(fd, FD_SOCKET, pair[0], NULL) < 0) {
+        if (fd_alloc_at(fd, FD_SOCKET, pair[0], absock_unregister_fd) < 0) {
             close(pair[0]);
             close(pair[1]);
             host_fd_ref_close(&host_ref);
@@ -793,11 +830,12 @@ int64_t sys_setsockopt(guest_t *g,
     if (level == LINUX_SOL_SOCKET && optname == LINUX_SO_PASSCRED) {
         if (!net_socket_fd_is_valid(fd))
             return -LINUX_EBADF;
+        if (optlen == 0 || optlen > sizeof(int))
+            return -LINUX_EINVAL;
         int value = 0;
-        if (optlen > 0 && optlen <= sizeof(int)) {
-            if (guest_read_small(g, optval_gva, &value, optlen) < 0)
-                return -LINUX_EFAULT;
-        }
+        if (guest_read_small(g, optval_gva, &value, optlen) < 0)
+            return -LINUX_EFAULT;
+        value = socket_small_int_normalize(level, optname, value);
         net_socket_cached_int_set(fd, LINUX_SOL_SOCKET, LINUX_SO_PASSCRED,
                                   value);
         return 0;
@@ -817,10 +855,10 @@ int64_t sys_setsockopt(guest_t *g,
          */
         if (!net_socket_fd_is_valid(fd))
             return -LINUX_EBADF;
-        if (optlen > sizeof(int))
+        if (optlen == 0 || optlen > sizeof(int))
             return -LINUX_EINVAL;
         int value = 0;
-        if (optlen > 0 && guest_read_small(g, optval_gva, &value, optlen) < 0)
+        if (guest_read_small(g, optval_gva, &value, optlen) < 0)
             return -LINUX_EFAULT;
         net_socket_cached_int_set(fd, LINUX_IPPROTO_IP, LINUX_IP_MTU_DISCOVER,
                                   value);
@@ -841,20 +879,18 @@ int64_t sys_setsockopt(guest_t *g,
          */
         if (!net_socket_fd_is_valid(fd))
             return -LINUX_EBADF;
-        if (optlen > sizeof(int))
+        if (optlen == 0 || optlen > sizeof(int))
             return -LINUX_EINVAL;
-        if (optlen > 0) {
-            int value = 0;
-            if (guest_read_small(g, optval_gva, &value, optlen) < 0)
-                return -LINUX_EFAULT;
-            (void) value;
-        }
+        int value = 0;
+        if (guest_read_small(g, optval_gva, &value, optlen) < 0)
+            return -LINUX_EFAULT;
+        (void) value;
         return 0;
     }
 
-    if (optlen <= sizeof(int) && small_int_opt) {
+    if (optlen > 0 && optlen <= sizeof(int) && small_int_opt) {
         int value = 0;
-        if (optlen > 0 && guest_read_small(g, optval_gva, &value, optlen) < 0)
+        if (guest_read_small(g, optval_gva, &value, optlen) < 0)
             return -LINUX_EFAULT;
         value = socket_small_int_normalize(level, optname, value);
 
@@ -918,8 +954,12 @@ int64_t sys_setsockopt(guest_t *g,
 
 setsockopt_translated:
     if (optlen <= sizeof(int) && small_int_opt) {
+        if (optlen == 0) {
+            host_fd_ref_close(&host_ref);
+            return -LINUX_EINVAL;
+        }
         int value = 0;
-        if (optlen > 0 && guest_read_small(g, optval_gva, &value, optlen) < 0) {
+        if (guest_read_small(g, optval_gva, &value, optlen) < 0) {
             host_fd_ref_close(&host_ref);
             return -LINUX_EFAULT;
         }
@@ -938,8 +978,14 @@ setsockopt_translated:
             }
         }
 
+        /* Linux accepts shorter optlen for many int-valued options and
+         * zero-extends the value. macOS rejects optlen < sizeof(int) with
+         * EINVAL (notably for IP_TOS / IP_TTL / IP_PKTINFO / IP_RECVTTL /
+         * IP_RECVTOS). The value has already been zero-extended into an int,
+         * so always call the host with sizeof(int).
+         */
         if (setsockopt(host_ref.fd, mac_level, mac_optname, &value,
-                       (socklen_t) optlen) < 0) {
+                       sizeof(value)) < 0) {
             log_debug("setsockopt(fd=%d, level=%d/%d, opt=%d/%d, len=%u): %s",
                       fd, level, mac_level, optname, mac_optname, optlen,
                       strerror(errno));
@@ -971,6 +1017,21 @@ setsockopt_translated:
     }
     host_fd_ref_close(&host_ref);
     return 0;
+}
+
+/* Mirrors Linux ip_sockglue copyval: when an IP-level getsockopt has a
+ * caller buffer shorter than int and the int-sized value fits in a byte,
+ * report and write a single byte. Otherwise leaves actual_len untouched.
+ */
+static inline uint32_t ip_copyval_clamp(int level,
+                                        uint32_t guest_optlen,
+                                        int value,
+                                        uint32_t actual_len)
+{
+    if (level == LINUX_IPPROTO_IP && guest_optlen > 0 &&
+        guest_optlen < sizeof(int) && value >= 0 && value <= 255)
+        return 1;
+    return actual_len;
 }
 
 int64_t sys_getsockopt(guest_t *g,
@@ -1032,13 +1093,16 @@ int64_t sys_getsockopt(guest_t *g,
         return 0;
     }
 
-    if (guest_optlen <= sizeof(int)) {
+    if (socket_opt_uses_small_int(level, optname)) {
         int value = 0;
         if (net_socket_cached_int_get(fd, level, optname, &value)) {
-            uint32_t actual_len = sizeof(int), write_len = actual_len;
+            uint32_t actual_len =
+                ip_copyval_clamp(level, guest_optlen, value, sizeof(int));
+            uint32_t write_len = actual_len;
             if (write_len > guest_optlen)
                 write_len = guest_optlen;
-            if (guest_write_small(g, optval_gva, &value, write_len) < 0)
+            if (write_len > 0 &&
+                guest_write_small(g, optval_gva, &value, write_len) < 0)
                 return -LINUX_EFAULT;
             if (guest_write_small(g, optlen_gva, &actual_len,
                                   sizeof(actual_len)) < 0)
@@ -1107,7 +1171,7 @@ getsockopt_translated:
         return -LINUX_EFAULT;
     }
 
-    if (guest_optlen <= sizeof(int) && small_int_opt) {
+    if (small_int_opt) {
         int value = 0;
         socklen_t mac_optlen = sizeof(value);
         uint32_t actual_len, write_len;
@@ -1133,6 +1197,7 @@ getsockopt_translated:
         }
 
         actual_len = used_cache ? sizeof(int) : (uint32_t) mac_optlen;
+        actual_len = ip_copyval_clamp(level, guest_optlen, value, actual_len);
         write_len = actual_len;
         if (write_len > guest_optlen)
             write_len = guest_optlen;

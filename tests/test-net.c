@@ -24,6 +24,20 @@
 
 #include "test-harness.h"
 
+static int ip_bool_roundtrip(int sock, int optname)
+{
+    int val = 42;
+    if (setsockopt(sock, IPPROTO_IP, optname, &val, sizeof(val)) < 0)
+        return -1;
+
+    val = 0;
+    socklen_t len = sizeof(val);
+    if (getsockopt(sock, IPPROTO_IP, optname, &val, &len) < 0)
+        return -1;
+
+    return val;
+}
+
 int main(void)
 {
     int passes = 0, fails = 0;
@@ -334,6 +348,21 @@ ipv6_done:;
                 EXPECT_TRUE(val > 0, "SO_RCVBUF is 0");
             } else
                 FAIL("getsockopt failed");
+            close(sock);
+        } else
+            FAIL("socket failed");
+    }
+
+    TEST("IP boolean sockopts normalize to 1");
+    {
+        int sock = socket(AF_INET, SOCK_DGRAM, 0);
+        if (sock >= 0) {
+            int pktinfo = ip_bool_roundtrip(sock, IP_PKTINFO);
+            int recvttl = ip_bool_roundtrip(sock, IP_RECVTTL);
+            int recvtos = ip_bool_roundtrip(sock, IP_RECVTOS);
+
+            EXPECT_TRUE(pktinfo == 1 && recvttl == 1 && recvtos == 1,
+                        "IP boolean sockopt returned non-normalized value");
             close(sock);
         } else
             FAIL("socket failed");

@@ -19,8 +19,11 @@ int socket_small_int_normalize(int level, int optname, int value)
          (optname == LINUX_SO_KEEPALIVE || optname == LINUX_SO_REUSEADDR ||
           optname == LINUX_SO_ACCEPTCONN || optname == LINUX_SO_REUSEPORT ||
           optname == LINUX_SO_BROADCAST || optname == LINUX_SO_DONTROUTE ||
-          optname == LINUX_SO_OOBINLINE)) ||
+          optname == LINUX_SO_OOBINLINE || optname == LINUX_SO_PASSCRED)) ||
         (level == LINUX_IPPROTO_TCP && optname == LINUX_TCP_NODELAY) ||
+        (level == LINUX_IPPROTO_IP &&
+         (optname == LINUX_IP_HDRINCL || optname == LINUX_IP_PKTINFO ||
+          optname == LINUX_IP_RECVTTL || optname == LINUX_IP_RECVTOS)) ||
         (level == LINUX_IPPROTO_IPV6 && optname == LINUX_IPV6_V6ONLY))
         return value != 0;
 
@@ -46,6 +49,7 @@ int socket_opt_uses_small_int(int level, int optname)
         case LINUX_SO_SNDBUF:
         case LINUX_SO_TYPE:
         case LINUX_SO_ERROR:
+        case LINUX_SO_PASSCRED:
             return 1;
         default:
             return 0;
@@ -58,6 +62,20 @@ int socket_opt_uses_small_int(int level, int optname)
         case LINUX_TCP_KEEPIDLE:
         case LINUX_TCP_KEEPINTVL:
         case LINUX_TCP_KEEPCNT:
+            return 1;
+        default:
+            return 0;
+        }
+    }
+
+    if (level == LINUX_IPPROTO_IP) {
+        switch (optname) {
+        case LINUX_IP_TOS:
+        case LINUX_IP_TTL:
+        case LINUX_IP_HDRINCL:
+        case LINUX_IP_PKTINFO:
+        case LINUX_IP_RECVTTL:
+        case LINUX_IP_RECVTOS:
             return 1;
         default:
             return 0;
@@ -134,6 +152,12 @@ int translate_small_int_sockopt(int level,
         default:
             return 0;
         }
+    }
+
+    if (level == LINUX_IPPROTO_IP) {
+        *mac_level = IPPROTO_IP;
+        *mac_optname = translate_ip_sockopt_to_mac(optname);
+        return *mac_optname >= 0;
     }
 
     if (level == LINUX_IPPROTO_IPV6 && optname == LINUX_IPV6_V6ONLY) {

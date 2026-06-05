@@ -31,6 +31,7 @@ pthread_mutex_t fd_lock = PTHREAD_MUTEX_INITIALIZER; /* Lock order: 3 */
 
 /* FD table. */
 fd_entry_t fd_table[FD_TABLE_SIZE];
+static uint64_t fd_next_generation = 1;
 
 /* RLIMIT_NOFILE tracking. */
 /* Guest-side soft limit for RLIMIT_NOFILE. fd_alloc checks this.
@@ -77,6 +78,7 @@ static inline void fd_init_entry(int fd,
     fd_bitmap_set_used(fd);
     fd_table[fd].type = type;
     fd_table[fd].host_fd = host_fd;
+    fd_table[fd].generation = fd_next_generation++;
     fd_table[fd].linux_flags = 0;
     fd_table[fd].dir = NULL;
     fd_table[fd].proc_path[0] = '\0';
@@ -154,9 +156,16 @@ void fdtable_init(void)
     memset(fd_free_bitmap, 0xFF, sizeof(fd_free_bitmap));
 
     /* Pre-open stdin/stdout/stderr */
-    fd_table[0] = (fd_entry_t) {.type = FD_STDIO, .host_fd = STDIN_FILENO};
-    fd_table[1] = (fd_entry_t) {.type = FD_STDIO, .host_fd = STDOUT_FILENO};
-    fd_table[2] = (fd_entry_t) {.type = FD_STDIO, .host_fd = STDERR_FILENO};
+    fd_next_generation = 1;
+    fd_table[0] = (fd_entry_t) {.type = FD_STDIO,
+                                .host_fd = STDIN_FILENO,
+                                .generation = fd_next_generation++};
+    fd_table[1] = (fd_entry_t) {.type = FD_STDIO,
+                                .host_fd = STDOUT_FILENO,
+                                .generation = fd_next_generation++};
+    fd_table[2] = (fd_entry_t) {.type = FD_STDIO,
+                                .host_fd = STDERR_FILENO,
+                                .generation = fd_next_generation++};
     fd_bitmap_set_used(0);
     fd_bitmap_set_used(1);
     fd_bitmap_set_used(2);
