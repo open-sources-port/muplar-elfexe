@@ -64,6 +64,8 @@
 
 #include "core/shim-globals.h"
 
+#include "debug/syscall-hist.h"
+
 /* Generated from src/syscall/dispatch.tbl into $(BUILD_DIR). */
 #include "dispatch.h"
 
@@ -1737,6 +1739,11 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, bool verbose)
     int nr = (int) x8;
     const syscall_entry_t *entry = NULL;
 
+    /* Per-syscall histogram for the dynamic-linker bring-up storm. Zero when
+     * disabled so the bottom-of-dispatch record path is a single branch.
+     */
+    uint64_t hist_start_ns = syscall_hist_now_ns();
+
     if (!verbose) {
         if (nr == SYS_getpid || nr == SYS_getppid || nr == SYS_gettid ||
             nr == SYS_getpgid || nr == SYS_getuid || nr == SYS_geteuid ||
@@ -1850,6 +1857,17 @@ slow_path:
             should_exit = true;
             result = 0; /* Not written back, but keep clean */
         } else if (result == SYSCALL_EXEC_HAPPENED) {
+            if (hist_start_ns) {
+                /* Guard the subtraction: syscall_hist_now_ns returns 0
+                 * if clock_gettime fails. An unsigned 0 minus a non-zero
+                 * start would underflow to a huge value and pollute the
+                 * histogram with a bogus latency sample.
+                 */
+                uint64_t hist_end_ns = syscall_hist_now_ns();
+                if (hist_end_ns >= hist_start_ns)
+                    syscall_hist_record(nr, hist_end_ns - hist_start_ns);
+                syscall_hist_freeze("frozen at first execve");
+            }
             return SYSCALL_EXEC_HAPPENED;
         }
     } else {
@@ -1894,6 +1912,12 @@ fast_done:
          * cannot be drained or torn by another vCPU's epilogue.
          */
         tlbi_request_emit_to_vcpu(vcpu);
+    }
+
+    if (hist_start_ns) {
+        uint64_t hist_end_ns = syscall_hist_now_ns();
+        if (hist_end_ns >= hist_start_ns)
+            syscall_hist_record(nr, hist_end_ns - hist_start_ns);
     }
 
     return should_exit;

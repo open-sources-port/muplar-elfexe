@@ -348,18 +348,16 @@ int elf_map_segments(const elf_info_t *info,
             return -1;
         }
 
-        /* Zero the full page-aligned segment extent (zero_len computed above
-         * with guest_size and infra_reserve checks). Linux guarantees
-         * zero-filled tail bytes in the last mapped page, and some dynamic
-         * linkers allocate from that page tail before they request more
-         * memory. Leaving stale bytes there leaks state across execve and
-         * corrupts the new image.
+        /* Zero only the tail beyond filesz: the BSS portion [filesz, memsz)
+         * plus the page-padding [memsz, zero_len) that Linux guarantees clean
+         * for dynamic linkers allocating from the last mapped page's tail.
+         * Skipping the file-data range avoids writing zeros that the fread
+         * below would immediately overwrite; for typical shared libraries that
+         * is a hundreds-of-KiB win per segment.
          */
-        memset((uint8_t *) guest_base + gpa, 0, zero_len);
+        if (zero_len > filesz)
+            memset((uint8_t *) guest_base + gpa + filesz, 0, zero_len - filesz);
 
-        /* Overlay initialized bytes after zeroing so BSS and page tail remain
-         * zero-filled.
-         */
         if (filesz > 0) {
             if (fseek(f, (long) ph->p_offset, SEEK_SET) != 0) {
                 log_error("%s: seek failed for segment at 0x%llx", path,

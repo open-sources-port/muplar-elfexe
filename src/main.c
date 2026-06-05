@@ -42,6 +42,7 @@
 
 #include "debug/gdbstub.h"
 #include "debug/log.h"
+#include "debug/syscall-hist.h"
 
 static int parse_int_arg(const char *s, int min, int max, int *out)
 {
@@ -159,6 +160,10 @@ static int host_dc_zva_assert(void)
 int main(int argc, char **argv)
 {
     log_init();
+    /* Resolve ELFUSE_STARTUP_TRACE before any guest syscall can fire so the
+     * histogram captures the very first dynamic-linker openat.
+     */
+    syscall_hist_init();
 
     bool verbose = false;
     /* x86_64-via-Rosetta is on by default; --no-rosetta or
@@ -515,6 +520,12 @@ int main(int argc, char **argv)
     if (shim_globals_stats_enabled())
         shim_globals_counters_dump(&g);
 
+    /* Dump the startup histogram before guest_destroy so any cleanup-path
+     * syscalls (closing host fds, unmapping the slab) do not appear in the
+     * captured set. The dump is a no-op when ELFUSE_STARTUP_TRACE=syscalls
+     * was not requested.
+     */
+    syscall_hist_dump();
     cleanup_main_resources(&g, guest_initialized, &sysroot_mount,
                            have_host_cwd ? host_cwd : NULL, guest_argv,
                            guest_argc, elf_path, sysroot_path);

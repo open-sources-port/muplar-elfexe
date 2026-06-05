@@ -46,6 +46,7 @@
 #include "syscall/signal.h"
 
 #include "debug/log.h"
+#include "debug/syscall-hist.h"
 
 /* fork_child_main. */
 
@@ -74,6 +75,13 @@ int fork_child_main(int ipc_fd,
     log_init();
     if (verbose)
         log_set_level(LOG_DEBUG);
+
+    /* The startup syscall histogram captures dynamic-linker bring-up of the
+     * top-level guest only; the child resumes from the parent's snapshot, so
+     * its first syscalls would be steady-state traffic that confuses the
+     * dump. Disable before any guest syscall is dispatched.
+     */
+    syscall_hist_disable();
 
     /* Reset static process/thread/futex state before receiving the parent
      * snapshot so the incoming metadata survives child restore.

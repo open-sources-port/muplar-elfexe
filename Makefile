@@ -66,7 +66,8 @@ SRCS := \
     debug/gdbstub.c \
     debug/gdbstub-reg.c \
     debug/gdbstub-rsp.c \
-    debug/log.c
+    debug/log.c \
+    debug/syscall-hist.c
 
 SRCS := $(addprefix src/,$(SRCS))
 OBJS := $(patsubst src/%.c,$(BUILD_DIR)/%.o,$(SRCS))

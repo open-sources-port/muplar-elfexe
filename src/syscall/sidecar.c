@@ -45,6 +45,179 @@
  */
 static pthread_mutex_t sidecar_global_lock = PTHREAD_MUTEX_INITIALIZER;
 
+/* Per-directory cache: did this directory lack a sidecar index file
+ * for the current directory metadata version? Keyed by (st_dev, st_ino) so a
+ * renamed or moved directory does not leak a stale answer. Sidecar's
+ * case-fold walker visits every parent directory of every translated path;
+ * during dynamic-linker bring-up that walker fires per guest openat and
+ * dominates startup (histogram showed openat at 61% of getent's 7.5 ms warm
+ * path). The cache lets the common "no index here" answer return after a
+ * 5 us fstat instead of a ~30 us openat per directory traversed.
+ *
+ * 64 slots, single-level open-addressing (last writer wins on collision).
+ * The directory ctime/mtime pair is part of the cache key: publishing an
+ * index from another elfuse process changes the directory entry set, so a
+ * stale ABSENT entry becomes UNKNOWN on the next lookup.
+ */
+enum {
+    SIDECAR_IDX_UNKNOWN = 0,
+    SIDECAR_IDX_ABSENT = 1,
+};
+typedef struct {
+    dev_t dev;
+    ino_t ino;
+    struct timespec mtime;
+    struct timespec ctime;
+    uint8_t state;
+} sidecar_idx_slot_t;
+#define SIDECAR_IDX_CACHE_SLOTS 64
+static sidecar_idx_slot_t sidecar_idx_cache[SIDECAR_IDX_CACHE_SLOTS];
+static pthread_mutex_t sidecar_idx_cache_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static size_t sidecar_idx_cache_slot(dev_t dev, ino_t ino)
+{
+    /* Mix dev into ino so two filesystems with overlapping inode numbers
+     * do not pin the same slot. The golden-ratio multiplier scatters small
+     * inode numbers across the table without needing a real hash.
+     */
+    uint64_t key = (uint64_t) ino ^ ((uint64_t) dev * 0x9E3779B97F4A7C15ULL);
+    return (size_t) (key % SIDECAR_IDX_CACHE_SLOTS);
+}
+
+static bool sidecar_idx_cache_matches(const sidecar_idx_slot_t *slot,
+                                      const struct stat *st)
+{
+    return slot->state != SIDECAR_IDX_UNKNOWN && slot->dev == st->st_dev &&
+           slot->ino == st->st_ino &&
+           slot->mtime.tv_sec == st->st_mtimespec.tv_sec &&
+           slot->mtime.tv_nsec == st->st_mtimespec.tv_nsec &&
+           slot->ctime.tv_sec == st->st_ctimespec.tv_sec &&
+           slot->ctime.tv_nsec == st->st_ctimespec.tv_nsec;
+}
+
+static int sidecar_idx_cache_lookup_stat(const struct stat *st)
+{
+    size_t slot = sidecar_idx_cache_slot(st->st_dev, st->st_ino);
+    int state = SIDECAR_IDX_UNKNOWN;
+    pthread_mutex_lock(&sidecar_idx_cache_lock);
+    if (sidecar_idx_cache_matches(&sidecar_idx_cache[slot], st))
+        state = sidecar_idx_cache[slot].state;
+    pthread_mutex_unlock(&sidecar_idx_cache_lock);
+    return state;
+}
+
+static void sidecar_idx_cache_set_stat(const struct stat *st, int state)
+{
+    size_t slot = sidecar_idx_cache_slot(st->st_dev, st->st_ino);
+    pthread_mutex_lock(&sidecar_idx_cache_lock);
+    sidecar_idx_cache[slot].dev = st->st_dev;
+    sidecar_idx_cache[slot].ino = st->st_ino;
+    sidecar_idx_cache[slot].mtime = st->st_mtimespec;
+    sidecar_idx_cache[slot].ctime = st->st_ctimespec;
+    sidecar_idx_cache[slot].state = (uint8_t) state;
+    pthread_mutex_unlock(&sidecar_idx_cache_lock);
+}
+
+/* Roll the cache entry back to UNKNOWN. Used by the index publish path
+ * before the renameat so a concurrent reader entering the post-rename
+ * window cannot consume a stale ABSENT and skip the openat. UNKNOWN forces
+ * the reader to consult the filesystem.
+ */
+static void sidecar_idx_cache_invalidate(int dirfd)
+{
+    struct stat st;
+    if (fstat(dirfd, &st) < 0)
+        return;
+    sidecar_idx_cache_set_stat(&st, SIDECAR_IDX_UNKNOWN);
+}
+
+/* Cached sysroot dirfd. sidecar_open_base opens the sysroot directory on
+ * every translated absolute path; for dynamic-linker bring-up that fires
+ * once per openat / fstat / access / readlink. Caching the host fd and
+ * handing the walker a dup turns that ~30 us open into a ~5 us dup. The
+ * cache invalidates lazily by comparing the path string -- proc_set_sysroot
+ * is rare (once at startup, once on fork-child IPC restore), so the
+ * snapshot+strcmp on every call is still a net win over the open it
+ * replaces. Concurrent vCPU lookups serialize on the lock for the cache check
+ * and dup.
+ */
+static int sidecar_sysroot_cached_fd = -1;
+static char sidecar_sysroot_cached_path[LINUX_PATH_MAX] = {0};
+static dev_t sidecar_sysroot_cached_dev;
+static ino_t sidecar_sysroot_cached_ino;
+static pthread_mutex_t sidecar_sysroot_cached_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static int sidecar_open_sysroot_cached(const char *path)
+{
+    pthread_mutex_lock(&sidecar_sysroot_cached_lock);
+    int cached = sidecar_sysroot_cached_fd;
+    if (cached >= 0 && !strcmp(path, sidecar_sysroot_cached_path)) {
+        /* Path text alone is not a sufficient cache key: a host-side
+         * rename or replace can rebind the same path to a different
+         * inode while the cached fd still resolves to the original.
+         * Stat the path on every hit and accept the cache only when
+         * (dev, ino) still match the inode captured at fill time. The
+         * stat is one host syscall per call, much cheaper than the
+         * open it replaces.
+         *
+         * Race window: a host-side mutation between this stat and the
+         * dup below can leave the cache returning the pre-mutation fd
+         * even though a fresh open(path) at that instant would resolve
+         * the post-mutation binding. The window is microseconds. It
+         * only matters under adversarial host-side sysroot mutation;
+         * normal sysroot configuration is canonicalized once at
+         * proc_set_sysroot time and never changes. Closing it
+         * adversarially would require dropping the cache, which gives
+         * back the ~25 us per-call win; not worth it absent a real
+         * reproducer.
+         */
+        struct stat current;
+        if (stat(path, &current) == 0 &&
+            current.st_dev == sidecar_sysroot_cached_dev &&
+            current.st_ino == sidecar_sysroot_cached_ino) {
+            cached = fcntl(cached, F_DUPFD_CLOEXEC, 0);
+            pthread_mutex_unlock(&sidecar_sysroot_cached_lock);
+            return cached;
+        }
+        /* Inode mismatch: fall through to refresh below. */
+    }
+    if (sidecar_sysroot_cached_fd >= 0) {
+        close(sidecar_sysroot_cached_fd);
+        sidecar_sysroot_cached_fd = -1;
+        sidecar_sysroot_cached_path[0] = '\0';
+    }
+    int fresh = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fresh < 0) {
+        pthread_mutex_unlock(&sidecar_sysroot_cached_lock);
+        return -1;
+    }
+    /* Capture the inode of the freshly-opened dir so subsequent cache
+     * hits can validate against it. Using fstat on the open fd gives
+     * the same (dev, ino) as a path stat would, with no second walk.
+     */
+    struct stat fresh_st;
+    if (fstat(fresh, &fresh_st) < 0) {
+        close(fresh);
+        pthread_mutex_unlock(&sidecar_sysroot_cached_lock);
+        return -1;
+    }
+    /* CLOEXEC dup: a concurrent posix_spawn from another vCPU thread
+     * must not inherit the sysroot dirfd into the fork-child. F_DUPFD_CLOEXEC
+     * sets the flag atomically with the dup, closing the inheritance window
+     * that plain dup() leaves open.
+     */
+    int cache_fd = fcntl(fresh, F_DUPFD_CLOEXEC, 0);
+    if (cache_fd >= 0) {
+        sidecar_sysroot_cached_fd = cache_fd;
+        sidecar_sysroot_cached_dev = fresh_st.st_dev;
+        sidecar_sysroot_cached_ino = fresh_st.st_ino;
+        str_copy_trunc(sidecar_sysroot_cached_path, path,
+                       sizeof(sidecar_sysroot_cached_path));
+    }
+    pthread_mutex_unlock(&sidecar_sysroot_cached_lock);
+    return fresh;
+}
+
 typedef struct {
     char *guest_name;
     char token[SIDECAR_TOKEN_NAME_LEN + 1];
@@ -163,10 +336,25 @@ static int sidecar_load_index(int dirfd, sidecar_index_t *index)
 {
     memset(index, 0, sizeof(*index));
 
+    /* Per-dir absence cache: skip the openat round-trip only while the
+     * directory metadata still matches the snapshot that produced ENOENT.
+     * Another elfuse process can publish the index through the fcntl-locked
+     * writer, so cross-process invalidation relies on the directory mtime/ctime
+     * changing when the sidecar index appears.
+     */
+    struct stat dir_st;
+    bool have_dir_st = fstat(dirfd, &dir_st) == 0;
+    if (have_dir_st &&
+        sidecar_idx_cache_lookup_stat(&dir_st) == SIDECAR_IDX_ABSENT)
+        return 0;
+
     int fd = openat(dirfd, SIDECAR_INDEX_NAME, O_RDONLY | O_CLOEXEC);
     if (fd < 0) {
-        if (errno == ENOENT)
+        if (errno == ENOENT) {
+            if (have_dir_st)
+                sidecar_idx_cache_set_stat(&dir_st, SIDECAR_IDX_ABSENT);
             return 0;
+        }
         return -1;
     }
 
@@ -355,7 +543,7 @@ static int sidecar_open_base(guest_fd_t dirfd,
             errno = ENAMETOOLONG;
             return -1;
         }
-        *base_fd = open(sysroot, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        *base_fd = sidecar_open_sysroot_cached(sysroot);
         if (*base_fd < 0)
             return -1;
         *absolute = true;
@@ -900,6 +1088,14 @@ static int sidecar_write_locked_index(int parent_dirfd,
         errno = saved_errno;
         return -1;
     }
+    /* Invalidate the cache to UNKNOWN BEFORE the rename so a concurrent
+     * walker that loses the race to read the new file does not return a
+     * stale ABSENT verdict from this slot. A reader entering the window
+     * between rename and post-rename mark would otherwise skip the openat
+     * and miss the freshly-published index. UNKNOWN forces the reader to
+     * do the openat and observe the new file directly.
+     */
+    sidecar_idx_cache_invalidate(parent_dirfd);
     if (renameat(parent_dirfd, SIDECAR_INDEX_TMP_NAME, parent_dirfd,
                  SIDECAR_INDEX_NAME) < 0) {
         int saved_errno = errno;

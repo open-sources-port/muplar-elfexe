@@ -141,10 +141,18 @@ int path_translate_at(guest_fd_t dirfd,
         return -1;
     }
 
-    memset(tx, 0, sizeof(*tx));
+    /* Only the fields read on the no-rewrite fast path need explicit
+     * defaults; proc_path / guest_buf / host_buf are read-after-written
+     * by their respective resolvers. memset of all three 4 KiB buffers
+     * would add ~12 KiB of zeroing per call, which became visible at
+     * ~30 calls per dynamic-linker startup after the sidecar caches
+     * dropped the rest of the openat overhead.
+     */
     tx->guest_path = path;
     tx->intercept_path = path;
     tx->host_path = path;
+    tx->proc_resolved = 0;
+    tx->fuse_path = false;
 
     if (!path)
         return 0;
