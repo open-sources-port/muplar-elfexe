@@ -738,15 +738,20 @@ int64_t sys_fcntl(guest_t *g, int fd, int cmd, uint64_t arg)
     case 4: /* F_SETFL */
     {
         if (fuse_fd) {
-            int preserved =
-                fd_table[fd].linux_flags &
-                (LINUX_O_CLOEXEC | LINUX_O_PATH | LINUX_O_DIRECTORY |
-                 LINUX_O_NOFOLLOW | LINUX_O_DIRECT | LINUX_O_LARGEFILE);
+            /* Preserve LINUX_O_ACCMODE: F_SETFL is not allowed to change the
+             * access mode in the Linux kernel, and without preserving it
+             * here a stray F_SETFL(0) would silently flip an O_RDWR FUSE
+             * shadow to O_RDONLY, surfacing the wrong mode through F_GETFL.
+             */
+            int preserved = fd_table[fd].linux_flags &
+                            (LINUX_O_ACCMODE | LINUX_O_CLOEXEC | LINUX_O_PATH |
+                             LINUX_O_DIRECTORY | LINUX_O_NOFOLLOW |
+                             LINUX_O_DIRECT | LINUX_O_LARGEFILE);
             fd_table[fd].linux_flags =
-                preserved |
-                ((int) arg &
-                 ~(LINUX_O_CLOEXEC | LINUX_O_PATH | LINUX_O_DIRECTORY |
-                   LINUX_O_NOFOLLOW | LINUX_O_DIRECT | LINUX_O_LARGEFILE));
+                preserved | ((int) arg & ~(LINUX_O_ACCMODE | LINUX_O_CLOEXEC |
+                                           LINUX_O_PATH | LINUX_O_DIRECTORY |
+                                           LINUX_O_NOFOLLOW | LINUX_O_DIRECT |
+                                           LINUX_O_LARGEFILE));
             return 0;
         }
         /* Timerfd: kqueue host fd rejects fcntl(F_SETFL), so mirror Linux's
