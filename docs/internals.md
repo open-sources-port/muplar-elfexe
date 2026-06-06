@@ -98,10 +98,9 @@ Guest memory is identity-mapped (guest VA == guest IPA). Large areas use 2 MiB
 block descriptors by default; mappings that need mixed permissions are split
 to 4 KiB L3 pages (see [Page Table Splitting](#page-table-splitting)).
 
+Low, fixed addresses:
+
 ```
-0x000010000  - 0x0000FFFFF:  Page table pool (960 KiB)
-0x000100000  - 0x0001FFFFF:  Shim code (2 MiB block, RX)
-0x000200000  - 0x0003FFFFF:  Shim data/stack (2 MiB block, RW)
 0x000400000  - varies:        ELF LOAD segments (PIE_LOAD_BASE for ET_DYN)
 0x001000000:                  brk base (16 MiB)
 0x007800000  - 0x007800FFF:  Stack guard page (PROT_NONE, dynamic position)
@@ -110,8 +109,30 @@ to 4 KiB L3 pages (see [Page Table Splitting](#page-table-splitting)).
 0x010200000  - mmap_limit:    mmap RX growth area
 0x200000000  - 0x2001FFFFF:  mmap RW region (initial 2 MiB at 8 GiB, RW)
 0x200200000  - mmap_limit:    mmap RW growth area
-interp_base  - varies:        Dynamic linker (g->interp_base, --sysroot only)
 ```
+
+High addresses, anchored to `interp_base` (computed from `guest_size`, see
+below). The runtime infrastructure reserve is a 16 MiB region placed at
+`[interp_base - INFRA_RESERVE, interp_base)` -- in the dead zone above
+`mmap_limit` -- so guest binaries keep the low addresses their link scripts
+expect. It is present regardless of `--sysroot`; offsets are relative to its
+base `infra = interp_base - 16 MiB` (exact values in `src/core/guest.h`):
+
+```
+infra + 0x0000000 - 0x000FFFF:  null guard (64 KiB, unmapped)
+infra + 0x0010000 - 0x0DF5FFF:  page table pool (~13.9 MiB, RW)
+infra + 0x0DF6000 - 0x0DFFFFF:  shim code slot (40 KiB, RX). Shares the PT
+                                pool's tail 2 MiB L2 block, so that block
+                                splits to 4 KiB L3 pages (mixed RX/RW).
+infra + 0x0E00000 - 0x0FFFFFF:  shim data + EL1 stack (2 MiB L2 block, RW;
+                                ends at interp_base)
+interp_base       - varies:     Dynamic linker (g->interp_base, --sysroot only)
+```
+
+The reserve is demand-paged (`MAP_ANON`), so its unused page-table-pool pages
+cost no host RAM despite the generous virtual reservation. The pool holds
+~3558 L3 pages (~7 GiB of split address space), enough for the many V8
+isolates a Node `worker_threads` pool or cluster spins up.
 
 The guest size is determined by the VM's configured IPA width (capped at
 40-bit / 1 TiB):
