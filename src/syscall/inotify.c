@@ -402,7 +402,7 @@ int64_t sys_inotify_init1(int flags)
     memset(inst->watches, 0, sizeof(inst->watches));
     pthread_mutex_unlock(&inotify_lock);
 
-    fd_table[gfd].linux_flags = (flags & IN_CLOEXEC) ? LINUX_O_CLOEXEC : 0;
+    fd_publish_linux_flags(gfd, (flags & IN_CLOEXEC) ? LINUX_O_CLOEXEC : 0);
 
     return gfd;
 }

@@ -109,6 +109,15 @@ int fd_snapshot_and_dup(int guest_fd, fd_entry_t *out);
  */
 int fd_get_type(int guest_fd);
 
+/* Publish linux_flags for a guest fd under fd_lock. Use after fd_alloc when
+ * the creating syscall needs to set linux_flags atomically with respect to a
+ * concurrent fcntl(F_SETFL/F_SETFD) on the same slot. The fd_alloc-then-
+ * publish window is small (the new gfd is not communicated to other threads
+ * until the syscall returns) but the lock removes the structural race and
+ * keeps every linux_flags writer on one lock domain.
+ */
+void fd_publish_linux_flags(int guest_fd, int linux_flags);
+
 /* Republish the EL1 urandom read fast-path bit for this fd from the current
  * fd_table type and access mode. Only readable /dev/urandom descriptors are
  * eligible for the bitmap.

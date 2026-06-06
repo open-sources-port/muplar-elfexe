@@ -218,9 +218,10 @@ int64_t sys_timerfd_create(int clockid, int flags)
      * fs/timerfd.c). Stamp O_RDWR into linux_flags so the F_GETFL branch
      * below can surface the access mode without re-deriving it.
      */
-    fd_table[gfd].linux_flags =
-        LINUX_O_RDWR | ((flags & LINUX_TFD_CLOEXEC) ? LINUX_O_CLOEXEC : 0) |
-        ((flags & LINUX_TFD_NONBLOCK) ? LINUX_O_NONBLOCK : 0);
+    fd_publish_linux_flags(
+        gfd, LINUX_O_RDWR |
+                 ((flags & LINUX_TFD_CLOEXEC) ? LINUX_O_CLOEXEC : 0) |
+                 ((flags & LINUX_TFD_NONBLOCK) ? LINUX_O_NONBLOCK : 0));
     return gfd;
 }
 
@@ -659,8 +660,8 @@ int64_t sys_eventfd2(unsigned int initval, int flags)
     eventfd_owner[gfd] = slot;
     pthread_mutex_unlock(&sfd_lock);
 
-    fd_table[gfd].linux_flags =
-        (flags & LINUX_EFD_CLOEXEC) ? LINUX_O_CLOEXEC : 0;
+    fd_publish_linux_flags(gfd,
+                           (flags & LINUX_EFD_CLOEXEC) ? LINUX_O_CLOEXEC : 0);
 
     /* If initial counter > 0, make the pipe readable so poll sees it */
     if (initval > 0) {
@@ -1083,8 +1084,8 @@ int64_t sys_signalfd4(guest_t *g,
     signalfd_state[slot].nonblock = (flags & LINUX_SFD_NONBLOCK) ? 1 : 0;
     pthread_mutex_unlock(&sfd_lock);
 
-    fd_table[gfd].linux_flags =
-        (flags & LINUX_SFD_CLOEXEC) ? LINUX_O_CLOEXEC : 0;
+    fd_publish_linux_flags(gfd,
+                           (flags & LINUX_SFD_CLOEXEC) ? LINUX_O_CLOEXEC : 0);
 
     return gfd;
 }

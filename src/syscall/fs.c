@@ -668,7 +668,16 @@ int64_t sys_fcntl(guest_t *g, int fd, int cmd, uint64_t arg)
     if (!RANGE_CHECK(fd, 0, FD_TABLE_SIZE))
         return -LINUX_EBADF;
 
-    int fd_type = fd_table[fd].type;
+    /* Snapshot the slot under fd_lock once; readers use fd_snap below, and
+     * writers reacquire fd_lock and revalidate against fd_snap.generation
+     * so a close+reopen between the snapshot and the RMW returns EBADF
+     * instead of mutating an unrelated fd.
+     */
+    fd_entry_t fd_snap;
+    if (!fd_snapshot(fd, &fd_snap))
+        return -LINUX_EBADF;
+
+    int fd_type = fd_snap.type;
     bool fuse_fd = (fd_type == FD_FUSE_DEV || fd_type == FD_FUSE_FILE ||
                     fd_type == FD_FUSE_DIR);
 
@@ -681,7 +690,7 @@ int64_t sys_fcntl(guest_t *g, int fd, int cmd, uint64_t arg)
         if ((int) arg < 0) {
             return -LINUX_EINVAL;
         }
-        int dup_flags = fd_table[fd].linux_flags & ~LINUX_O_CLOEXEC;
+        int dup_flags = fd_snap.linux_flags & ~LINUX_O_CLOEXEC;
         if (cmd == 1030)
             dup_flags |= LINUX_O_CLOEXEC;
         int gfd = duplicate_guest_fd(fd, (int) arg, -1, false, dup_flags);
@@ -695,17 +704,28 @@ int64_t sys_fcntl(guest_t *g, int fd, int cmd, uint64_t arg)
         return gfd;
     }
     case 1: /* F_GETFD */
-        return (fd_table[fd].linux_flags & LINUX_O_CLOEXEC) ? LINUX_FD_CLOEXEC
-                                                            : 0;
+        return (fd_snap.linux_flags & LINUX_O_CLOEXEC) ? LINUX_FD_CLOEXEC : 0;
     case 2: /* F_SETFD */
+        /* Hold fd_lock across the read-modify-write so the CLOEXEC flip is
+         * atomic against a concurrent F_SETFL on the same shadow word and
+         * against any fd_lock-protected reader. Revalidate against the
+         * snapshot generation so a close+reopen returns EBADF.
+         */
+        pthread_mutex_lock(&fd_lock);
+        if (fd_table[fd].type == FD_CLOSED ||
+            fd_table[fd].generation != fd_snap.generation) {
+            pthread_mutex_unlock(&fd_lock);
+            return -LINUX_EBADF;
+        }
         if ((int) arg & LINUX_FD_CLOEXEC)
             fd_table[fd].linux_flags |= LINUX_O_CLOEXEC;
         else
             fd_table[fd].linux_flags &= ~LINUX_O_CLOEXEC;
+        pthread_mutex_unlock(&fd_lock);
         return 0;
     case 3: { /* F_GETFL */
         if (fuse_fd)
-            return fd_table[fd].linux_flags;
+            return fd_snap.linux_flags;
         /* Linux timerfd F_GETFL reports O_RDWR plus the writable status bits
          * the kernel honors. Surface only those bits from the shadow rather
          * than echoing arbitrary linux_flags bits so stray F_SETFL args
@@ -714,11 +734,8 @@ int64_t sys_fcntl(guest_t *g, int fd, int cmd, uint64_t arg)
          */
         if (fd_type == FD_TIMERFD)
             return LINUX_O_RDWR |
-                   (fd_table[fd].linux_flags &
+                   (fd_snap.linux_flags &
                     (LINUX_O_APPEND | LINUX_O_NONBLOCK | LINUX_O_NOATIME));
-        fd_entry_t snap;
-        if (!fd_snapshot(fd, &snap))
-            return -LINUX_EBADF;
         host_fd_ref_t host_ref;
         if (host_fd_ref_open(fd, &host_ref) < 0)
             return -LINUX_EBADF;
@@ -727,10 +744,10 @@ int64_t sys_fcntl(guest_t *g, int fd, int cmd, uint64_t arg)
         if (mac_fl < 0)
             return linux_errno();
         int linux_fl = mac_to_linux_status_flags(mac_fl);
-        if (snap.type == FD_REGULAR || snap.type == FD_DIR ||
-            snap.type == FD_PATH || snap.type == FD_URANDOM)
-            linux_fl = (linux_fl & ~O_ACCMODE) | (snap.linux_flags & 3);
-        linux_fl |= snap.linux_flags &
+        if (fd_snap.type == FD_REGULAR || fd_snap.type == FD_DIR ||
+            fd_snap.type == FD_PATH || fd_snap.type == FD_URANDOM)
+            linux_fl = (linux_fl & ~O_ACCMODE) | (fd_snap.linux_flags & 3);
+        linux_fl |= fd_snap.linux_flags &
                     (LINUX_O_PATH | LINUX_O_DIRECTORY | LINUX_O_NOFOLLOW |
                      LINUX_O_DIRECT | LINUX_O_LARGEFILE);
         return linux_fl;
@@ -742,7 +759,18 @@ int64_t sys_fcntl(guest_t *g, int fd, int cmd, uint64_t arg)
              * access mode in the Linux kernel, and without preserving it
              * here a stray F_SETFL(0) would silently flip an O_RDWR FUSE
              * shadow to O_RDONLY, surfacing the wrong mode through F_GETFL.
+             *
+             * Hold fd_lock across the read-modify-write so the update is
+             * atomic against a concurrent F_SETFD and any fd_lock-protected
+             * reader. Revalidate against the snapshot generation so a
+             * close+reopen returns EBADF.
              */
+            pthread_mutex_lock(&fd_lock);
+            if (fd_table[fd].type != fd_type ||
+                fd_table[fd].generation != fd_snap.generation) {
+                pthread_mutex_unlock(&fd_lock);
+                return -LINUX_EBADF;
+            }
             int preserved = fd_table[fd].linux_flags &
                             (LINUX_O_ACCMODE | LINUX_O_CLOEXEC | LINUX_O_PATH |
                              LINUX_O_DIRECTORY | LINUX_O_NOFOLLOW |
@@ -752,6 +780,7 @@ int64_t sys_fcntl(guest_t *g, int fd, int cmd, uint64_t arg)
                                            LINUX_O_PATH | LINUX_O_DIRECTORY |
                                            LINUX_O_NOFOLLOW | LINUX_O_DIRECT |
                                            LINUX_O_LARGEFILE));
+            pthread_mutex_unlock(&fd_lock);
             return 0;
         }
         /* Timerfd: kqueue host fd rejects fcntl(F_SETFL), so mirror Linux's
@@ -765,13 +794,22 @@ int64_t sys_fcntl(guest_t *g, int fd, int cmd, uint64_t arg)
          * matching how Linux F_SETFL drops them.
          */
         if (fd_type == FD_TIMERFD) {
-            if ((int) arg & LINUX_O_DIRECT)
-                return -LINUX_EINVAL;
             const int setfl_mask =
                 LINUX_O_APPEND | LINUX_O_NONBLOCK | LINUX_O_NOATIME;
+            pthread_mutex_lock(&fd_lock);
+            if (fd_table[fd].type != FD_TIMERFD ||
+                fd_table[fd].generation != fd_snap.generation) {
+                pthread_mutex_unlock(&fd_lock);
+                return -LINUX_EBADF;
+            }
+            if ((int) arg & LINUX_O_DIRECT) {
+                pthread_mutex_unlock(&fd_lock);
+                return -LINUX_EINVAL;
+            }
             fd_table[fd].linux_flags =
                 (fd_table[fd].linux_flags & ~setfl_mask) |
                 ((int) arg & setfl_mask);
+            pthread_mutex_unlock(&fd_lock);
             return 0;
         }
         host_fd_ref_t host_ref;

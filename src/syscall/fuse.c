@@ -1329,8 +1329,11 @@ int fuse_proc_open(int linux_flags)
         errno = EMFILE;
         return -1;
     }
-    fd_table[guest_fd].linux_flags = linux_flags;
     pthread_mutex_unlock(&fuse_lock);
+    /* Publish under fd_lock so the write is on the same lock domain as
+     * sys_fcntl(F_SETFL/F_SETFD), not stranded behind fuse_lock.
+     */
+    fd_publish_linux_flags(guest_fd, linux_flags);
     return guest_fd;
 }
 
@@ -1897,8 +1900,11 @@ int64_t fuse_open_path(guest_t *g, const char *path, int linux_flags, int mode)
         fd_mark_closed(guest_fd);
         return -LINUX_EMFILE;
     }
-    fd_table[guest_fd].linux_flags = linux_flags;
     pthread_mutex_unlock(&fuse_lock);
+    /* Publish under fd_lock so the open's flags land on the same lock
+     * domain that sys_fcntl(F_SETFL/F_SETFD) uses.
+     */
+    fd_publish_linux_flags(guest_fd, linux_flags);
     return guest_fd;
 }
 
@@ -2607,16 +2613,24 @@ int fuse_dup_fd(int src_fd,
         }
     }
 
+    pthread_mutex_unlock(&fuse_lock);
+
     /* O_NONBLOCK is a file-status flag preserved by dup(2)/dup2(2); without
      * it a duplicated non-blocking FUSE fd would silently become blocking
      * because nothing else carries the flag forward.
+     *
+     * Take fd_lock once for both the source read and the destination write
+     * so the dup snapshot is consistent with any concurrent F_SETFL on the
+     * source and so the destination publish cannot be overwritten by an
+     * early racing F_SETFL on the new slot.
      */
+    pthread_mutex_lock(&fd_lock);
     int preserved_flags =
         fd_table[src_fd].linux_flags &
         (LINUX_O_PATH | LINUX_O_DIRECTORY | LINUX_O_NOFOLLOW | LINUX_O_DIRECT |
          LINUX_O_LARGEFILE | LINUX_O_NONBLOCK);
     fd_table[guest_fd].linux_flags = preserved_flags | linux_flags;
-    pthread_mutex_unlock(&fuse_lock);
+    pthread_mutex_unlock(&fd_lock);
     return guest_fd;
 }
 

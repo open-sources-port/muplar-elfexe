@@ -225,6 +225,33 @@ int main(void)
             FAIL("timerfd_create");
     }
 
+    /* F_SETFD and F_SETFL touch the same linux_flags shadow but operate on
+     * disjoint bits. Toggling CLOEXEC via F_SETFD must not perturb the
+     * status bits surfaced by F_GETFL. Targets the new fd_lock-serialized
+     * RMW in both branches.
+     */
+    TEST("F_SETFD does not perturb F_GETFL status bits");
+    {
+        int fd = timerfd_create(CLOCK_MONOTONIC, 0);
+        if (fd >= 0) {
+            int wanted = O_APPEND | O_NONBLOCK | O_NOATIME;
+            EXPECT_TRUE(fcntl(fd, F_SETFL, wanted) == 0, "F_SETFL failed");
+
+            EXPECT_TRUE(fcntl(fd, F_SETFD, FD_CLOEXEC) == 0,
+                        "F_SETFD set failed");
+            int fl = fcntl(fd, F_GETFL);
+            EXPECT_TRUE(fl >= 0 && (fl & wanted) == wanted,
+                        "F_SETFD CLOEXEC perturbed status bits");
+
+            EXPECT_TRUE(fcntl(fd, F_SETFD, 0) == 0, "F_SETFD clear failed");
+            fl = fcntl(fd, F_GETFL);
+            EXPECT_TRUE(fl >= 0 && (fl & wanted) == wanted,
+                        "F_SETFD clear perturbed status bits");
+            close(fd);
+        } else
+            FAIL("timerfd_create");
+    }
+
     /* dup must carry the linux_flags shadow's NONBLOCK bit through; without
      * the preserved-mask fix the new fd's F_GETFL would report blocking.
      * (The timerfd slot table is keyed by guest_fd with no alias support,
