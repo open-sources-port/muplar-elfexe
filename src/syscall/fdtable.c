@@ -404,6 +404,15 @@ int fd_get_type(int guest_fd)
     return type;
 }
 
+void fd_publish_linux_flags(int guest_fd, int linux_flags)
+{
+    if (!RANGE_CHECK(guest_fd, 0, FD_TABLE_SIZE))
+        return;
+    pthread_mutex_lock(&fd_lock);
+    fd_table[guest_fd].linux_flags = linux_flags;
+    pthread_mutex_unlock(&fd_lock);
+}
+
 /* Sized to cover all FD_* constants in abi.h plus a small headroom. Indexed
  * by type. Each slot defaults to NULL (no per-type cleanup). Modules that
  * own a type call fd_register_cleanup() at init time; dup and fork-restore
