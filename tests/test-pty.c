@@ -5,12 +5,14 @@
  *
  * Foot, sshd, tmux, and any libvte-derived terminal need the multiplexer
  * primitives glibc's posix_openpt(3) / ptsname(3) / openpty(3) stack rests
- * on. Exercise the four pieces wired in for issue #88:
+ * on. Exercise the pieces glibc and posix-compliant pty children depend on:
  *
  *   1. TIOCSWINSZ on the /dev/ptmx master fd (the direct failure foot saw)
  *   2. TIOCGPTN -> /dev/pts/N path round trip
  *   3. TIOCSPTLCK(0) for unlockpt(), plus non-zero lock request fd typing
  *   4. /dev/pts/N open + stat intercept and the slave fd's window size
+ *   5. /dev/pts/N open in a forked child after the child has already closed
+ *      its master (foot/sshd/openssh sftp-server pattern)
  *
  * The test stays self-contained on the syscall surface (no libutil/openpty),
  * so it runs the same way under elfuse-aarch64, qemu-aarch64, and any future
@@ -52,7 +54,7 @@ int passes = 0, fails = 0;
 
 int main(void)
 {
-    printf("test-pty: PTY ioctl + /dev/pts/N path support (issue #88)\n");
+    printf("test-pty: PTY ioctl + /dev/pts/N path support\n");
 
     /* Regression guard for the pty_keepalive_table BSS-zero collision: any
      * close that runs before the very first /dev/ptmx open would walk the
@@ -74,9 +76,9 @@ int main(void)
         return 1;
     }
 
-    /* TIOCSWINSZ on the master is the direct regression from issue #88.
-     * Before the fix, sys_ioctl had no case for it and fell through to the
-     * default -ENOTTY arm, breaking foot's terminal initialization.
+    /* TIOCSWINSZ on the master was the direct regression that broke foot's
+     * terminal startup: sys_ioctl had no case for it and fell through to the
+     * default -ENOTTY arm.
      */
     TEST("TIOCSWINSZ on /dev/ptmx master");
     struct winsize ws_set = {
@@ -316,6 +318,109 @@ int main(void)
     }
     EXPECT_TRUE(leak_loop_ok,
                 "repeated /dev/ptmx open/close exhausted the keepalive table");
+
+    /* foot/sshd/openssh sftp-server pattern: the child closes its inherited
+     * master fd before opening the slave (the child has no use for the
+     * master). Earlier, this dropped the keepalive table entry that held the
+     * macOS slave_path mapping, and the subsequent open("/dev/pts/N") in the
+     * child failed with ENOENT even though the parent still held the master
+     * and the macOS slave node was openable. The retained-path semantics in
+     * proc_pty_close_keepalive must let the child still translate the path.
+     */
+    TEST("child can open /dev/pts/N after closing its master");
+    int spawn_master = open("/dev/ptmx", O_RDWR | O_NOCTTY);
+    if (spawn_master < 0) {
+        FAIL("open(/dev/ptmx) for spawn scenario");
+    } else {
+        unsigned int spawn_ptyno = (unsigned int) -1;
+        int unlock_zero = 0;
+        if (ioctl(spawn_master, TIOCGPTN, &spawn_ptyno) != 0 ||
+            ioctl(spawn_master, TIOCSPTLCK, &unlock_zero) != 0) {
+            FAIL("TIOCGPTN/TIOCSPTLCK on spawn master");
+            close(spawn_master);
+        } else {
+            char spawn_pts[32];
+            snprintf(spawn_pts, sizeof(spawn_pts), "/dev/pts/%u", spawn_ptyno);
+            int spawn_pipe[2];
+            if (pipe(spawn_pipe) != 0) {
+                FAIL("pipe for spawn scenario");
+                close(spawn_master);
+            } else {
+                pid_t spawn_pid = fork();
+                if (spawn_pid < 0) {
+                    FAIL("fork for spawn scenario");
+                    close(spawn_pipe[0]);
+                    close(spawn_pipe[1]);
+                    close(spawn_master);
+                } else if (spawn_pid == 0) {
+                    /* Child: foot's slave_exec sequence -- close the master,
+                     * then open(pts_name) for the controlling terminal.
+                     */
+                    close(spawn_pipe[0]);
+                    if (setsid() < 0)
+                        _exit(11);
+                    close(spawn_master);
+                    int slave_fd = open(spawn_pts, O_RDWR);
+                    char status = (slave_fd >= 0) ? 'Y' : 'N';
+                    (void) !write(spawn_pipe[1], &status, 1);
+                    if (slave_fd >= 0) {
+                        (void) !write(slave_fd, "ok\n", 3);
+                        close(slave_fd);
+                    }
+                    close(spawn_pipe[1]);
+                    _exit(slave_fd >= 0 ? 0 : 12);
+                } else {
+                    close(spawn_pipe[1]);
+                    char status = '?';
+                    ssize_t n = read(spawn_pipe[0], &status, 1);
+                    close(spawn_pipe[0]);
+                    int wstatus = 0;
+                    waitpid(spawn_pid, &wstatus, 0);
+                    int spawn_ok = (n == 1) && (status == 'Y') &&
+                                   WIFEXITED(wstatus) &&
+                                   WEXITSTATUS(wstatus) == 0;
+                    EXPECT_TRUE(spawn_ok,
+                                "child open(/dev/pts/N) after close(master)");
+                    if (spawn_ok) {
+                        char drain[16] = {0};
+                        int flags = fcntl(spawn_master, F_GETFL);
+                        if (flags >= 0 && fcntl(spawn_master, F_SETFL,
+                                                flags | O_NONBLOCK) == 0) {
+                            (void) !read(spawn_master, drain,
+                                         sizeof(drain) - 1);
+                            (void) fcntl(spawn_master, F_SETFL, flags);
+                        }
+                    }
+                    close(spawn_master);
+
+                    TEST("stale /dev/pts/N expires after master teardown");
+                    int stale_fd = open(spawn_pts, O_RDWR);
+                    /* Both ENOENT (devfs node gone) and ENXIO (devfs node
+                     * lingers but the pty pair has been torn down) are valid
+                     * macOS responses depending on kernel version. The
+                     * invariant the test guards is "the stale cached path
+                     * does not silently hand back an unrelated tty"; any
+                     * open failure satisfies that.
+                     */
+                    int stale_ok =
+                        stale_fd < 0 && (errno == ENOENT || errno == ENXIO);
+                    if (stale_fd >= 0)
+                        close(stale_fd);
+                    EXPECT_TRUE(stale_ok, "stale /dev/pts/N stayed openable");
+                }
+            }
+        }
+    }
+
+    /* /dev/pts/N for a never-allocated minor must surface ENOENT (the cached
+     * paths in the keepalive table cannot satisfy an arbitrary number).
+     */
+    TEST("/dev/pts/<unknown> returns ENOENT");
+    int unknown = open("/dev/pts/999999", O_RDWR);
+    int unknown_ok = unknown < 0 && errno == ENOENT;
+    if (unknown >= 0)
+        close(unknown);
+    EXPECT_TRUE(unknown_ok, "open(/dev/pts/999999) did not return ENOENT");
 
     /* A pty master received via SCM_RIGHTS bypasses the /dev/ptmx open
      * intercept, so the receiver process has no keepalive entry for it.

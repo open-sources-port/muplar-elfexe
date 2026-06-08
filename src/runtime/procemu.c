@@ -20,6 +20,7 @@
 #define MAPS_NAME_COLUMN 73
 
 #include <ctype.h>
+#include <stdbool.h>
 #include <stdarg.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -1502,9 +1503,19 @@ static void proc_task_collect_cb(thread_entry_t *t, void *arg)
  *    encodings) cannot strand the guest with the wrong slave.
  *
  * Entries are keyed by the host master fd because that is what fd_cleanup_entry
- * has when the guest closes a master. Capacity matches the macOS default
- * UNIX98 slave count; overflow leaves the entry empty and the guest gets the
- * pre-fix degraded behavior for that one pair instead of an open failure.
+ * has when the guest closes a master. Capacity matches the macOS default UNIX98
+ * slave count; overflow leaves the entry empty and the guest gets the pre-fix
+ * degraded behavior for that one pair instead of an open failure.
+ *
+ * Fork-restored entries may outlive their master for one /dev/pts/N open. A
+ * foot / sshd / posix-compliant child closes the master fd after fork before
+ * opening the slave (the child has no use for the master); without retaining
+ * the path mapping past close, the subsequent /dev/pts/N open in the child
+ * loses its translation and fails with ENOENT even though the parent still
+ * holds the master and the macOS slave node is openable. Those stale entries
+ * keep the received slave fd until the first translated open attempt, then
+ * expire before the minor can be reused for an unrelated host tty. Ordinary
+ * local master closes clear the mapping immediately.
  */
 #define PTY_KEEPALIVE_MAX 256
 #define PTY_KEEPALIVE_FREE (-1)
@@ -1515,6 +1526,7 @@ static struct {
     int master_host_fd;
     int slave_host_fd;
     uint32_t linux_pts_num;
+    bool stale_open_once;
     char slave_path[PTY_SLAVE_PATH_MAX];
 } pty_keepalive_table[PTY_KEEPALIVE_MAX];
 static pthread_mutex_t pty_keepalive_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -1526,8 +1538,20 @@ static void pty_keepalive_init(void)
         pty_keepalive_table[i].master_host_fd = PTY_KEEPALIVE_FREE;
         pty_keepalive_table[i].slave_host_fd = PTY_KEEPALIVE_FREE;
         pty_keepalive_table[i].linux_pts_num = 0;
+        pty_keepalive_table[i].stale_open_once = false;
         pty_keepalive_table[i].slave_path[0] = '\0';
     }
+}
+
+static int pty_keepalive_clear_slot_locked(int slot)
+{
+    int slave = pty_keepalive_table[slot].slave_host_fd;
+    pty_keepalive_table[slot].master_host_fd = PTY_KEEPALIVE_FREE;
+    pty_keepalive_table[slot].slave_host_fd = PTY_KEEPALIVE_FREE;
+    pty_keepalive_table[slot].linux_pts_num = 0;
+    pty_keepalive_table[slot].stale_open_once = false;
+    pty_keepalive_table[slot].slave_path[0] = '\0';
+    return slave;
 }
 
 static uint32_t pty_extract_pts_num(const char *slave_path)
@@ -1567,31 +1591,69 @@ static int pty_keepalive_register_locked(int master_host_fd,
                                          int slave_host_fd,
                                          uint32_t linux_pts_num,
                                          const char *slave_path,
+                                         bool stale_open_once,
                                          uint32_t *existing_pts_num)
 {
-    int free_slot = -1;
+    int empty_slot = -1;
+    int stale_path_slot = -1;
     for (int i = 0; i < PTY_KEEPALIVE_MAX; i++) {
         if (pty_keepalive_table[i].master_host_fd == master_host_fd) {
             if (existing_pts_num)
                 *existing_pts_num = pty_keepalive_table[i].linux_pts_num;
             return PTY_REG_EXISTS;
         }
-        if (free_slot < 0 &&
-            pty_keepalive_table[i].master_host_fd == PTY_KEEPALIVE_FREE)
-            free_slot = i;
+        if (pty_keepalive_table[i].master_host_fd != PTY_KEEPALIVE_FREE)
+            continue;
+        /* Prefer a stale-path slot with the same pts number: the macOS minor
+         * deterministically maps to the same slave_path string, so reusing
+         * keeps lookups path-correct and bounds the table at one slot per
+         * live minor instead of accumulating a new entry on every reopen.
+         */
+        if (pty_keepalive_table[i].slave_path[0] != '\0' &&
+            pty_keepalive_table[i].linux_pts_num == linux_pts_num) {
+            stale_path_slot = i;
+        } else if (empty_slot < 0 &&
+                   pty_keepalive_table[i].slave_path[0] == '\0') {
+            empty_slot = i;
+        }
     }
-    if (free_slot < 0)
-        return PTY_REG_FULL;
-    pty_keepalive_table[free_slot].master_host_fd = master_host_fd;
-    pty_keepalive_table[free_slot].slave_host_fd = slave_host_fd;
-    pty_keepalive_table[free_slot].linux_pts_num = linux_pts_num;
+    int slot = (stale_path_slot >= 0) ? stale_path_slot : empty_slot;
+    if (slot < 0) {
+        /* Out of empty slots and no stale-path match: evict the lowest-index
+         * stale-path entry so the live registration cannot starve. Live entries
+         * are never evicted. The eviction policy is approximately LRU: empty
+         * slots fill from low indices, so the lowest-index stale slot tends to
+         * be the oldest closed. A theoretical race exists with the
+         * close-before-open child pattern (a child stales slot K under
+         * pty_keepalive_lock and races into open("/dev/pts/N") just as another
+         * thread evicts slot K to register a different minor) but needs the
+         * keepalive table to be full -- live and stale entries both count --
+         * with the staling thread's slot being the lowest-index stale. Well
+         * outside the foot / sshd workload that motivated this code.
+         */
+        for (int i = 0; i < PTY_KEEPALIVE_MAX; i++) {
+            if (pty_keepalive_table[i].master_host_fd == PTY_KEEPALIVE_FREE &&
+                pty_keepalive_table[i].slave_path[0] != '\0') {
+                slot = i;
+                break;
+            }
+        }
+        if (slot < 0)
+            return PTY_REG_FULL;
+    }
+    pty_keepalive_table[slot].master_host_fd = master_host_fd;
+    if (pty_keepalive_table[slot].slave_host_fd >= 0 &&
+        pty_keepalive_table[slot].slave_host_fd != slave_host_fd)
+        close(pty_keepalive_table[slot].slave_host_fd);
+    pty_keepalive_table[slot].slave_host_fd = slave_host_fd;
+    pty_keepalive_table[slot].linux_pts_num = linux_pts_num;
+    pty_keepalive_table[slot].stale_open_once = stale_open_once;
     if (slave_path) {
-        strncpy(pty_keepalive_table[free_slot].slave_path, slave_path,
+        strncpy(pty_keepalive_table[slot].slave_path, slave_path,
                 PTY_SLAVE_PATH_MAX - 1);
-        pty_keepalive_table[free_slot].slave_path[PTY_SLAVE_PATH_MAX - 1] =
-            '\0';
+        pty_keepalive_table[slot].slave_path[PTY_SLAVE_PATH_MAX - 1] = '\0';
     } else {
-        pty_keepalive_table[free_slot].slave_path[0] = '\0';
+        pty_keepalive_table[slot].slave_path[0] = '\0';
     }
     return PTY_REG_INSERTED;
 }
@@ -1604,12 +1666,14 @@ static int pty_keepalive_register_locked(int master_host_fd,
 static int pty_keepalive_register(int master_host_fd,
                                   int slave_host_fd,
                                   uint32_t linux_pts_num,
-                                  const char *slave_path)
+                                  const char *slave_path,
+                                  bool stale_open_once)
 {
     pthread_once(&pty_keepalive_once, pty_keepalive_init);
     pthread_mutex_lock(&pty_keepalive_lock);
     int rc = pty_keepalive_register_locked(master_host_fd, slave_host_fd,
-                                           linux_pts_num, slave_path, NULL);
+                                           linux_pts_num, slave_path,
+                                           stale_open_once, NULL);
     pthread_mutex_unlock(&pty_keepalive_lock);
     if (rc == PTY_REG_FULL) {
         errno = ENOSPC;
@@ -1734,7 +1798,7 @@ uint32_t proc_pty_master_adopt(int guest_fd)
     }
     uint32_t existing_pts = UINT32_MAX;
     int rc = pty_keepalive_register_locked(canonical_host_fd, slave, pts_num,
-                                           slave_path, &existing_pts);
+                                           slave_path, false, &existing_pts);
     pthread_mutex_unlock(&fd_lock);
     pthread_mutex_unlock(&pty_keepalive_lock);
     if (rc == PTY_REG_FULL) {
@@ -1770,24 +1834,117 @@ static int pty_lookup_slave_path(uint32_t linux_pts_num,
         return -1;
     }
     pthread_once(&pty_keepalive_once, pty_keepalive_init);
+    int hit = -1;
+    pthread_mutex_lock(&pty_keepalive_lock);
+    /* Prefer a live entry (master still open in this process) over a stale
+     * path entry. Both encode the same slave_path for a given minor on macOS,
+     * so the preference only matters if a future change ever lets the two
+     * diverge - live wins by breaking out of the scan on first match.
+     */
+    for (int i = 0; i < PTY_KEEPALIVE_MAX; i++) {
+        if (pty_keepalive_table[i].linux_pts_num != linux_pts_num)
+            continue;
+        if (pty_keepalive_table[i].slave_path[0] == '\0')
+            continue;
+        if (pty_keepalive_table[i].master_host_fd != PTY_KEEPALIVE_FREE) {
+            hit = i;
+            break;
+        }
+        if (!pty_keepalive_table[i].stale_open_once ||
+            pty_keepalive_table[i].slave_host_fd < 0)
+            continue;
+        if (hit < 0)
+            hit = i;
+    }
+    if (hit < 0) {
+        pthread_mutex_unlock(&pty_keepalive_lock);
+        errno = ENOENT;
+        return -1;
+    }
+    size_t len = strlen(pty_keepalive_table[hit].slave_path);
+    if (len >= out_sz) {
+        pthread_mutex_unlock(&pty_keepalive_lock);
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    memcpy(out, pty_keepalive_table[hit].slave_path, len + 1);
+    pthread_mutex_unlock(&pty_keepalive_lock);
+    return 0;
+}
+
+static int pty_open_slave(uint32_t linux_pts_num, int linux_flags)
+{
+    int oflags = translate_open_flags(linux_flags) &
+                 (O_ACCMODE | O_NONBLOCK | O_CLOEXEC | O_NOCTTY);
+    char host_path[PTY_SLAVE_PATH_MAX];
+    int stale_hit = -1;
+    int retained_slaves[PTY_KEEPALIVE_MAX];
+    int nretained = 0;
+    int fd = -1;
+
+    pthread_once(&pty_keepalive_once, pty_keepalive_init);
     pthread_mutex_lock(&pty_keepalive_lock);
     for (int i = 0; i < PTY_KEEPALIVE_MAX; i++) {
-        if (pty_keepalive_table[i].master_host_fd != PTY_KEEPALIVE_FREE &&
-            pty_keepalive_table[i].linux_pts_num == linux_pts_num) {
+        if (pty_keepalive_table[i].linux_pts_num != linux_pts_num)
+            continue;
+        if (pty_keepalive_table[i].slave_path[0] == '\0')
+            continue;
+        if (pty_keepalive_table[i].master_host_fd != PTY_KEEPALIVE_FREE) {
             size_t len = strlen(pty_keepalive_table[i].slave_path);
-            if (len >= out_sz) {
+            if (len >= sizeof(host_path)) {
                 pthread_mutex_unlock(&pty_keepalive_lock);
                 errno = ENAMETOOLONG;
                 return -1;
             }
-            memcpy(out, pty_keepalive_table[i].slave_path, len + 1);
+            memcpy(host_path, pty_keepalive_table[i].slave_path, len + 1);
             pthread_mutex_unlock(&pty_keepalive_lock);
-            return 0;
+            return open(host_path, oflags);
         }
+        if (stale_hit < 0 && pty_keepalive_table[i].stale_open_once &&
+            pty_keepalive_table[i].slave_host_fd >= 0)
+            stale_hit = i;
+    }
+
+    if (stale_hit < 0) {
+        pthread_mutex_unlock(&pty_keepalive_lock);
+        errno = ENOENT;
+        return -1;
+    }
+
+    /* Stale fork-child entries are one-shot. The retained slave fd pins the
+     * macOS tty while we translate the close-before-open sequence, preventing
+     * the cached path from resolving to a reused unrelated minor. Regardless
+     * of open success, consume the stale mapping before returning.
+     */
+    size_t len = strlen(pty_keepalive_table[stale_hit].slave_path);
+    if (len >= sizeof(host_path)) {
+        int retained_slave = pty_keepalive_clear_slot_locked(stale_hit);
+        pthread_mutex_unlock(&pty_keepalive_lock);
+        if (retained_slave >= 0)
+            close(retained_slave);
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    memcpy(host_path, pty_keepalive_table[stale_hit].slave_path, len + 1);
+    fd = open(host_path, oflags);
+    int saved = errno;
+    for (int i = 0; i < PTY_KEEPALIVE_MAX; i++) {
+        if (pty_keepalive_table[i].master_host_fd != PTY_KEEPALIVE_FREE)
+            continue;
+        if (!pty_keepalive_table[i].stale_open_once)
+            continue;
+        if (strncmp(pty_keepalive_table[i].slave_path, host_path,
+                    PTY_SLAVE_PATH_MAX) != 0)
+            continue;
+        int retained_slave = pty_keepalive_clear_slot_locked(i);
+        if (retained_slave >= 0 && nretained < PTY_KEEPALIVE_MAX)
+            retained_slaves[nretained++] = retained_slave;
     }
     pthread_mutex_unlock(&pty_keepalive_lock);
-    errno = ENOENT;
-    return -1;
+    for (int i = 0; i < nretained; i++)
+        close(retained_slaves[i]);
+    errno = saved;
+    return fd;
 }
 
 static int pty_open_pts_dir(int linux_flags)
@@ -1805,9 +1962,21 @@ static int pty_open_pts_dir(int linux_flags)
 
     pthread_once(&pty_keepalive_once, pty_keepalive_init);
     pthread_mutex_lock(&pty_keepalive_lock);
+    /* Enumerate live masters and fork-child one-shot stale entries. The stale
+     * entries retain a slave fd until the first open attempt consumes them, so
+     * they cannot name a reused unrelated tty while they appear in readdir.
+     */
     for (int i = 0; i < PTY_KEEPALIVE_MAX; i++) {
-        if (pty_keepalive_table[i].master_host_fd == PTY_KEEPALIVE_FREE)
+        if (pty_keepalive_table[i].slave_path[0] == '\0')
             continue;
+        if (pty_keepalive_table[i].master_host_fd == PTY_KEEPALIVE_FREE &&
+            (!pty_keepalive_table[i].stale_open_once ||
+             pty_keepalive_table[i].slave_host_fd < 0))
+            continue;
+        /* The recycle/reuse-by-pts_num invariant in
+         * pty_keepalive_register_locked keeps at most one entry per minor, so
+         * no de-duplication pass is needed here.
+         */
         pts_nums[pts_count++] = pty_keepalive_table[i].linux_pts_num;
     }
     pthread_mutex_unlock(&pty_keepalive_lock);
@@ -1888,7 +2057,7 @@ void proc_pty_dup_keepalive_locked(int src_master_host_fd,
     }
     uint32_t existing_pts = UINT32_MAX;
     int rc = pty_keepalive_register_locked(dst_master_host_fd, dst_slave,
-                                           src_pts_num, src_slave_path,
+                                           src_pts_num, src_slave_path, false,
                                            &existing_pts);
     if (rc != PTY_REG_INSERTED) {
         /* Table full or duplicate entry for dst_master_host_fd; drop the
@@ -1916,17 +2085,58 @@ void proc_pty_close_keepalive(int master_host_fd)
     pthread_mutex_lock(&pty_keepalive_lock);
     for (int i = 0; i < PTY_KEEPALIVE_MAX; i++) {
         if (pty_keepalive_table[i].master_host_fd == master_host_fd) {
-            slave = pty_keepalive_table[i].slave_host_fd;
-            pty_keepalive_table[i].master_host_fd = PTY_KEEPALIVE_FREE;
-            pty_keepalive_table[i].slave_host_fd = PTY_KEEPALIVE_FREE;
-            pty_keepalive_table[i].linux_pts_num = 0;
-            pty_keepalive_table[i].slave_path[0] = '\0';
+            if (pty_keepalive_table[i].stale_open_once) {
+                /* Fork-restored child entry: retain the slave fd and path for
+                 * one /dev/pts/N open after close(master). pty_open_slave
+                 * consumes and closes it on the first translated open attempt.
+                 */
+                pty_keepalive_table[i].master_host_fd = PTY_KEEPALIVE_FREE;
+            } else {
+                slave = pty_keepalive_clear_slot_locked(i);
+            }
             break;
         }
     }
     pthread_mutex_unlock(&pty_keepalive_lock);
     if (slave >= 0)
         close(slave);
+}
+
+static void proc_pty_expire_stale_by_path(const char *slave_path)
+{
+    if (!slave_path || slave_path[0] == '\0')
+        return;
+
+    int stale_slaves[PTY_KEEPALIVE_MAX];
+    int nslaves = 0;
+    pthread_once(&pty_keepalive_once, pty_keepalive_init);
+    pthread_mutex_lock(&pty_keepalive_lock);
+    for (int i = 0; i < PTY_KEEPALIVE_MAX; i++) {
+        if (pty_keepalive_table[i].master_host_fd != PTY_KEEPALIVE_FREE)
+            continue;
+        if (!pty_keepalive_table[i].stale_open_once)
+            continue;
+        if (strncmp(pty_keepalive_table[i].slave_path, slave_path,
+                    PTY_SLAVE_PATH_MAX) != 0)
+            continue;
+        int slave = pty_keepalive_clear_slot_locked(i);
+        if (slave >= 0 && nslaves < PTY_KEEPALIVE_MAX)
+            stale_slaves[nslaves++] = slave;
+    }
+    pthread_mutex_unlock(&pty_keepalive_lock);
+    for (int i = 0; i < nslaves; i++)
+        close(stale_slaves[i]);
+}
+
+static int pty_keepalive_register_recycled(int master_host_fd,
+                                           int slave_host_fd,
+                                           uint32_t linux_pts_num,
+                                           const char *slave_path,
+                                           bool stale_open_once)
+{
+    proc_pty_expire_stale_by_path(slave_path);
+    return pty_keepalive_register(master_host_fd, slave_host_fd, linux_pts_num,
+                                  slave_path, stale_open_once);
 }
 
 int proc_pty_snapshot_keepalive(proc_pty_ipc_entry_t *out_entries,
@@ -2001,8 +2211,8 @@ void proc_pty_restore_keepalive(int master_host_fd,
      * would have truncated and reparsing here would yield the wrong number.
      */
     errno = 0;
-    if (pty_keepalive_register(master_host_fd, slave_host_fd, linux_pts_num,
-                               slave_path) < 0) {
+    if (pty_keepalive_register_recycled(master_host_fd, slave_host_fd,
+                                        linux_pts_num, slave_path, true) < 0) {
         if (slave_host_fd >= 0)
             close(slave_host_fd);
     } else if (errno == EEXIST) {
@@ -2071,7 +2281,8 @@ static int pty_open_master(int linux_flags)
         return -1;
     }
     errno = 0;
-    if (pty_keepalive_register(master, slave, linux_pts_num, slave_path) < 0) {
+    if (pty_keepalive_register_recycled(master, slave, linux_pts_num,
+                                        slave_path, false) < 0) {
         close(slave);
         close(master);
         errno = EMFILE;
@@ -2188,17 +2399,11 @@ int proc_intercept_open(const guest_t *g,
             errno = ENOENT;
             return -1;
         }
-        char host_path[PTY_SLAVE_PATH_MAX];
-        if (pty_lookup_slave_path((uint32_t) n, host_path, sizeof(host_path)) <
-            0)
-            return -1;
         /* /dev/pts/N is a character device; strip O_CREAT and friends so
          * the two-argument open(2) never sees a creation-mode-required
          * combination without a mode arg.
          */
-        int oflags = translate_open_flags(linux_flags) &
-                     (O_ACCMODE | O_NONBLOCK | O_CLOEXEC | O_NOCTTY);
-        return open(host_path, oflags);
+        return pty_open_slave((uint32_t) n, linux_flags);
     }
 
     /* /proc -> synthetic directory with PID entries for busybox ps, top, etc.

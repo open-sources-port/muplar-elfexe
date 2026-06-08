@@ -1575,7 +1575,7 @@ int64_t sys_ioctl(guest_t *g, int fd, uint64_t request, uint64_t arg)
         /* Set terminal window size. Same struct as TIOCGWINSZ; foot, sshd,
          * tmux, and any libvte-derived emulator call this on the PTY master
          * after spawning the slave child. Without it, terminal startup fails
-         * with -ENOTTY from the default arm below (issue #88).
+         * with -ENOTTY from the default arm below.
          *
          * A master received through SCM_RIGHTS bypasses /dev/ptmx open
          * interception, so lazily create its keepalive before the host ioctl.
