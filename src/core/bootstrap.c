@@ -390,10 +390,7 @@ int guest_bootstrap_prepare(guest_t *g,
 
     /* Rosetta is statically linked at 0x800000000000 (128 TiB), beyond the 36
      * and 40-bit IPA ranges. Request 48-bit IPA up-front so the page-table
-     * builder can reach the rosetta segments. HVF clamps to its supported size;
-     * on M1 hosts the upstream hyper-linux audit confirms 48 is honoured even
-     * though the auto-detect default returns 36, so the request is non-fatal in
-     * either direction.
+     * builder can reach the rosetta segments.
      */
     uint32_t req_ipa = want_rosetta ? 48 : 0;
     t0 = startup_trace_now_ns();
@@ -401,6 +398,7 @@ int guest_bootstrap_prepare(guest_t *g,
         log_error("failed to initialize guest");
         return -1;
     }
+
     startup_trace_step("guest_init", t0);
     *guest_initialized = true;
     g->is_rosetta = want_rosetta;

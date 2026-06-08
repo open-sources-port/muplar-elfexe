@@ -18,7 +18,9 @@ Supported user-facing options:
 | `-v`, `--verbose` | Enable syscall-level and loader diagnostics |
 | `-t`, `--timeout N` | Per-iteration vCPU watchdog, in seconds (default `10`, `0` disables) |
 | `--sysroot PATH` | Resolve guest absolute paths under `PATH` first |
-| `--gdb PORT` | Listen for a GDB RSP client on `PORT` |
+| `--create-sysroot PATH` | Provision a case-sensitive APFS sparsebundle mounted at `PATH`, then use it as the sysroot |
+| `--no-rosetta` | Disable the x86_64-via-Rosetta translator (also `ELFUSE_NO_ROSETTA=1`) |
+| `--gdb PORT` | Listen for a GDB RSP client on `PORT` (aarch64 guests only) |
 | `--gdb-stop-on-entry` | Stop before the first guest instruction |
 | `--` | End `elfuse` option parsing; remaining tokens are guest argv |
 
@@ -47,6 +49,91 @@ Pass guest arguments that begin with `-`:
 build/elfuse -- ./guest-program --guest-flag
 ```
 
+The guest's exit status is propagated as the `elfuse` exit status, so
+`elfuse` composes with shell pipelines, `make`, CI scripts, and
+anything else that inspects `$?`.
+
+### Worked Examples
+
+The guest reads and writes the host filesystem directly (no overlay,
+no volume mount), so file arguments are just file arguments.
+
+Run a Linux static `jq` against a host JSON file:
+
+```sh
+build/elfuse ./jq-aarch64-static '.name' /tmp/data.json
+```
+
+Drop into an interactive `bash` session against a musl sysroot:
+
+```sh
+build/elfuse --sysroot ./aarch64-musl-sysroot \
+    /path/to/aarch64-linux/bin/bash
+```
+
+Run a Linux `sqlite3` against a host database file:
+
+```sh
+build/elfuse ./sqlite3-aarch64-static /tmp/mydata.db \
+    'SELECT name FROM sqlite_master WHERE type = "table";'
+```
+
+Run an x86_64 Linux binary (architecture is auto-detected; Rosetta
+hosts the translator):
+
+```sh
+build/elfuse ./hello-x86_64-static
+```
+
+## x86_64-via-Rosetta
+
+Statically linked `x86_64-linux` ELFs run through Apple's embedded
+Rosetta translator hosted inside the guest VM. The architecture is
+auto-detected from the ELF header, so the same `elfuse` invocation
+works for both aarch64 and x86_64 inputs:
+
+```sh
+build/elfuse ./x86_64-static-binary
+```
+
+Rosetta is on by default. To force the aarch64-only path (or to
+verify that a binary really is aarch64), pass `--no-rosetta` or
+export `ELFUSE_NO_ROSETTA=1`:
+
+```sh
+build/elfuse --no-rosetta ./aarch64-program
+```
+
+Both statically and dynamically linked x86_64 binaries are supported.
+Dynamic guests need an x86_64-linux sysroot:
+
+```sh
+build/elfuse --sysroot /path/to/x86_64-sysroot ./x86_64-dynamic-binary
+```
+
+The sysroot must contain the requested dynamic linker
+(typically `/lib64/ld-linux-x86-64.so.2` for glibc, or
+`/lib/ld-musl-x86_64.so.1` for musl) and any shared libraries the
+guest opens. elfuse loads Rosetta into the VM and lets the translator
+read the guest ELF; the translated x86_64 dynamic linker then maps
+the interpreter and shared libraries through the sysroot like any
+other guest process. Runtime `dlopen` and per-thread TLS are
+exercised by `tests/test-rosetta-glibc.sh`.
+
+Notes:
+
+- `--gdb` is rejected for x86_64 guests: the stub serves the aarch64
+  view Rosetta produces, not the original x86_64 architectural state.
+- The CoW fork fast path is disabled for Rosetta because HVF caches
+  the host VA-to-PA mapping at `hv_vm_map` time.
+- Two Rosetta-internal divergences are documented and not papered
+  over: `SA_RESETHAND` is shadowed by Rosetta's own signal-handler
+  state, and `clone(..., CLONE_SETTLS, tls=0, ...)` can hang.
+
+The first x86_64 launch may pause briefly while the AOT cache under
+`$HOME/.cache/elfuse-rosettad/` warms up; subsequent launches reuse
+the SHA-256-keyed translations.
+
 ## Dynamic Linking And Sysroots
 
 Dynamic Linux guests need a sysroot that contains the expected interpreter and
@@ -70,6 +157,12 @@ Practical notes:
   resolve from the guest working directory.
 - The sysroot setting is preserved across guest `fork` and `execve`, so spawned
   children see the same view of the filesystem.
+- On case-insensitive macOS volumes, `elfuse` maintains per-directory
+  sidecar token files so case-colliding Linux names remain distinct.
+- Use `--create-sysroot PATH` if the host filesystem is case-insensitive
+  (default APFS) and the sysroot is being provisioned for the first
+  time; `elfuse` creates a case-sensitive APFS sparsebundle, mounts it
+  at `PATH`, and uses it as the sysroot for this run.
 
 ## Debugging With GDB Or LLDB
 
@@ -112,3 +205,7 @@ That has a few direct implications:
   syscall layer.
 - Behavior is strongest for normal command-line tools, language runtimes, test
   binaries, and debugger-driven workflows.
+- Guest-internal FUSE means `/dev/fuse` and `mount(..., "fuse", ...)`
+  work entirely inside the VM. Programs that link against `libfuse`
+  (sshfs, ntfs-3g, AppImage runtimes) run without macFUSE, FUSE-T, or
+  FSKit on the host.

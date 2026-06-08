@@ -378,9 +378,6 @@ typedef struct {
  * mapped at IPAs stacked just above guest_size; a bump allocator hands out
  * 2 MiB blocks. New segments are created lazily so untouched overflow costs
  * nothing.
- *
- * Layout matches externals/hyper-linux/src/guest.h:146-153 to keep the
- * upcoming syscall_exec / fork_ipc ports straightforward.
  */
 #define GUEST_MAX_OVERFLOW 4
 #define GUEST_OVERFLOW_SIZE                          \
@@ -451,9 +448,6 @@ typedef struct {
      * Survives guest_reset so execve of another x86_64 binary keeps the same
      * placement and kbuf wiring.
      *
-     * Field semantics mirror externals/hyper-linux/src/guest.h so that future
-     * ports of rosetta.c/.h, syscall_exec.c, and fork_ipc.c do not need to
-     * rename anything:
      *   rosetta_guest_base : Stage-2 GPA where rosetta segments are installed
      *                        via guest_add_mapping (typically 128 TiB).
      *   rosetta_va_base    : Guest virtual base where rosetta is loaded

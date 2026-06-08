@@ -53,10 +53,20 @@ make clean
 What they do:
 
 - `make elfuse`: build and sign `build/elfuse`
-- `make check`: unit suite from `tests/manifest.txt` followed by the BusyBox
-  applet smoke suite. The BusyBox binary is auto-resolved from
-  `externals/test-fixtures/aarch64-musl/staticbin/bin/busybox` if present, or
-  downloaded into `build/busybox` on first run.
+- `make check`: the recommended pre-commit gate. Runs, in order:
+  - `scripts/check-syscall-coverage.py` so any new `dispatch.tbl`
+    entry without a direct or aliased test reference fails the build
+  - the unit suite from `tests/manifest.txt`
+  - the TLBI RVAE1IS encoder unit test
+  - the proctitle argv-tail and low-stack regressions
+  - the BusyBox applet smoke suite (auto-resolved from
+    `externals/test-fixtures/aarch64-musl/staticbin/bin/busybox` or
+    downloaded into `build/busybox` on first run)
+  - the sysroot procfs exec, FUSE-on-Alpine, and `timeout=0` regressions
+  - the Rosetta CLI gating regressions
+  - the hot-syscall guardrail (`tests/test-bench-guardrail.sh`)
+    asserting `getpid`, libc `clock_gettime`, and 1-byte
+    `/dev/urandom` reads stay under their ns/op ceilings
 - `make test-rosetta-all`: Rosetta-specific x86_64 acceptance scripts
   (`test-rosetta-cli`, `test-rosetta-failure-modes`,
   `test-rosetta-statics`, `test-rosetta-alpine`,
@@ -66,7 +76,8 @@ What they do:
 - `make test-fuse-alpine`: validate guest `/dev/fuse` + `mount("fuse")`
   against the Alpine musl sysroot fixture
 - `make test-gdbstub`: debugger integration checks against the built-in GDB stub
-- `make test-matrix`: broader `elfuse` and QEMU cross-check
+- `make test-matrix`: cross-check `elfuse` (aarch64), QEMU (aarch64),
+  and `elfuse` (x86_64-via-Rosetta) on overlapping corpora
 - `make lint`: static analysis through `clang-tidy`
 
 ## Quick Iteration
@@ -132,11 +143,8 @@ Fixture handling is self-contained:
 not treated as elfuse regressions:
 
 - `SA_RESETHAND` is not reset reliably because Rosetta shadows guest signal
-  handler state internally. This matches the vendored `externals/hyper-linux`
-  reference behavior.
-- `clone(..., CLONE_SETTLS, tls=0, ...)` can hang. The upstream reproducer is
-  the raw-thread path in `externals/hyper-linux/test/test-thread.c`, and the
-  same limitation is documented in `externals/hyper-linux/hl.1`.
+  handler state internally.
+- `clone(..., CLONE_SETTLS, tls=0, ...)` can hang.
 
 The x86_64 matrix branch is therefore a Rosetta acceptance gate, not a claim
 that translated guests fully match native Linux thread and signal semantics.
@@ -237,9 +245,9 @@ different paths under different IPA widths:
   path (and the M5 slab-bisection variant). Currently held equal to
   `apple-m1-m2` pending operator capture on real M3+ hardware. When
   that capture lands, only the
-  `EXPECTED_MIN_PASS[elfuse-x86_64:apple-m3-plus]` and
-  `EXPECTED_FAIL[elfuse-x86_64:apple-m3-plus]` entries in
-  `tests/test-matrix.sh` move; the M1/M2 row stays intact.
+  `"elfuse-x86_64:apple-m3-plus|<min_pass>|<max_fail>"` row in the
+  `EXPECTED_BASELINES` array in `tests/test-matrix.sh` moves; the
+  M1/M2 row stays intact.
 
 - `apple-unknown`: fallback for SoC brand strings the detector does
   not recognise. Inherits the M1/M2 numbers and triggers a one-line
@@ -253,9 +261,11 @@ versa) without changing the detector, set
 `apple-unknown`) before invoking `tests/test-matrix.sh`.
 
 When the seven sub-suites grow or trim a test, the per-sub-suite
-counts in the comment block above `EXPECTED_MIN_PASS` and the
+counts in the comment block above `EXPECTED_BASELINES` and the
 inventory list above must move in the same commit so the per-host
-baseline stays in sync with reality.
+baseline stays in sync with reality. Each `EXPECTED_BASELINES` entry
+is a pipe-separated `mode-key|min_pass|max_fail` triple parsed by
+`expected_baseline_get()` in `tests/test-matrix.sh`.
 
 ## Test Inventory
 
@@ -287,5 +297,6 @@ Suggested minimum validation:
 | CLI, logging, docs-only build rules | `make elfuse` |
 | General syscall or runtime logic | `make elfuse && make check` |
 | `/proc`, `/dev`, path, or BusyBox-sensitive behavior | `make elfuse && make check` |
+| Rosetta hosting, x86_64 dispatch, VZ ioctls, AOT cache | `make elfuse && make test-rosetta-all` |
 | Broad behavioral changes | `make elfuse && make check && make test-matrix` |
 | Debugger or ptrace flow | `make elfuse && make test-gdbstub` |
