@@ -1478,20 +1478,17 @@ static int hvf_apply_file_overlay_quiesced(guest_t *g,
     return 0;
 }
 
-/* Apply a real MAP_SHARED file overlay at [ipa, ipa+len) backed by [fd,
- * file_off). The IPA range may be sub-2 MiB; the containing 2 MiB
- * segment is split out first if it is not already isolated. Caller
- * holds mmap_lock and has not quiesced siblings yet. The function
- * quiesces siblings around the unmap+remap window so concurrent vCPUs
- * cannot fault on the temporarily-unmapped IPA range.
- */
-/* True when the backing fd cannot be written through. The overlay path
- * replaces the slab's RW host VA with MAP_SHARED|MAP_FIXED of this fd, and
- * Apple HVF refuses hv_vm_map of any permission onto a host VA whose write
- * capability does not cover the requested stage-2 perms. A read-only fd
- * lands here with the kernel rejecting either PROT_WRITE on the host mmap
- * or, after a PROT_READ downgrade, the post-overlay hv_vm_map with
- * HV_DENIED. Callers must use the snapshot pread path instead.
+/* True when the backing fd allows writes through. The overlay path replaces
+ * the slab's RW host VA with MAP_SHARED|MAP_FIXED of this fd, and Apple HVF
+ * refuses hv_vm_map of any permission onto a host VA whose write capability
+ * does not cover the requested stage-2 perms. A read-only fd lands there
+ * with the kernel rejecting either PROT_WRITE on the host mmap or, after a
+ * PROT_READ downgrade, the post-overlay hv_vm_map with HV_DENIED.
+ * Centralises that decision: both the overlay entry (hvf_apply_file_overlay)
+ * and the sys_mmap fast-path skip share this gate so read-only backers are
+ * routed straight to the snapshot pread path. Returns true on the optimistic
+ * path when fcntl itself fails: the subsequent mmap / hv_vm_map will surface
+ * the real error rather than this helper synthesising one.
  */
 static bool overlay_fd_writable(int fd)
 {
@@ -1501,6 +1498,13 @@ static bool overlay_fd_writable(int fd)
     return (fl & O_ACCMODE) != O_RDONLY;
 }
 
+/* Apply a real MAP_SHARED file overlay at [ipa, ipa+len) backed by [fd,
+ * file_off). The IPA range may be sub-2 MiB; the containing 2 MiB
+ * segment is split out first if it is not already isolated. Caller
+ * holds mmap_lock and has not quiesced siblings yet. The function
+ * quiesces siblings around the unmap+remap window so concurrent vCPUs
+ * cannot fault on the temporarily-unmapped IPA range.
+ */
 static int hvf_apply_file_overlay(guest_t *g,
                                   uint64_t ipa,
                                   uint64_t len,

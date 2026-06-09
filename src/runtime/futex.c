@@ -104,8 +104,10 @@ static _Atomic int futex_interrupt_requested = 0;
  *
  * The wait quantum is capped at 100 ms so proc_exit_group_requested() and
  * futex_interrupt_pending() get noticed promptly without a process-wide
- * broadcast channel. EINTR is only synthesized when an actual deliverable
- * signal is queued for this thread (signal_pending_lockfree) or when a guest
+ * broadcast channel. EINTR is only returned when an actual deliverable
+ * signal is queued for this thread (confirmed under sig_lock via
+ * signal_pending(), not the atomic hint, so that rt_sigprocmask masking the
+ * queued signal cannot leave a stale-true edge behind), or when a guest
  * itimer expires under the poll loop's signal_check_timer poke. Earlier
  * revisions returned -EINTR after one unconditional second of waiting to
  * unblock shutdown-stalled multi-threaded runtimes, but that broke POSIX
@@ -455,9 +457,11 @@ static int64_t futex_os_sync_wait(guest_t *g,
         /* Return EINTR only when a real deliverable signal is queued for
          * this thread. POSIX callers (e.g. glibc sem_wait, foot's render
          * worker) often do not retry on EINTR, so synthetic spurious
-         * wakeups cannot be issued here.
+         * wakeups cannot be issued here. signal_pending() confirms under
+         * sig_lock so the atomic hint cannot produce a stale-true edge
+         * after rt_sigprocmask masked the queued signal.
          */
-        if (signal_pending_lockfree())
+        if (signal_pending())
             return -LINUX_EINTR;
         /* For has_timeout: futex_remaining_ns returns 0 next iteration once
          * the user deadline elapses, so the loop exits with -ETIMEDOUT.
@@ -565,13 +569,15 @@ static int64_t futex_wait(guest_t *g,
 
         /* Lock-order: bucket lock(7) outranks sig_lock(4), so signal_pending()
          * and signal_check_timer() may only be called once the bucket lock has
-         * been released. Drop it, poke the itimers, observe queued signals,
-         * then re-acquire and re-check waiter.woken in case a wake landed in
-         * the window.
+         * been released. Drop it, poke the itimers, observe queued signals
+         * under sig_lock (the slow-path confirm avoids the stale-true edge
+         * that the atomic hint can carry after rt_sigprocmask masks the
+         * queued signal), then re-acquire and re-check waiter.woken in case
+         * a wake landed in the window.
          */
         pthread_mutex_unlock(&b->lock);
         signal_check_timer();
-        bool sig_ready = signal_pending_lockfree();
+        bool sig_ready = signal_pending() != 0;
         pthread_mutex_lock(&b->lock);
 
         if (__atomic_load_n(&waiter.woken, __ATOMIC_ACQUIRE))
