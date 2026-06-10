@@ -10,7 +10,7 @@
         test-matrix test-matrix-elfuse-aarch64 test-matrix-qemu-aarch64 \
         test-full test-multi-vcpu test-rwx test-sysroot-rename \
         test-case-collision test-case-collision-fallback test-getdents64-overlong \
-        test-sysroot-create-paths \
+        test-sysroot-create-paths test-fork-ipc-protocol-host \
         test-proctitle-host test-proctitle-low-stack \
         test-sysroot-procfs-exec test-timeout-disable test-fuse-alpine \
         test-sysroot-nofollow test-sysroot-chdir perf
@@ -37,10 +37,13 @@ endef
 
 ## Run the unit test suite plus busybox applet validation
 check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage \
-		$(BUILD_DIR)/test-tlbi-encoder-host
+		$(BUILD_DIR)/test-tlbi-encoder-host \
+		$(BUILD_DIR)/test-fork-ipc-protocol-host
 	@bash tests/driver.sh -e $(ELFUSE_BIN) -d $(TEST_DIR) -v
 	@printf "\n$(BLUE)━━━ TLBI RVAE1IS encoder unit test ━━━$(RESET)\n"
 	@$(BUILD_DIR)/test-tlbi-encoder-host
+	@printf "\n$(BLUE)━━━ fork IPC protocol identity unit test ━━━$(RESET)\n"
+	@$(BUILD_DIR)/test-fork-ipc-protocol-host
 	@printf "\n$(BLUE)━━━ proctitle argv-tail regression ━━━$(RESET)\n"
 	@$(MAKE) --no-print-directory test-proctitle-host
 	@printf "\n$(BLUE)━━━ proctitle low-stack regression ━━━$(RESET)\n"
@@ -568,6 +571,11 @@ test-multi-vcpu: $(BUILD_DIR)/test-multi-vcpu
 ## Run RWX page table entry test (does HVF allow W+X?)
 test-rwx: $(BUILD_DIR)/test-rwx
 	$(BUILD_DIR)/test-rwx
+
+# Fork IPC protocol identity regression
+## Run the fork IPC protocol identity unit test
+test-fork-ipc-protocol-host: $(BUILD_DIR)/test-fork-ipc-protocol-host
+	$(BUILD_DIR)/test-fork-ipc-protocol-host
 
 # Proctitle argv-tail regression
 ## Run the deterministic argv-tail overshoot guard test

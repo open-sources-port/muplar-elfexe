@@ -28,6 +28,7 @@
 #include "runtime/procemu.h"
 
 #include "syscall/abi.h"
+#include "syscall/chown-overlay.h"
 #include "syscall/fd.h" /* eventfd_dup_fd */
 #include "syscall/fuse.h"
 #include "syscall/fs.h"
@@ -72,6 +73,25 @@ static int intercepted_fd_type(const char *path, int host_fd, int linux_flags)
     if (type == FD_REGULAR && path && !strcmp(path, "/dev/urandom"))
         return FD_URANDOM;
     return type;
+}
+
+static bool same_stat_identity(const struct stat *a, const struct stat *b)
+{
+    return a->st_dev == b->st_dev && a->st_ino == b->st_ino;
+}
+
+typedef struct removed_overlay_identity {
+    struct removed_overlay_identity *next;
+    uint64_t dev;
+    uint64_t ino;
+} removed_overlay_identity_t;
+
+static pthread_mutex_t removed_overlay_lock = PTHREAD_MUTEX_INITIALIZER;
+static removed_overlay_identity_t *removed_overlay_identities;
+
+static bool stat_identity_will_disappear(const struct stat *st)
+{
+    return S_ISDIR(st->st_mode) || st->st_nlink <= 1;
 }
 
 static const char *proc_virtual_dir_path(const char *path,
@@ -451,6 +471,121 @@ int64_t sys_openat(guest_t *g,
     return sys_openat_path(g, dirfd, pathp, linux_flags, mode);
 }
 
+static bool stat_identity_has_open_fd(const struct stat *target)
+{
+    bool found = false;
+
+    pthread_mutex_lock(&fd_lock);
+    for (int i = 0; i < FD_TABLE_SIZE; i++) {
+        if (fd_table[i].type == FD_CLOSED)
+            continue;
+
+        struct stat candidate;
+        if (fstat(fd_table[i].host_fd, &candidate) == 0 &&
+            same_stat_identity(target, &candidate)) {
+            found = true;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&fd_lock);
+
+    return found;
+}
+
+static bool removed_overlay_identity_contains(const struct stat *st)
+{
+    bool found = false;
+    uint64_t dev = (uint64_t) st->st_dev;
+    uint64_t ino = (uint64_t) st->st_ino;
+
+    pthread_mutex_lock(&removed_overlay_lock);
+    for (removed_overlay_identity_t *e = removed_overlay_identities; e;
+         e = e->next) {
+        if (e->dev == dev && e->ino == ino) {
+            found = true;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&removed_overlay_lock);
+
+    return found;
+}
+
+static void removed_overlay_identity_remove(const struct stat *st)
+{
+    uint64_t dev = (uint64_t) st->st_dev;
+    uint64_t ino = (uint64_t) st->st_ino;
+
+    pthread_mutex_lock(&removed_overlay_lock);
+    removed_overlay_identity_t **prev = &removed_overlay_identities;
+    for (removed_overlay_identity_t *e = *prev; e;
+         prev = &e->next, e = e->next) {
+        if (e->dev == dev && e->ino == ino) {
+            *prev = e->next;
+            free(e);
+            break;
+        }
+    }
+    pthread_mutex_unlock(&removed_overlay_lock);
+}
+
+static void removed_overlay_identity_add(const struct stat *st)
+{
+    uint64_t dev = (uint64_t) st->st_dev;
+    uint64_t ino = (uint64_t) st->st_ino;
+
+    pthread_mutex_lock(&removed_overlay_lock);
+    for (removed_overlay_identity_t *e = removed_overlay_identities; e;
+         e = e->next) {
+        if (e->dev == dev && e->ino == ino) {
+            pthread_mutex_unlock(&removed_overlay_lock);
+            return;
+        }
+    }
+
+    removed_overlay_identity_t *e = calloc(1, sizeof(*e));
+    if (e) {
+        e->dev = dev;
+        e->ino = ino;
+        e->next = removed_overlay_identities;
+        removed_overlay_identities = e;
+    }
+    pthread_mutex_unlock(&removed_overlay_lock);
+}
+
+static void chown_overlay_clear_removed_identity(const struct stat *st)
+{
+    if (stat_identity_has_open_fd(st)) {
+        removed_overlay_identity_add(st);
+        if (!stat_identity_has_open_fd(st)) {
+            removed_overlay_identity_remove(st);
+            chown_overlay_clear((uint64_t) st->st_dev, (uint64_t) st->st_ino);
+        }
+        return;
+    }
+
+    chown_overlay_clear((uint64_t) st->st_dev, (uint64_t) st->st_ino);
+}
+
+static void chown_overlay_clear_closed_unlinked_fd(int host_fd)
+{
+    struct stat st;
+    if (fstat(host_fd, &st) < 0)
+        return;
+
+    if (st.st_nlink == 0 && !stat_identity_has_open_fd(&st)) {
+        removed_overlay_identity_remove(&st);
+        chown_overlay_clear((uint64_t) st.st_dev, (uint64_t) st.st_ino);
+        return;
+    }
+
+    if (removed_overlay_identity_contains(&st) &&
+        !stat_identity_has_open_fd(&st)) {
+        removed_overlay_identity_remove(&st);
+        chown_overlay_clear((uint64_t) st.st_dev, (uint64_t) st.st_ino);
+    }
+}
+
 int64_t sys_close(int fd)
 {
     if (!RANGE_CHECK(fd, 0, FD_TABLE_SIZE))
@@ -468,6 +603,7 @@ int64_t sys_close(int fd)
          * no per-type cleanup is registered.
          */
         proc_pty_close_keepalive(host_fd);
+        chown_overlay_clear_closed_unlinked_fd(host_fd);
         if (close(host_fd) < 0)
             return linux_errno();
         return 0;
@@ -481,6 +617,7 @@ int64_t sys_close(int fd)
     if (!fd_snapshot_and_close_relaxed(fd, &snap))
         return -LINUX_EBADF;
 
+    chown_overlay_clear_closed_unlinked_fd(snap.host_fd);
     fd_cleanup_entry(fd, &snap);
     return 0;
 }
@@ -1109,19 +1246,17 @@ int64_t sys_getdents64(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
             continue;
         if (name_rc < 0) {
             /* macOS APFS accepts UTF-8 filenames whose byte length exceeds
-             * Linux NAME_MAX (255). A guest libc cannot represent such a
-             * name in its 256-byte dirent buffer at all, so elfuse silently
-             * skips the unrepresentable entry and keeps the rest of the
-             * stream intact. This is an elfuse compatibility policy, not
-             * Linux kernel behavior: real getdents64 has no equivalent
-             * skip path because Linux NAME_MAX is enforced at the
-             * filesystem layer, so no oversize entry ever reaches
-             * verify_dirent_name. Aborting the whole stream the way the
-             * pre-fix code did truncated ls / find / coreutils listings
-             * against APFS-mounted source trees. Skip on ENAMETOOLONG;
-             * keep the existing partial-return path for any other
-             * translation failure so genuine errors are not silently
-             * dropped.
+             * Linux NAME_MAX (255). A guest libc cannot represent such a name
+             * in its 256-byte dirent buffer at all, so elfuse silently skips
+             * the unrepresentable entry and keeps the rest of the stream
+             * intact. This is an elfuse compatibility policy, not Linux kernel
+             * behavior: real getdents64 has no equivalent skip path because
+             * Linux NAME_MAX is enforced at the filesystem layer, so no
+             * oversize entry ever reaches verify_dirent_name. Aborting the
+             * whole stream the way the pre-fix code did truncated ls / find /
+             * coreutils listings against APFS-mounted source trees. Skip on
+             * ENAMETOOLONG; keep the existing partial-return path for any other
+             * translation failure so genuine errors are not silently dropped.
              */
             if (errno == ENAMETOOLONG) {
                 static bool overlong_warned;
@@ -1429,11 +1564,20 @@ int64_t sys_unlinkat(guest_t *g, int dirfd, uint64_t path_gva, int flags)
         unlink_path = tx.host_path;
     }
 
+    struct stat removed_st;
+    bool clear_removed_overlay =
+        fstatat(dir_ref.fd, unlink_path, &removed_st, AT_SYMLINK_NOFOLLOW) ==
+            0 &&
+        (removed_st.st_nlink <= 1 || (flags & LINUX_AT_REMOVEDIR));
+
     int host_flags = translate_at_flags(flags);
     if (unlinkat(dir_ref.fd, unlink_path, host_flags) < 0) {
         host_fd_ref_close(&dir_ref);
         return linux_errno();
     }
+
+    if (clear_removed_overlay)
+        chown_overlay_clear_removed_identity(&removed_st);
 
     host_fd_ref_close(&dir_ref);
     return 0;
@@ -1571,11 +1715,23 @@ int64_t sys_renameat2(guest_t *g,
             -LINUX_EINVAL); /* RENAME_EXCHANGE requires AT_FDCWD on macOS */
     }
 
+    struct stat old_st;
+    bool have_old_st = fstatat(olddir_ref.fd, old_tx.host_path, &old_st,
+                               AT_SYMLINK_NOFOLLOW) == 0;
+    struct stat overwritten_st;
+    bool clear_overwritten_overlay =
+        fstatat(newdir_ref.fd, new_tx.host_path, &overwritten_st,
+                AT_SYMLINK_NOFOLLOW) == 0 &&
+        stat_identity_will_disappear(&overwritten_st) &&
+        (!have_old_st || !same_stat_identity(&old_st, &overwritten_st));
+
     if (olddirfd == LINUX_AT_FDCWD && newdirfd == LINUX_AT_FDCWD) {
         if (rename(old_tx.host_path, new_tx.host_path) < 0) {
             return close_dir_refs_result(&olddir_ref, &newdir_ref,
                                          linux_errno());
         }
+        if (clear_overwritten_overlay)
+            chown_overlay_clear_removed_identity(&overwritten_st);
         return close_dir_refs_result(&olddir_ref, &newdir_ref, 0);
     }
 
@@ -1583,6 +1739,8 @@ int64_t sys_renameat2(guest_t *g,
                  new_tx.host_path) < 0) {
         return close_dir_refs_result(&olddir_ref, &newdir_ref, linux_errno());
     }
+    if (clear_overwritten_overlay)
+        chown_overlay_clear_removed_identity(&overwritten_st);
     return close_dir_refs_result(&olddir_ref, &newdir_ref, 0);
 }
 
@@ -1898,11 +2056,37 @@ int64_t sys_fchmodat(guest_t *g,
     return 0;
 }
 
-/* Fake success on EPERM: emulated-root guests expect chown to succeed. */
-static int64_t chown_result(int rc)
+/* Update the virtual-owner overlay for the file the chown call just touched.
+ * host_rc is the return value of fchown/fchownat, host_st is a fresh stat of
+ * the same file (NULL if the host stat failed: the file is gone and an empty
+ * entry would not survive a follow-up access anyway).
+ *
+ * Maps a host EPERM to no-op success because macOS only lets the superuser
+ * chown to an arbitrary uid/gid, but an emulated-root guest expects chown(2) to
+ * succeed. The overlay then ensures the next stat round-trip returns the value
+ * the guest intended.
+ *
+ * The success and EPERM cases share the same update so a partial chown (e.g.
+ * owner=-1) preserves the prior override for the field the caller did not
+ * touch, even when the host actually changed the other field.
+ */
+static int64_t chown_result(int host_rc,
+                            const struct stat *host_st,
+                            uint32_t owner,
+                            uint32_t group)
 {
-    if (rc < 0)
-        return (errno == EPERM) ? 0 : linux_errno();
+    if (host_rc < 0 && errno != EPERM)
+        return linux_errno();
+    if (host_st && chown_overlay_set((uint64_t) host_st->st_dev,
+                                     (uint64_t) host_st->st_ino, owner, group,
+                                     host_st->st_uid, host_st->st_gid) < 0) {
+        /* Override allocation failed; reporting success would lie about the
+         * post-call stat round-trip. Linux's chown(2) lists ENOMEM among its
+         * possible errors for related allocation paths, so surface that to the
+         * guest instead.
+         */
+        return -LINUX_ENOMEM;
+    }
     return 0;
 }
 
@@ -1932,8 +2116,32 @@ int64_t sys_fchownat(guest_t *g,
         return -LINUX_EBADF;
 
     int mac_flags = translate_at_flags(flags);
-    int64_t out = chown_result(
-        fchownat(dir_ref.fd, tx.host_path, owner, group, mac_flags));
+    struct stat before_st;
+    bool before_ok =
+        fstatat(dir_ref.fd, tx.host_path, &before_st, mac_flags) == 0;
+
+    int host_rc = fchownat(dir_ref.fd, tx.host_path, owner, group, mac_flags);
+    int saved_errno = errno;
+
+    struct stat after_st;
+    const struct stat *st_ptr = NULL;
+    if (fstatat(dir_ref.fd, tx.host_path, &after_st, mac_flags) == 0 &&
+        before_ok && same_stat_identity(&before_st, &after_st)) {
+        st_ptr = &after_st;
+    }
+
+    errno = saved_errno;
+    int64_t out;
+    if (host_rc < 0 && saved_errno == EPERM && !st_ptr) {
+        /* fchownat does not give us a stable handle to the object it checked.
+         * If the path was replaced while the host syscall was in flight, a
+         * post-call stat could attach the virtual owner to the replacement
+         * inode. Refuse the fakeroot success in that race instead.
+         */
+        out = -LINUX_EAGAIN;
+    } else {
+        out = chown_result(host_rc, st_ptr, owner, group);
+    }
     host_fd_ref_close(&dir_ref);
     return out;
 }
@@ -1947,7 +2155,17 @@ int64_t sys_fchown(int fd, uint32_t owner, uint32_t group)
     host_fd_ref_t host_ref;
     if (host_fd_ref_open(fd, &host_ref) < 0)
         return -LINUX_EBADF;
-    int64_t out = chown_result(fchown(host_ref.fd, owner, group));
+
+    int host_rc = fchown(host_ref.fd, owner, group);
+    int saved_errno = errno;
+
+    struct stat host_st;
+    const struct stat *st_ptr = NULL;
+    if (fstat(host_ref.fd, &host_st) == 0)
+        st_ptr = &host_st;
+
+    errno = saved_errno;
+    int64_t out = chown_result(host_rc, st_ptr, owner, group);
     host_fd_ref_close(&host_ref);
     return out;
 }

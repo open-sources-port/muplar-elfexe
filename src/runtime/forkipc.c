@@ -37,6 +37,7 @@
 #include "runtime/futex.h"
 
 #include "syscall/abi.h"
+#include "syscall/chown-overlay.h"
 #include "syscall/internal.h"
 #include "syscall/mem.h"
 #include "syscall/net.h"  /* absock namespace IPC state */
@@ -89,8 +90,8 @@ int fork_child_main(int ipc_fd,
     proc_init();
     fork_child_vfork_notify_fd = vfork_notify_fd;
 
-    /* The header fixes the IPC protocol version and the guest identity before
-     * any variable-length state is trusted.
+    /* The header magic identifies the fork IPC protocol before any
+     * variable-length state is trusted.
      */
     ipc_header_t hdr;
     if (fork_ipc_read_all(ipc_fd, &hdr, sizeof(hdr)) < 0) {
@@ -101,14 +102,6 @@ int fork_child_main(int ipc_fd,
         log_error("fork-child: bad magic 0x%x", hdr.magic);
         return 1;
     }
-    if (hdr.version != IPC_VERSION) {
-        log_error(
-            "fork-child: IPC version mismatch "
-            "(got %u, expected %u)",
-            hdr.version, IPC_VERSION);
-        return 1;
-    }
-
     log_debug("fork-child: pid=%lld ppid=%lld", (long long) hdr.child_pid,
               (long long) hdr.parent_pid);
 
@@ -228,7 +221,7 @@ int fork_child_main(int ipc_fd,
      * primary buffer and is copied by the region transfer below, so the child
      * can reuse it without rebuilding the tree.
      */
-    g.is_rosetta = (hdr.is_rosetta != 0);
+    g.is_rosetta = hdr.is_rosetta;
     proc_set_rosetta_active(g.is_rosetta);
     g.rosetta_guest_base = hdr.rosetta_guest_base;
     g.rosetta_va_base = hdr.rosetta_va_base;
@@ -271,6 +264,12 @@ int fork_child_main(int ipc_fd,
     signal_state_t sig;
     if (fork_ipc_recv_process_state(ipc_fd, &g, &sig) < 0) {
         log_error("fork-child: failed to receive process state");
+        guest_destroy(&g);
+        return 1;
+    }
+
+    if (chown_overlay_recv(ipc_fd) < 0) {
+        log_error("fork-child: failed to receive chown overlay");
         guest_destroy(&g);
         return 1;
     }
@@ -1494,9 +1493,8 @@ int64_t sys_clone(hv_vcpu_t vcpu,
     /* Header */
     ipc_header_t hdr = {
         .magic = IPC_MAGIC_HEADER,
-        .version = IPC_VERSION,
         .ipa_bits = g->ipa_bits,
-        .has_shm = (uint32_t) use_shm,
+        .has_shm = use_shm,
         .child_pid = child_guest_pid,
         .parent_pid = proc_get_pid(),
         .guest_size = g->guest_size,
@@ -1521,7 +1519,7 @@ int64_t sys_clone(hv_vcpu_t vcpu,
         .absock_namespace_id = absock_get_namespace_id(),
         .sid = proc_get_sid(),
         .pgid = proc_get_pgid(),
-        .is_rosetta = g->is_rosetta ? 1 : 0,
+        .is_rosetta = g->is_rosetta,
         .rosetta_guest_base = g->rosetta_guest_base,
         .rosetta_va_base = g->rosetta_va_base,
         .rosetta_size = g->rosetta_size,
@@ -1618,6 +1616,11 @@ int64_t sys_clone(hv_vcpu_t vcpu,
             regions_tracker_stale_snapshot, preannounced_snapshot,
             num_preannounced) < 0) {
         log_error("clone: failed to send process state");
+        goto fail_snapshot;
+    }
+
+    if (chown_overlay_send(ipc_sock) < 0) {
+        log_error("clone: failed to send chown overlay");
         goto fail_snapshot;
     }
 

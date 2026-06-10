@@ -203,3 +203,6 @@ test-fd-family                     # diff=skip
 
 [section] SCM_CREDENTIALS tests
 test-scm-creds                     # diff=skip
+
+[section] Virtual chown overlay tests
+test-chown-overlay                 # diff=skip

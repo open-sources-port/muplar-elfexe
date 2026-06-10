@@ -36,6 +36,7 @@ int fork_ipc_write_all(int fd, const void *buf, size_t len)
                 continue;
             return -1;
         }
+
         if (n == 0) {
             /* Defensive: an unexpected zero return on a blocking socket would
              * otherwise spin forever, since p and len stay at the same offset.

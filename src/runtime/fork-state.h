@@ -15,23 +15,18 @@
 #include "syscall/abi.h"
 #include "syscall/signal.h"
 
-/* Magic values for IPC frame delimiters */
-#define IPC_MAGIC_HEADER 0x454C464BU   /* "ELFK" */
-#define IPC_MAGIC_SENTINEL 0x454C4F4BU /* "ELOK" */
-/* Bumped to 11 when regions_tracker_stale was added to process state so forked
- * children preserve mprotect fast-path correctness.
- *
- * Bumped to 10 when the rosetta placement / kbuf / ttbr1 tuple was added so a
- * rosetta-aware child rejects an older parent's header instead of trying to
- * interpret unknown trailing fields.
+/* Fork IPC protocol identity. Bump this whenever the header layout or ordered
+ * fork payload changes incompatibly.
  */
-#define IPC_VERSION 11
+#define FORK_IPC_PROTOCOL_MAGIC 0x454C464CU /* "ELFL" */
+
+#define IPC_MAGIC_HEADER FORK_IPC_PROTOCOL_MAGIC
+#define IPC_MAGIC_SENTINEL 0x454C4F4BU /* "ELOK" */
 
 typedef struct {
     uint32_t magic;
-    uint32_t version;
     uint32_t ipa_bits;
-    uint32_t has_shm;
+    bool has_shm;
     int64_t child_pid, parent_pid;
     uint64_t guest_size;
     uint64_t elf_load_min;
@@ -46,14 +41,14 @@ typedef struct {
     uint32_t _pad;
     uint64_t absock_namespace_id;
     int64_t sid, pgid;
+
     /* Rosetta placement fields. All zero for aarch64 guests; populated when the
      * parent is_rosetta. The child rebuilds the TTBR1 kbuf tree from the PT
      * pool that came across in the memory transfer; rosetta_guest_base /
      * va_base / size pin the segments at the same primary-buffer location so
      * the non-identity page-table mapping remains coherent across the fork.
      */
-    uint32_t is_rosetta;
-    uint32_t _rosetta_pad;
+    bool is_rosetta;
     uint64_t rosetta_guest_base;
     uint64_t rosetta_va_base;
     uint64_t rosetta_size;

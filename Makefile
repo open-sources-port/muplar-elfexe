@@ -40,6 +40,7 @@ SRCS := \
     syscall/path.c \
     syscall/fuse.c \
     syscall/sidecar.c \
+    syscall/chown-overlay.c \
     syscall/fs.c \
     syscall/fs-stat.c \
     syscall/fs-xattr.c \
@@ -139,6 +140,14 @@ $(BUILD_DIR)/test-rwx: $(BUILD_DIR)/test-rwx.o | $(BUILD_DIR)
 # immediately.
 $(BUILD_DIR)/test-tlbi-encoder-host: $(BUILD_DIR)/test-tlbi-encoder-host.o \
 		| $(BUILD_DIR)
+	@echo "  LD      $@"
+	$(Q)$(CC) $(CFLAGS) -o $@ $^
+
+## Build the fork IPC protocol identity unit test (native macOS binary).
+# Pure C; no HVF entitlement needed. Pins the first header word as the
+# cross-version protocol discriminator after IPC_VERSION removal.
+$(BUILD_DIR)/test-fork-ipc-protocol-host: \
+		$(BUILD_DIR)/test-fork-ipc-protocol-host.o | $(BUILD_DIR)
 	@echo "  LD      $@"
 	$(Q)$(CC) $(CFLAGS) -o $@ $^
 
