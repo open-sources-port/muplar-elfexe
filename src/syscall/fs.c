@@ -1107,8 +1107,35 @@ int64_t sys_getdents64(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
                                                  sizeof(guest_name));
         if (name_rc > 0)
             continue;
-        if (name_rc < 0)
+        if (name_rc < 0) {
+            /* macOS APFS accepts UTF-8 filenames whose byte length exceeds
+             * Linux NAME_MAX (255). A guest libc cannot represent such a
+             * name in its 256-byte dirent buffer at all, so elfuse silently
+             * skips the unrepresentable entry and keeps the rest of the
+             * stream intact. This is an elfuse compatibility policy, not
+             * Linux kernel behavior: real getdents64 has no equivalent
+             * skip path because Linux NAME_MAX is enforced at the
+             * filesystem layer, so no oversize entry ever reaches
+             * verify_dirent_name. Aborting the whole stream the way the
+             * pre-fix code did truncated ls / find / coreutils listings
+             * against APFS-mounted source trees. Skip on ENAMETOOLONG;
+             * keep the existing partial-return path for any other
+             * translation failure so genuine errors are not silently
+             * dropped.
+             */
+            if (errno == ENAMETOOLONG) {
+                static bool overlong_warned;
+                if (!__atomic_exchange_n(&overlong_warned, true,
+                                         __ATOMIC_RELAXED))
+                    log_warn(
+                        "getdents64: skipping host dirent whose name "
+                        "exceeds Linux NAME_MAX (%u); first hit was "
+                        "%zu bytes on fd %d",
+                        NAME_MAX, strlen(de->d_name), fd);
+                continue;
+            }
             return guest_pos > 0 ? (int64_t) guest_pos : linux_errno();
+        }
 
         size_t name_len = strlen(guest_name);
         /* Linux dirent64: 19-byte header + name + null, padded to 8 */

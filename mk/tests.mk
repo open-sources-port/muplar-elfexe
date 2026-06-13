@@ -9,7 +9,8 @@
         test-rosetta-glibc test-rosetta-all bench-rosetta \
         test-matrix test-matrix-elfuse-aarch64 test-matrix-qemu-aarch64 \
         test-full test-multi-vcpu test-rwx test-sysroot-rename \
-        test-case-collision test-case-collision-fallback test-sysroot-create-paths \
+        test-case-collision test-case-collision-fallback test-getdents64-overlong \
+        test-sysroot-create-paths \
         test-proctitle-host test-proctitle-low-stack \
         test-sysroot-procfs-exec test-timeout-disable test-fuse-alpine \
         test-sysroot-nofollow test-sysroot-chdir perf
@@ -48,6 +49,8 @@ check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage \
 	@$(MAKE) --no-print-directory test-busybox
 	@printf "\n$(BLUE)━━━ sysroot procfs exec validation ━━━$(RESET)\n"
 	@$(MAKE) --no-print-directory test-sysroot-procfs-exec
+	@printf "\n$(BLUE)━━━ getdents64 overlong-UTF-8 dirent skip ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-getdents64-overlong
 	@printf "\n$(BLUE)━━━ Alpine sysroot FUSE validation ━━━$(RESET)\n"
 	@$(MAKE) --no-print-directory test-fuse-alpine
 	@printf "\n$(BLUE)━━━ timeout=0 validation ━━━$(RESET)\n"
@@ -116,6 +119,26 @@ test-case-collision-fallback: $(ELFUSE_BIN) $(BUILD_DIR)/test-case-collision
 	@tmpdir=$$(mktemp -d); \
 	trap 'rm -rf "$$tmpdir"' EXIT; \
 	$(ELFUSE_BIN) --sysroot "$$tmpdir" $(BUILD_DIR)/test-case-collision
+
+# Build APFS-side dirents whose UTF-8 byte length exceeds Linux
+# NAME_MAX (255). 89 copies of U+3042 (3-byte UTF-8) plus a 1-byte
+# ASCII tag = 268 bytes per name; the guest cannot forge this via
+# openat (NAME_MAX is enforced), so the harness stages it host-side
+# and the guest scans the listing. Five overlong files plus one
+# normal entry: with a one-entry-per-call buffer on the guest side,
+# any APFS hash ordering puts an overlong entry in a position where
+# pre-fix code returned -ENAMETOOLONG to userspace.
+test-getdents64-overlong: $(ELFUSE_BIN) $(BUILD_DIR)/test-getdents64-overlong
+	@set -e; \
+	tmpdir=$$(mktemp -d); \
+	trap 'rm -rf "$$tmpdir"' EXIT; \
+	mkdir -p "$$tmpdir/fixture"; \
+	: > "$$tmpdir/fixture/expected.txt"; \
+	for tag in a b c d e; do \
+		overlong=$$(printf '\343\201\202%.0s' $$(seq 1 89))$$tag; \
+		: > "$$tmpdir/fixture/$$overlong"; \
+	done; \
+	$(ELFUSE_BIN) $(BUILD_DIR)/test-getdents64-overlong "$$tmpdir/fixture"
 
 test-sysroot-create-paths: $(ELFUSE_BIN) $(BUILD_DIR)/test-sysroot-create-paths
 	@set -e; \
