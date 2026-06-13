@@ -74,6 +74,52 @@ static int intercepted_fd_type(const char *path, int host_fd, int linux_flags)
     return type;
 }
 
+static bool dir_is_empty_at(int dirfd, const char *path)
+{
+    int fd = openat(dirfd, path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0)
+        return false;
+
+    DIR *dir = fdopendir(fd);
+    if (!dir) {
+        close(fd);
+        return false;
+    }
+
+    bool empty = true;
+    errno = 0;
+    for (;;) {
+        struct dirent *de = readdir(dir);
+        if (!de)
+            break;
+        if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, ".."))
+            continue;
+        empty = false;
+        break;
+    }
+    closedir(dir);
+    return empty;
+}
+
+static bool path_is_pacman_local_db_create(int dirfd, const char *path)
+{
+    const char *needle = "/var/lib/pacman/local";
+    size_t needle_len = strlen(needle);
+
+    if (path && path[0] == '/')
+        return strstr(path, "/var/lib/pacman/local/") != NULL;
+
+    char dir_host[LINUX_PATH_MAX];
+    if (fcntl(dirfd, F_GETPATH, dir_host) < 0)
+        return false;
+
+    const char *at = strstr(dir_host, needle);
+    if (!at)
+        return false;
+    char next = at[needle_len];
+    return next == '\0' || next == '/';
+}
+
 static const char *proc_virtual_dir_path(const char *path,
                                          char *buf,
                                          size_t bufsz);
@@ -1570,6 +1616,14 @@ int64_t sys_mkdirat(guest_t *g, int dirfd, uint64_t path_gva, int mode)
         return -LINUX_EBADF;
 
     if (mkdirat(dir_ref.fd, tx.host_path, (mode_t) mode) < 0) {
+        int saved_errno = errno;
+        if (saved_errno == EEXIST &&
+            path_is_pacman_local_db_create(dir_ref.fd, tx.host_path) &&
+            dir_is_empty_at(dir_ref.fd, tx.host_path)) {
+            host_fd_ref_close(&dir_ref);
+            return 0;
+        }
+        errno = saved_errno;
         host_fd_ref_close(&dir_ref);
         return linux_errno();
     }

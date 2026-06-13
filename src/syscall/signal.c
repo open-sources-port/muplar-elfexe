@@ -306,6 +306,10 @@ void signal_set_shim_globals_guest(guest_t *g)
  */
 static inline void attention_raise(void)
 {
+    if (proc_exit_group_requested()) {
+        thread_interrupt_all();
+        return;
+    }
     guest_t *g = atomic_load_explicit(&attention_guest, memory_order_acquire);
     if (g)
         shim_globals_raise_attention(g);

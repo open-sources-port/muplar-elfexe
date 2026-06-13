@@ -125,6 +125,7 @@
 #define SYS_getsid 156
 #define SYS_setsid 157
 #define SYS_getgroups 158
+#define SYS_setgroups 159
 #define SYS_uname 160
 #define SYS_getrlimit 163
 #define SYS_setrlimit 164
@@ -167,6 +168,7 @@
 #define SYS_wait4 260
 #define SYS_prlimit64 261
 #define SYS_renameat2 276
+#define SYS_seccomp 277
 #define SYS_getrandom 278
 #define SYS_execveat 281
 #define SYS_copy_file_range 285
@@ -216,6 +218,9 @@
 #define SYS_pidfd_getfd 438
 #define SYS_ptrace 117
 #define SYS_personality 92
+#define SYS_landlock_create_ruleset 444
+#define SYS_landlock_add_rule 445
+#define SYS_landlock_restrict_self 446
 #define SYS_capget 90
 #define SYS_capset 91
 #define SYS_get_robust_list 100
@@ -440,6 +445,8 @@ typedef struct {
 #define LINUX_PR_SET_DUMPABLE 4
 #define LINUX_PR_SET_NAME 15
 #define LINUX_PR_GET_NAME 16
+#define LINUX_PR_GET_SECCOMP 21
+#define LINUX_PR_SET_SECCOMP 22
 #define LINUX_PR_SET_NO_NEW_PRIVS 38
 #define LINUX_PR_GET_NO_NEW_PRIVS 39
 #define LINUX_PR_SET_CHILD_SUBREAPER 36

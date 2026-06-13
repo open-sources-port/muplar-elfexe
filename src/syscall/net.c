@@ -38,6 +38,7 @@
 #include "syscall/net-abi.h"
 #include "syscall/net-absock.h"
 #include "syscall/net-sockopt.h"
+#include "syscall/path.h"
 #include "syscall/proc.h"
 #include "syscall/signal.h"
 
@@ -79,6 +80,67 @@ static bool rosetta_seqpacket_placeholder(guest_t *g, int guest_fd, int host_fd)
         return false;
 
     return (so_type & 0xF) == SOCK_STREAM;
+}
+
+static bool linux_sockaddr_is_unix_path(const uint8_t *linux_sa,
+                                        uint32_t addrlen)
+{
+    if (addrlen < offsetof(struct sockaddr_un, sun_path) + 1)
+        return false;
+    uint16_t fam;
+    memcpy(&fam, linux_sa, sizeof(fam));
+    return fam == LINUX_AF_UNIX && linux_sa[2] != '\0';
+}
+
+static int unix_path_sockaddr_to_mac(const uint8_t *linux_sa,
+                                     uint32_t addrlen,
+                                     path_translate_flags_t flags,
+                                     struct sockaddr_storage *mac_sa)
+{
+    size_t path_off = offsetof(struct sockaddr_un, sun_path);
+    if (addrlen <= path_off)
+        return -LINUX_EINVAL;
+
+    size_t in_len = addrlen - path_off;
+    const char *in_path = (const char *) linux_sa + path_off;
+    size_t path_len = strnlen(in_path, in_len);
+    if (path_len == in_len)
+        return -LINUX_EINVAL;
+
+    char guest_path[LINUX_PATH_MAX];
+    if (str_copy_trunc(guest_path, in_path, sizeof(guest_path)) >=
+        sizeof(guest_path))
+        return -LINUX_ENAMETOOLONG;
+
+    path_translation_t tx;
+    if (path_translate_at(LINUX_AT_FDCWD, guest_path, flags, &tx) < 0) {
+        if (flags != PATH_TR_NONE ||
+            path_translate_at(LINUX_AT_FDCWD, guest_path, PATH_TR_NOFOLLOW,
+                              &tx) < 0) {
+            return -LINUX_ENOENT;
+        }
+    }
+
+    const char *host_path = tx.host_path;
+    char resolved_path[LINUX_PATH_MAX];
+    struct stat st;
+    if (lstat(tx.host_path, &st) == 0 && S_ISLNK(st.st_mode) &&
+        realpath(tx.host_path, resolved_path) &&
+        stat(resolved_path, &st) == 0 && S_ISSOCK(st.st_mode)) {
+        host_path = resolved_path;
+    }
+
+    struct sockaddr_un *sun = (struct sockaddr_un *) mac_sa;
+    memset(sun, 0, sizeof(*sun));
+    sun->sun_family = AF_UNIX;
+    if (str_copy_trunc(sun->sun_path, host_path, sizeof(sun->sun_path)) >=
+        sizeof(sun->sun_path))
+        return -LINUX_ENAMETOOLONG;
+
+    int mac_len =
+        (int) (offsetof(struct sockaddr_un, sun_path) + strlen(sun->sun_path));
+    sun->sun_len = (uint8_t) mac_len;
+    return mac_len;
 }
 
 int64_t sys_socket(guest_t *g, int domain, int type, int protocol)
@@ -251,6 +313,13 @@ int64_t sys_bind(guest_t *g, int fd, uint64_t addr_gva, uint32_t addrlen)
             return -LINUX_EINVAL;
         }
         mac_len = bind_len;
+    } else if (linux_sockaddr_is_unix_path(linux_sa, addrlen)) {
+        mac_len = unix_path_sockaddr_to_mac(linux_sa, addrlen, PATH_TR_CREATE,
+                                            &mac_sa);
+        if (mac_len < 0) {
+            host_fd_ref_close(&host_ref);
+            return mac_len;
+        }
     } else {
         mac_len = linux_to_mac_sockaddr(linux_sa, addrlen, &mac_sa);
         if (mac_len < 0) {
@@ -442,6 +511,13 @@ int64_t sys_connect(guest_t *g, int fd, uint64_t addr_gva, uint32_t addrlen)
         if (mac_len < 0) {
             host_fd_ref_close(&host_ref);
             return -LINUX_ECONNREFUSED;
+        }
+    } else if (linux_sockaddr_is_unix_path(linux_sa, addrlen)) {
+        mac_len =
+            unix_path_sockaddr_to_mac(linux_sa, addrlen, PATH_TR_NONE, &mac_sa);
+        if (mac_len < 0) {
+            host_fd_ref_close(&host_ref);
+            return mac_len;
         }
     } else {
         mac_len = linux_to_mac_sockaddr(linux_sa, addrlen, &mac_sa);

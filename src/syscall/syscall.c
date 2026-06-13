@@ -545,6 +545,7 @@ SC_FORWARD(sc_setreuid,  CRED_BRACKETED(g, proc_sys_setreuid((uint32_t) x0, (uin
 SC_FORWARD(sc_setregid,  CRED_BRACKETED(g, proc_sys_setregid((uint32_t) x0, (uint32_t) x1)))
 SC_FORWARD(sc_setresuid, CRED_BRACKETED(g, proc_sys_setresuid((uint32_t) x0, (uint32_t) x1, (uint32_t) x2)))
 SC_FORWARD(sc_setresgid, CRED_BRACKETED(g, proc_sys_setresgid((uint32_t) x0, (uint32_t) x1, (uint32_t) x2)))
+SC_FORWARD(sc_setgroups, 0)
 
 /* setfs{uid,gid}: Linux returns the previous fs{uid,gid} and only mutates state
  * on a permitted transition. elfuse does not track fsuid separately from euid,
@@ -566,6 +567,10 @@ SC_STUB(sc_set_mempolicy,       0)
 SC_STUB(sc_io_destroy,          -LINUX_EINVAL)
 SC_STUB(sc_sethostname,         -LINUX_EPERM)
 SC_STUB(sc_mincore,             -LINUX_ENOSYS)
+SC_STUB(sc_landlock_create_ruleset, 1)
+SC_STUB(sc_landlock_add_rule,       0)
+SC_STUB(sc_landlock_restrict_self,  0)
+SC_STUB(sc_seccomp,                 0)
 /* clang-format on */
 
 SC_FORWARD(sc_setpriority, proc_sys_setpriority((int) x0, (int) x1, (int) x2))
@@ -1011,6 +1016,10 @@ static int64_t sc_prctl(guest_t *g,
         return 0;
     case LINUX_PR_GET_NO_NEW_PRIVS:
         return 1;
+    case LINUX_PR_SET_SECCOMP:
+        return 0;
+    case LINUX_PR_GET_SECCOMP:
+        return 2;
     case LINUX_PR_SET_DUMPABLE:
         return 0;
     case LINUX_PR_GET_DUMPABLE:

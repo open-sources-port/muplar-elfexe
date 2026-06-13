@@ -55,8 +55,7 @@ bool path_might_use_open_intercept(const char *path)
         return true;
     if (path_prefix_match(path, SYSFS_CPU_PREFIX, sizeof(SYSFS_CPU_PREFIX) - 1))
         return true;
-    if (!strcmp(path, "/etc/mtab") || !strcmp(path, "/etc/passwd") ||
-        !strcmp(path, "/etc/group"))
+    if (!strcmp(path, "/etc/mtab"))
         return true;
     if (!strcmp(path, "/var/run/utmp") || !strcmp(path, "/run/utmp"))
         return true;

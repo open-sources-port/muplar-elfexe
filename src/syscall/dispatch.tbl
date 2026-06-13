@@ -141,6 +141,10 @@ SYS_ptrace sc_ptrace 1
 SYS_pidfd_open sc_pidfd_open 1
 SYS_pidfd_send_signal sc_pidfd_send_signal 1
 SYS_pidfd_getfd sc_pidfd_getfd 1
+SYS_landlock_create_ruleset sc_landlock_create_ruleset 1
+SYS_landlock_add_rule sc_landlock_add_rule 1
+SYS_landlock_restrict_self sc_landlock_restrict_self 0
+SYS_seccomp sc_seccomp 1
 
 # Identity and scheduling
 SYS_getpid sc_getpid 0
@@ -165,6 +169,7 @@ SYS_getpgid sc_getpgid 1
 SYS_getsid sc_getsid 1
 SYS_setsid sc_setsid 0
 SYS_getgroups sc_getgroups 1
+SYS_setgroups sc_setgroups 1
 SYS_setpriority sc_setpriority 0
 SYS_getpriority sc_getpriority 0
 SYS_sched_setparam sc_sched_setparam 0
