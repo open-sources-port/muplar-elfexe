@@ -446,7 +446,7 @@ int guest_init_from_shm(guest_t *g,
     uint64_t t0;
 
     memset(g, 0, sizeof(*g));
-    g->shm_fd = -1; /* Child does not own the shm */
+    g->shm_fd = shm_fd; /* Child owns the shm to allow nested fork CoW descriptor handover */
     g->ipa_base = GUEST_IPA_BASE;
     g->elf_load_min = ELF_DEFAULT_BASE;
     g->brk_base = BRK_BASE_DEFAULT;
@@ -467,27 +467,25 @@ int guest_init_from_shm(guest_t *g,
          * function takes ownership of shm_fd -- holds on every error path.
          */
         close(shm_fd);
+        g->shm_fd = -1;
         return -1;
     }
     g->pt_pool_next = g->pt_pool_base;
 
-    /* Map the shm fd MAP_PRIVATE: copy-on-write semantics. Reads see the
-     * parent's frozen snapshot; writes are private to this process. macOS CoW
-     * is page-granular: only modified pages are duplicated.
+    /* Map the shm fd MAP_SHARED: copy-on-write APFS file clone. Reads and writes
+     * see/update this process's isolated clone file.
      */
     t0 = startup_trace_now_ns();
     g->host_base =
-        mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE, shm_fd, 0);
+        mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
     startup_trace_step("shm_mmap", t0);
     if (g->host_base == MAP_FAILED) {
         perror("guest: mmap shm");
         g->host_base = NULL;
         close(shm_fd);
+        g->shm_fd = -1;
         return -1;
     }
-
-    /* Close the shm fd; the mapping keeps the pages alive */
-    close(shm_fd);
 
     /* Create HVF VM with the same IPA width as the parent */
     hv_return_t ret = HV_ERROR;

@@ -25,7 +25,7 @@
  * rosetta-aware child rejects an older parent's header instead of trying to
  * interpret unknown trailing fields.
  */
-#define IPC_VERSION 11
+#define IPC_VERSION 12
 
 typedef struct {
     uint32_t magic;
@@ -60,6 +60,8 @@ typedef struct {
     uint64_t rosetta_entry;
     uint64_t kbuf_gpa;
     uint64_t ttbr1;
+    uint64_t clone_flags;
+    uint64_t ctid_gva;
 } ipc_header_t;
 
 typedef struct {

@@ -48,6 +48,15 @@
 #include "debug/log.h"
 #include "debug/syscall-hist.h"
 
+/* Linux clone flags */
+#define LINUX_CLONE_VM 0x00000100
+#define LINUX_CLONE_VFORK 0x00004000
+#define LINUX_CLONE_THREAD 0x00010000
+#define LINUX_CLONE_SETTLS 0x00080000
+#define LINUX_CLONE_PARENT_SETTID 0x00100000
+#define LINUX_CLONE_CHILD_CLEARTID 0x00200000
+#define LINUX_CLONE_CHILD_SETTID 0x01000000
+
 /* fork_child_main. */
 
 static int fork_child_vfork_notify_fd = -1;
@@ -363,6 +372,23 @@ int fork_child_main(int ipc_fd,
      */
     thread_register_main(vcpu, vexit, hdr.child_pid, regs.sp_el1);
 
+    /* Write child PID to child's ctid address if CLONE_CHILD_SETTID was requested */
+    if (hdr.clone_flags & LINUX_CLONE_CHILD_SETTID) {
+        int32_t tid32 = (int32_t) hdr.child_pid;
+        if (guest_write_small(&g, hdr.ctid_gva, &tid32, sizeof(tid32)) < 0) {
+            log_warn("fork-child: failed to write child TID to ctid_gva 0x%llx",
+                     (unsigned long long) hdr.ctid_gva);
+        }
+    }
+
+    /* Register the clear TID address for cleanup on exit if CLONE_CHILD_CLEARTID was requested */
+    if (hdr.clone_flags & LINUX_CLONE_CHILD_CLEARTID) {
+        thread_entry_t *t = current_thread;
+        if (t) {
+            t->clear_child_tid = hdr.ctid_gva;
+        }
+    }
+
     /* Re-publish identity into the child's shim-globals cache: the CoW / region
      * copy inherits the parent's pid/uid values, and the shim's identity fast
      * path would otherwise return the parent's pid to the child. Identity is
@@ -420,14 +446,6 @@ int fork_child_main(int ipc_fd,
 
 /* sys_clone. */
 
-/* Linux clone flags */
-#define LINUX_CLONE_VM 0x00000100
-#define LINUX_CLONE_VFORK 0x00004000
-#define LINUX_CLONE_THREAD 0x00010000
-#define LINUX_CLONE_SETTLS 0x00080000
-#define LINUX_CLONE_PARENT_SETTID 0x00100000
-#define LINUX_CLONE_CHILD_CLEARTID 0x00200000
-#define LINUX_CLONE_CHILD_SETTID 0x01000000
 /* LINUX_SIGCHLD defined in syscall_signal.h (included above) */
 
 /* Namespace flags. elfuse implements no namespace isolation. Both sys_clone and
@@ -1528,6 +1546,8 @@ int64_t sys_clone(hv_vcpu_t vcpu,
         .rosetta_entry = g->rosetta_entry,
         .kbuf_gpa = g->kbuf_gpa,
         .ttbr1 = g->ttbr1,
+        .clone_flags = flags,
+        .ctid_gva = ctid_gva,
     };
     if (fork_ipc_write_all(ipc_sock, &hdr, sizeof(hdr)) < 0) {
         log_error("clone: failed to send header");
