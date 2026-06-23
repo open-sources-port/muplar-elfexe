@@ -6,6 +6,8 @@
 
 #include <stdatomic.h>
 #include <stdbool.h>
+#include <stdlib.h>
+#include <errno.h>
 #include <pthread.h>
 
 #include "syscall/abi.h"
@@ -24,16 +26,45 @@ static _Atomic int64_t guest_sid = 1, guest_pgid = 1;
 static _Atomic int64_t guest_fg_pgrp = 1;
 static _Atomic int32_t guest_has_ctty = 1;
 
+static bool parse_env_identity(const char *env_name, uint32_t *out_val)
+{
+    const char *env_str = getenv(env_name);
+    if (!env_str || *env_str == '\0') {
+        return false;
+    }
+    char *endptr = NULL;
+    errno = 0;
+    unsigned long val = strtoul(env_str, &endptr, 10);
+    const char *p = env_str;
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\v' || *p == '\f' ||
+           *p == '\r') {
+        p++;
+    }
+    if (p != endptr && errno != ERANGE && *endptr == '\0' &&
+        val <= UINT32_MAX && *p >= '0' && *p <= '9') {
+        *out_val = (uint32_t) val;
+        return true;
+    }
+    return false;
+}
+
 void proc_identity_init(void)
 {
     guest_pid = 1;
     parent_pid = 0;
-    emu_uid = GUEST_UID;
-    emu_euid = GUEST_UID;
-    emu_suid = GUEST_UID;
-    emu_gid = GUEST_GID;
-    emu_egid = GUEST_GID;
-    emu_sgid = GUEST_GID;
+
+    uint32_t uid = GUEST_UID;
+    parse_env_identity("ELFUSE_GUEST_UID", &uid);
+
+    uint32_t gid = GUEST_GID;
+    parse_env_identity("ELFUSE_GUEST_GID", &gid);
+
+    emu_uid = uid;
+    emu_euid = uid;
+    emu_suid = uid;
+    emu_gid = gid;
+    emu_egid = gid;
+    emu_sgid = gid;
     emu_nice = 0;
     guest_sid = 1;
     guest_pgid = 1;
