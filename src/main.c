@@ -201,6 +201,7 @@ int main(int argc, char **argv)
     const char *create_sysroot = NULL;
     int gdb_port = 0;
     bool gdb_stop_on_entry = false;
+    bool fakeroot = false;
     int arg_start = 1;
 
     /* 'elfuse rosettad translate <in> <out>' runs the real Apple rosettad
@@ -232,7 +233,7 @@ int main(int argc, char **argv)
             printf(
                 "usage: elfuse [--verbose] [--timeout N] [--sysroot PATH]\n"
                 "              [--create-sysroot PATH]\n"
-                "              [--no-rosetta]\n"
+                "              [--no-rosetta] [--fakeroot]\n"
                 "              [--gdb PORT] [--gdb-stop-on-entry]\n"
                 "              <elf-path> [args...]\n"
                 "\n"
@@ -249,6 +250,8 @@ int main(int argc, char **argv)
                 "  --no-rosetta            Disable x86_64-via-Rosetta "
                 "(architecture is auto-detected from the ELF header; "
                 "on by default)\n"
+                "  --fakeroot              Enable fakeroot mode (sets guest "
+                "UID/GID to 0 and provides full caps)\n"
                 "  --gdb PORT              Listen for GDB Remote Serial "
                 "Protocol on PORT\n"
                 "  --gdb-stop-on-entry     Halt before the first guest "
@@ -301,6 +304,9 @@ int main(int argc, char **argv)
         } else if (!strcmp(argv[arg_start], "--no-rosetta")) {
             rosetta_enabled = false;
             arg_start++;
+        } else if (!strcmp(argv[arg_start], "--fakeroot")) {
+            fakeroot = true;
+            arg_start++;
         } else if (!strcmp(argv[arg_start], "--gdb") && arg_start + 1 < argc) {
             if (parse_int_arg(argv[arg_start + 1], 1, 65535, &gdb_port) < 0) {
                 log_error("invalid GDB port: %s", argv[arg_start + 1]);
@@ -320,7 +326,7 @@ int main(int argc, char **argv)
             log_error(
                 "usage: elfuse [--verbose] [--timeout N] "
                 "[--sysroot PATH] [--create-sysroot PATH] [--no-rosetta] "
-                "[--gdb PORT] "
+                "[--fakeroot] [--gdb PORT] "
                 "[--gdb-stop-on-entry] <elf-path> [args...]");
             return 1;
         }
@@ -345,6 +351,13 @@ int main(int argc, char **argv)
     }
     proc_set_rosetta_enabled(rosetta_enabled);
 
+    if (!fakeroot) {
+        const char *fakeroot_env = getenv("ELFUSE_FAKEROOT");
+        if (fakeroot_env && strcmp(fakeroot_env, "1") == 0)
+            fakeroot = true;
+    }
+    proc_set_fakeroot_enabled(fakeroot);
+
     /* Fork-child mode: receive VM state over IPC and run */
     if (fork_child_fd >= 0)
         return fork_child_main(fork_child_fd, vfork_notify_fd, verbose,
@@ -354,7 +367,7 @@ int main(int argc, char **argv)
         log_error(
             "usage: elfuse [--verbose] [--timeout N] "
             "[--sysroot PATH] [--create-sysroot PATH] [--no-rosetta] "
-            "<elf-path> [args...]");
+            "[--fakeroot] <elf-path> [args...]");
         return 1;
     }
 

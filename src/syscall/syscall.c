@@ -1316,6 +1316,15 @@ static int64_t sc_capget(guest_t *g,
     }
     if (x1) {
         uint32_t data[6] = {0};
+        if (proc_fakeroot_enabled() && proc_get_euid() == 0) {
+            uint32_t high_mask = (1U << (LINUX_CAP_LAST_CAP - 32 + 1)) - 1;
+            data[0] = 0xffffffff; /* effective low */
+            data[1] = high_mask;  /* effective high */
+            data[2] = 0xffffffff; /* permitted low */
+            data[3] = high_mask;  /* permitted high */
+            data[4] = 0xffffffff; /* inheritable low */
+            data[5] = high_mask;  /* inheritable high */
+        }
         if (guest_write_small(g, x1, data, sizeof(data)) < 0)
             return -LINUX_EFAULT;
     }

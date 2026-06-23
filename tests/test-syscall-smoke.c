@@ -495,7 +495,17 @@ static void test_process_query_stubs(void)
     long tid = syscall(SYS_set_tid_address, &clear_tid);
     long caps = syscall(SYS_capget, &hdr, data);
     long pers = syscall(SYS_personality, 0xffffffffu);
-    if (tid > 0 && caps == 0 && pers >= 0)
+    bool caps_ok = false;
+    if (caps == 0) {
+        if (getuid() == 0) {
+            /* Under fakeroot, effective and permitted should be non-zero (full
+             * caps) */
+            caps_ok = (data[0].effective != 0);
+        } else {
+            caps_ok = (data[0].effective == 0);
+        }
+    }
+    if (tid > 0 && caps_ok && pers >= 0)
         PASS();
     else
         FAIL("process query stubs");

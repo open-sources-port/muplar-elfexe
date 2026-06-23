@@ -1321,7 +1321,7 @@ int64_t sys_clone(hv_vcpu_t vcpu,
 
     /* argv is intentionally minimal; guest argv is restored later from IPC. */
     char notify_fd_str[32];
-    char *child_argv[8];
+    char *child_argv[16];
     int ci = 0;
     child_argv[ci++] = self_path;
     if (verbose)
@@ -1333,6 +1333,8 @@ int64_t sys_clone(hv_vcpu_t vcpu,
      */
     if (!proc_rosetta_enabled())
         child_argv[ci++] = "--no-rosetta";
+    if (proc_fakeroot_enabled())
+        child_argv[ci++] = "--fakeroot";
     child_argv[ci++] = "--fork-child";
     child_argv[ci++] = fd_str;
     if (is_vfork) {
