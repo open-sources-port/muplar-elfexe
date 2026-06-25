@@ -33,6 +33,7 @@
 #include "syscall/abi.h"
 #include "syscall/internal.h"
 #include "syscall/net.h"
+#include "utils.h"
 
 static void netlink_close(int guest_fd);
 
@@ -130,6 +131,7 @@ typedef struct {
     size_t buf_pos; /* Current read position */
     uint32_t seq;   /* Sequence number from last request */
     uint32_t pid;   /* Bound PID (from bind or auto-assigned) */
+    int pipe_wr;    /* Host pipe write descriptor */
 } netlink_state_t;
 
 static netlink_state_t nl_state[MAX_NETLINK_FDS];
@@ -156,6 +158,7 @@ static netlink_state_t *nl_alloc(int guest_fd)
         memset(s, 0, sizeof(*s));
         s->in_use = true;
         s->guest_fd = guest_fd;
+        s->pipe_wr = -1;
         s->buf = malloc(NETLINK_BUF_SIZE);
         if (!s->buf) {
             s->in_use = false;
@@ -165,6 +168,26 @@ static netlink_state_t *nl_alloc(int guest_fd)
         return s;
     }
     return NULL;
+}
+
+static void netlink_signal_readable(netlink_state_t *ns)
+{
+    if (ns->pipe_wr != -1) {
+        uint8_t dummy = 1;
+        (void) write(ns->pipe_wr, &dummy, 1);
+    }
+}
+
+static void netlink_clear_readable(int guest_fd)
+{
+    int host_fd = fd_to_host(guest_fd);
+    if (host_fd < 0)
+        return;
+
+    uint8_t dummy[128];
+    while (read(host_fd, dummy, sizeof(dummy)) > 0) {
+        /* Drain non-blocking pipe */
+    }
 }
 
 /* Append a netlink attribute to the buffer. Returns bytes written. */
@@ -423,6 +446,12 @@ int64_t netlink_socket(int protocol, int type)
     if (pipe(pipefd) < 0)
         return -LINUX_EMFILE;
 
+    if (fd_set_nonblock(pipefd[0]) < 0 || fd_set_nonblock(pipefd[1]) < 0) {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        return -LINUX_EMFILE;
+    }
+
     int gfd = fd_alloc(FD_NETLINK, pipefd[0], netlink_close);
     if (gfd < 0) {
         close(pipefd[0]);
@@ -438,10 +467,7 @@ int64_t netlink_socket(int protocol, int type)
         return -LINUX_ENOMEM;
     }
 
-    /* No poll wakeup fd is needed because recvmsg drains the buffered response
-     * directly.
-     */
-    close(pipefd[1]); /* The write end is unused */
+    ns->pipe_wr = pipefd[1];
 
     return gfd;
 }
@@ -605,6 +631,9 @@ int64_t netlink_sendmsg(int guest_fd, guest_t *g, uint64_t msg_gva, int flags)
     }
 
     int ret = nl_process_request(ns, req, rlen);
+    if (ret == 0) {
+        netlink_signal_readable(ns);
+    }
     result = (ret < 0) ? ret : (int64_t) iov.iov_len;
 
 out:
@@ -636,6 +665,9 @@ int64_t netlink_send(int guest_fd, guest_t *g, uint64_t buf_gva, uint64_t len)
     }
 
     int ret = nl_process_request(ns, req, rlen);
+    if (ret == 0) {
+        netlink_signal_readable(ns);
+    }
     result = (ret < 0) ? ret : (int64_t) len;
 
 out:
@@ -662,7 +694,7 @@ int64_t netlink_recv(int guest_fd,
 
     if (ns->buf_pos >= ns->buf_len) {
         pthread_mutex_unlock(&nl_lock);
-        return 0;
+        return -LINUX_EAGAIN;
     }
 
     size_t avail = ns->buf_len - ns->buf_pos;
@@ -688,6 +720,10 @@ int64_t netlink_recv(int guest_fd,
         return -LINUX_EFAULT;
     }
     ns->buf_pos += msg_end;
+
+    if (ns->buf_pos >= ns->buf_len) {
+        netlink_clear_readable(guest_fd);
+    }
 
     if (src_gva && addrlen_gva) {
         sockaddr_nl_t snl = {
@@ -748,7 +784,7 @@ int64_t netlink_recvmsg(int guest_fd, guest_t *g, uint64_t msg_gva, int flags)
 
     if (ns->buf_pos >= ns->buf_len) {
         pthread_mutex_unlock(&nl_lock);
-        return 0;
+        return -LINUX_EAGAIN;
     }
 
     /* Parse msghdr to get iovec */
@@ -804,6 +840,10 @@ int64_t netlink_recvmsg(int guest_fd, guest_t *g, uint64_t msg_gva, int flags)
 
     ns->buf_pos += msg_end;
 
+    if (ns->buf_pos >= ns->buf_len) {
+        netlink_clear_readable(guest_fd);
+    }
+
     /* Write back sockaddr_nl if caller provided msg_name */
     if (mhdr.msg_name && mhdr.msg_namelen >= sizeof(sockaddr_nl_t)) {
         sockaddr_nl_t snl = {
@@ -839,7 +879,7 @@ int64_t netlink_read(int guest_fd, guest_t *g, uint64_t buf_gva, uint64_t count)
 
     if (ns->buf_pos >= ns->buf_len) {
         pthread_mutex_unlock(&nl_lock);
-        return 0;
+        return -LINUX_EAGAIN;
     }
 
     size_t avail = ns->buf_len - ns->buf_pos;
@@ -851,6 +891,11 @@ int64_t netlink_read(int guest_fd, guest_t *g, uint64_t buf_gva, uint64_t count)
     }
 
     ns->buf_pos += to_copy;
+
+    if (ns->buf_pos >= ns->buf_len) {
+        netlink_clear_readable(guest_fd);
+    }
+
     pthread_mutex_unlock(&nl_lock);
     return (int64_t) to_copy;
 }
@@ -862,6 +907,10 @@ static void netlink_close(int guest_fd)
     if (!ns) {
         pthread_mutex_unlock(&nl_lock);
         return;
+    }
+    if (ns->pipe_wr != -1) {
+        close(ns->pipe_wr);
+        ns->pipe_wr = -1;
     }
     free(ns->buf);
     ns->buf = NULL;
