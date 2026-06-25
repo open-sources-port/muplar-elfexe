@@ -136,6 +136,21 @@ void elf_resolve_interp(const char *sysroot,
                         char *out,
                         size_t out_sz);
 
+/* Read and parse a shebang script header from host_path.
+ * Writes interpreter path to interp_out and the single optional argument
+ * (if present) to arg_out. arg_out will be set to an empty string if there
+ * is no optional argument.
+ * Returns:
+ *   1 if a shebang script was successfully parsed
+ *   0 if the file is not a shebang script
+ *   Negative errno on failure (e.g. -ENOENT, -ENOEXEC, or buffer overflows)
+ */
+int elf_parse_shebang(const char *host_path,
+                      char *interp_out,
+                      size_t interp_sz,
+                      char *arg_out,
+                      size_t arg_sz);
+
 /* Translate ELF program-header flags (PF_R=4, PF_W=2, PF_X=1) into the
  * R=1/W=2/X=4 bitset shared by both MEM_PERM_R/W/X (page-table permissions) and
  * LINUX_PROT_READ/WRITE/EXEC (mmap prot bits).

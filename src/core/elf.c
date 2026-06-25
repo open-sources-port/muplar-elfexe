@@ -14,6 +14,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <errno.h>
 
 #include "core/elf.h"
 #include "debug/log.h"
@@ -426,4 +427,91 @@ void elf_resolve_interp(const char *sysroot,
     }
     /* Strategy 3: use interp_path as-is */
     str_copy_trunc(out, interp_path, out_sz);
+}
+
+int elf_parse_shebang(const char *host_path,
+                      char *interp_out,
+                      size_t interp_sz,
+                      char *arg_out,
+                      size_t arg_sz)
+{
+    int fd = open(host_path, O_RDONLY);
+    if (fd < 0) {
+        return -errno;
+    }
+
+    char buf[512];
+    ssize_t nread = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+
+    if (nread < 0) {
+        return -errno;
+    }
+    if (nread < 2 || buf[0] != '#' || buf[1] != '!') {
+        return 0; /* Not a shebang script */
+    }
+    buf[nread] = '\0';
+
+    /* Ignore script bytes after the first line (find \n or \r) */
+    char *eol = strchr(buf + 2, '\n');
+    if (eol) {
+        *eol = '\0';
+    }
+    eol = strchr(buf + 2, '\r');
+    if (eol) {
+        *eol = '\0';
+    }
+
+    char *ptr = buf + 2;
+    while (*ptr == ' ' || *ptr == '\t') {
+        ptr++;
+    }
+
+    /* Strip trailing whitespace/newlines of the whole shebang line */
+    size_t len = strlen(ptr);
+    while (len > 0 && (ptr[len - 1] == ' ' || ptr[len - 1] == '\t' ||
+                       ptr[len - 1] == '\r' || ptr[len - 1] == '\n')) {
+        ptr[--len] = '\0';
+    }
+
+    if (len == 0) {
+        return -ENOEXEC; /* Empty shebang interpreter */
+    }
+
+    /* Parse interpreter path and single optional argument */
+    char *interp = ptr;
+    char *space = strpbrk(ptr, " \t");
+    char *arg = NULL;
+    if (space) {
+        *space = '\0';
+        arg = space + 1;
+        /* Strip leading space of the argument */
+        while (*arg == ' ' || *arg == '\t') {
+            arg++;
+        }
+        /* Strip trailing space/newlines/tabs of the argument */
+        size_t arg_len = strlen(arg);
+        while (arg_len > 0 &&
+               (arg[arg_len - 1] == ' ' || arg[arg_len - 1] == '\t' ||
+                arg[arg_len - 1] == '\r' || arg[arg_len - 1] == '\n')) {
+            arg[--arg_len] = '\0';
+        }
+        if (strlen(arg) == 0) {
+            arg = NULL;
+        }
+    }
+
+    if (str_copy_trunc(interp_out, interp, interp_sz) >= interp_sz) {
+        return -ENOEXEC; /* Buffer too small */
+    }
+
+    if (arg) {
+        if (str_copy_trunc(arg_out, arg, arg_sz) >= arg_sz) {
+            return -ENOEXEC; /* Buffer too small */
+        }
+    } else {
+        arg_out[0] = '\0';
+    }
+
+    return 1; /* Successfully parsed shebang */
 }
