@@ -440,16 +440,165 @@ int main(int argc, char **argv)
     }
 
     proc_set_sysroot(sysroot);
-    if (resolve_guest_elf_host_path(elf_path, elf_host_path,
-                                    sizeof(elf_host_path),
-                                    &elf_host_temp) < 0) {
-        log_error("failed to resolve ELF path %s: %s", elf_path,
-                  strerror(errno));
+
+    int shebang_depth = 0;
+    const int max_shebang_depth = 5;
+
+    while (shebang_depth < max_shebang_depth) {
+        if (resolve_guest_elf_host_path(elf_path, elf_host_path,
+                                        sizeof(elf_host_path),
+                                        &elf_host_temp) < 0) {
+            log_error("failed to resolve ELF path %s: %s", elf_path,
+                      strerror(errno));
+            cleanup_main_resources(&g, guest_initialized, &sysroot_mount,
+                                   have_host_cwd ? host_cwd : NULL, guest_argv,
+                                   guest_argc, elf_path, sysroot_path);
+            if (elf_host_temp)
+                unlink(elf_host_path);
+            return 1;
+        }
+
+        /* Check if the file starts with "#!" */
+        FILE *f = fopen(elf_host_path, "r");
+        if (!f) {
+            /* If we can't open it, break and let guest_bootstrap_prepare handle
+             * it */
+            break;
+        }
+
+        char line[LINUX_PATH_MAX];
+        char *fgets_res = fgets(line, sizeof(line), f);
+        fclose(f);
+
+        if (!fgets_res || strncmp(line, "#!", 2) != 0) {
+            /* Not a shebang script, proceed to boot */
+            break;
+        }
+
+        shebang_depth++;
+
+        /* Skip leading whitespace after "#!" */
+        char *ptr = line + 2;
+        while (*ptr == ' ' || *ptr == '\t') {
+            ptr++;
+        }
+
+        /* Strip trailing newlines and whitespace */
+        size_t len = strlen(ptr);
+        while (len > 0 && (ptr[len - 1] == '\n' || ptr[len - 1] == '\r')) {
+            ptr[--len] = '\0';
+        }
+
+        if (len == 0) {
+            log_error("empty shebang interpreter in %s", elf_path);
+            cleanup_main_resources(&g, guest_initialized, &sysroot_mount,
+                                   have_host_cwd ? host_cwd : NULL, guest_argv,
+                                   guest_argc, elf_path, sysroot_path);
+            if (elf_host_temp)
+                unlink(elf_host_path);
+            return 1;
+        }
+
+        /* Parse interpreter path and single optional argument */
+        char *interp = ptr;
+        char *space = strpbrk(ptr, " \t");
+        char *arg = NULL;
+        if (space) {
+            *space = '\0';
+            arg = space + 1;
+            /* Strip leading space of the argument */
+            while (*arg == ' ' || *arg == '\t') {
+                arg++;
+            }
+            /* Strip trailing space of the argument */
+            size_t arg_len = strlen(arg);
+            while (arg_len > 0 &&
+                   (arg[arg_len - 1] == ' ' || arg[arg_len - 1] == '\t')) {
+                arg[--arg_len] = '\0';
+            }
+            if (strlen(arg) == 0) {
+                arg = NULL;
+            }
+        }
+
+        /* Prepend interpreter (and argument if present) to guest_argv */
+        int add_count = arg ? 2 : 1;
+        int new_argc = guest_argc + add_count;
+        const char **new_argv =
+            (const char **) calloc((size_t) new_argc, sizeof(char *));
+        if (!new_argv) {
+            log_error("out of memory");
+            cleanup_main_resources(&g, guest_initialized, &sysroot_mount,
+                                   have_host_cwd ? host_cwd : NULL, guest_argv,
+                                   guest_argc, elf_path, sysroot_path);
+            if (elf_host_temp)
+                unlink(elf_host_path);
+            return 1;
+        }
+
+        new_argv[0] = strdup(interp);
+        if (!new_argv[0]) {
+            log_error("out of memory");
+            free((void *) new_argv);
+            cleanup_main_resources(&g, guest_initialized, &sysroot_mount,
+                                   have_host_cwd ? host_cwd : NULL, guest_argv,
+                                   guest_argc, elf_path, sysroot_path);
+            if (elf_host_temp)
+                unlink(elf_host_path);
+            return 1;
+        }
+        if (arg) {
+            new_argv[1] = strdup(arg);
+            if (!new_argv[1]) {
+                log_error("out of memory");
+                free((void *) new_argv[0]);
+                free((void *) new_argv);
+                cleanup_main_resources(&g, guest_initialized, &sysroot_mount,
+                                       have_host_cwd ? host_cwd : NULL,
+                                       guest_argv, guest_argc, elf_path,
+                                       sysroot_path);
+                if (elf_host_temp)
+                    unlink(elf_host_path);
+                return 1;
+            }
+        }
+
+        /* Transfer ownership of the previous guest_argv elements */
+        for (int i = 0; i < guest_argc; i++) {
+            new_argv[i + add_count] = guest_argv[i];
+        }
+
+        free((void *) guest_argv);
+        guest_argv = new_argv;
+        guest_argc = new_argc;
+
+        /* Update elf_path to point to the interpreter path */
+        char *new_elf_path = strdup(interp);
+        if (!new_elf_path) {
+            log_error("out of memory");
+            cleanup_main_resources(&g, guest_initialized, &sysroot_mount,
+                                   have_host_cwd ? host_cwd : NULL, guest_argv,
+                                   guest_argc, elf_path, sysroot_path);
+            if (elf_host_temp)
+                unlink(elf_host_path);
+            return 1;
+        }
+        free(elf_path);
+        elf_path = new_elf_path;
+
+        /* Clean up any materialized temp file before resolving the next path */
+        if (elf_host_temp) {
+            unlink(elf_host_path);
+            elf_host_temp = false;
+        }
+    }
+
+    if (shebang_depth >= max_shebang_depth) {
+        log_error("too many levels of shebang recursion (max %d) resolving %s",
+                  max_shebang_depth, argv[arg_start]);
         cleanup_main_resources(&g, guest_initialized, &sysroot_mount,
                                have_host_cwd ? host_cwd : NULL, guest_argv,
                                guest_argc, elf_path, sysroot_path);
-        if (elf_host_temp)
-            unlink(elf_host_path);
         return 1;
     }
 
