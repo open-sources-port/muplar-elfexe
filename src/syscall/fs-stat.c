@@ -160,6 +160,15 @@ static void translate_statfs(const struct statfs *mac, linux_statfs_t *lin)
     lin->f_frsize = mac->f_bsize;
 }
 
+static void fill_proc_statfs(linux_statfs_t *st)
+{
+    memset(st, 0, sizeof(*st));
+    st->f_type = LINUX_PROC_SUPER_MAGIC;
+    st->f_bsize = 4096;
+    st->f_namelen = 255;
+    st->f_frsize = 4096;
+}
+
 /* Resolve the directory + path arguments of a *at-style stat operation and fill
  * *mac_st via the appropriate host call (proc intercept where applicable).
  * Shared by sys_newfstatat and sys_statx; the caller copies the result into the
@@ -360,6 +369,14 @@ int64_t sys_statfs(guest_t *g, uint64_t path_gva, uint64_t buf_gva)
     if (guest_read_str_small(g, path_gva, path, sizeof(path)) < 0)
         return -LINUX_EFAULT;
 
+    if (!strcmp(path, "/proc") || !strncmp(path, "/proc/", 6)) {
+        linux_statfs_t proc_st;
+        fill_proc_statfs(&proc_st);
+        if (guest_write_small(g, buf_gva, &proc_st, sizeof(proc_st)) < 0)
+            return -LINUX_EFAULT;
+        return 0;
+    }
+
     path_translation_t tx;
     if (path_translate_at(LINUX_AT_FDCWD, path, PATH_TR_NONE, &tx) < 0)
         return linux_errno();
@@ -380,6 +397,19 @@ int64_t sys_statfs(guest_t *g, uint64_t path_gva, uint64_t buf_gva)
 
 int64_t sys_fstatfs(guest_t *g, int fd, uint64_t buf_gva)
 {
+    fd_entry_t snap;
+    memset(&snap, 0, sizeof(snap));
+    bool have_snap = fd_snapshot(fd, &snap);
+    if (have_snap &&
+        (!strcmp(snap.proc_path, "/proc") ||
+         !strncmp(snap.proc_path, "/proc/", 6))) {
+        linux_statfs_t proc_st;
+        fill_proc_statfs(&proc_st);
+        if (guest_write_small(g, buf_gva, &proc_st, sizeof(proc_st)) < 0)
+            return -LINUX_EFAULT;
+        return 0;
+    }
+
     host_fd_ref_t host_ref;
     if (host_fd_ref_open(fd, &host_ref) < 0)
         return -LINUX_EBADF;

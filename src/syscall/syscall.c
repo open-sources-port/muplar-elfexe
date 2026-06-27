@@ -601,8 +601,10 @@ static int64_t sc_get_mempolicy(guest_t *g,
     return 0;
 }
 
-/* capset: unprivileged process cannot set capabilities. */
-SC_FORWARD(sc_capset, -LINUX_EPERM)
+/* Elfuse does not expose host capabilities. Accept guest capability updates so
+ * setpriv-style UID/GID drops can complete; emulated credential checks remain
+ * authoritative and no host privilege is granted. */
+SC_FORWARD(sc_capset, 0)
 
 /* sched_setaffinity: accept masks that include CPU 0, reject empty masks. */
 static int64_t sc_sched_setaffinity(guest_t *g,
@@ -1024,6 +1026,10 @@ static int64_t sc_prctl(guest_t *g,
         return 0;
     case LINUX_PR_GET_DUMPABLE:
         return 1;
+    case LINUX_PR_SET_KEEPCAPS:
+        return 0;
+    case LINUX_PR_GET_KEEPCAPS:
+        return 0;
     case LINUX_PR_SET_CHILD_SUBREAPER:
         /* Accept silently. elfuse's process model already reaps all children
          * within the VM; the flag has no additional effect.
@@ -1920,7 +1926,7 @@ static int fast_scalar_syscall_result(int nr, uint64_t x0, int64_t *result)
         *result = 0;
         return 1;
     case SYS_capset:
-        *result = -LINUX_EPERM;
+        *result = 0;
         return 1;
     case SYS_io_destroy:
         *result = -LINUX_EINVAL;

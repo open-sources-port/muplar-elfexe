@@ -39,6 +39,7 @@
 #include "runtime/futex.h"
 
 #include "syscall/internal.h"
+#include "syscall/poll.h"
 #include "syscall/proc-identity.h"
 #include "syscall/proc.h"
 #include "syscall/proc-pidfd.h"
@@ -277,6 +278,20 @@ static int proc_reap_finished(void)
     return reaped;
 }
 
+static void *proc_child_monitor(void *opaque)
+{
+    pid_t host_pid = (pid_t) (intptr_t) opaque;
+    int status;
+    pid_t waited;
+    do {
+        waited = waitpid(host_pid, &status, 0);
+    } while (waited < 0 && errno == EINTR);
+
+    if (waited == host_pid)
+        proc_mark_child_exited(host_pid, status);
+    return NULL;
+}
+
 int proc_register_child(pid_t host_pid, int64_t guest_pid_val)
 {
     pthread_mutex_lock(&pid_lock);
@@ -284,6 +299,10 @@ int proc_register_child(pid_t host_pid, int64_t guest_pid_val)
     if (entry) {
         proc_init_child_entry(entry, host_pid, guest_pid_val);
         pthread_mutex_unlock(&pid_lock);
+        pthread_t monitor;
+        if (pthread_create(&monitor, NULL, proc_child_monitor,
+                           (void *) (intptr_t) host_pid) == 0)
+            pthread_detach(monitor);
         return 0;
     }
 
@@ -293,6 +312,10 @@ int proc_register_child(pid_t host_pid, int64_t guest_pid_val)
     if (entry) {
         proc_init_child_entry(entry, host_pid, guest_pid_val);
         pthread_mutex_unlock(&pid_lock);
+        pthread_t monitor;
+        if (pthread_create(&monitor, NULL, proc_child_monitor,
+                           (void *) (intptr_t) host_pid) == 0)
+            pthread_detach(monitor);
         return 0;
     }
     pthread_mutex_unlock(&pid_lock);
@@ -313,6 +336,10 @@ void proc_mark_child_exited(pid_t host_pid, int status)
         pthread_cond_broadcast(&pid_cond);
         pthread_mutex_unlock(&pid_lock);
         proc_pidfd_notify_exit(gpid);
+        signal_queue(LINUX_SIGCHLD);
+        futex_interrupt_request();
+        wakeup_pipe_signal();
+        thread_interrupt_all();
         return;
     }
     pthread_mutex_unlock(&pid_lock);
@@ -2032,6 +2059,12 @@ int vcpu_run_loop(hv_vcpu_t vcpu,
              * would cause an "unexpected exit reason" crash.
              */
             hv_vcpu_set_vtimer_mask(vcpu, true);
+        } else if (vexit->reason == HV_EXIT_REASON_UNKNOWN &&
+                   (signal_pending() || thread_fork_barrier_check())) {
+            /* hv_vcpus_exit() can race with a natural VM exit on macOS and
+             * occasionally reports UNKNOWN instead of CANCELED. Retry only
+             * when Elfuse has a concrete asynchronous reason for the exit. */
+            continue;
         } else {
             log_error("%s: unexpected exit reason 0x%x", prefix, vexit->reason);
             {

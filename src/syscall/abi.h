@@ -440,6 +440,8 @@ typedef struct {
 #define LINUX_PR_GET_PDEATHSIG 2
 #define LINUX_PR_GET_DUMPABLE 3
 #define LINUX_PR_SET_DUMPABLE 4
+#define LINUX_PR_GET_KEEPCAPS 7
+#define LINUX_PR_SET_KEEPCAPS 8
 #define LINUX_PR_SET_NAME 15
 #define LINUX_PR_GET_NAME 16
 #define LINUX_PR_SET_NO_NEW_PRIVS 38
@@ -549,6 +551,8 @@ typedef struct {
     int64_t f_namelen, f_frsize, f_flags;
     int64_t f_spare[4];
 } linux_statfs_t;
+
+#define LINUX_PROC_SUPER_MAGIC 0x9fa0
 
 /* Linux iovec. */
 typedef struct {

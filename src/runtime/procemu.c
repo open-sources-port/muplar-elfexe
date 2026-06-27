@@ -2405,7 +2405,7 @@ int proc_intercept_open(const guest_t *g,
      * "self" symlink. The DIR* created from this allows getdents64 to enumerate
      * /proc like a real procfs. Cleaned up via atexit.
      */
-    if (!strcmp(path, "/proc")) {
+    if (!strcmp(path, "/proc") || !strcmp(path, "/proc/")) {
         const char *dir = ensure_proc_tmpdir(g);
         if (!dir)
             return -1;
@@ -2413,7 +2413,8 @@ int proc_intercept_open(const guest_t *g,
     }
 
     /* /proc/self -> directory fd for the PID subdirectory */
-    if (!strcmp(path, "/proc/self") || !strcmp(path, "/proc/self/")) {
+    if (!strcmp(path, "/proc/self") || !strcmp(path, "/proc/self/") ||
+        !strcmp(path, "/proc/1") || !strcmp(path, "/proc/1/")) {
         const char *dir = ensure_proc_tmpdir(g);
         if (!dir)
             return -1;
@@ -3442,6 +3443,7 @@ int proc_intercept_stat(const char *path, struct stat *st)
         snprintf(pidslash, sizeof(pidslash), "/proc/%lld/",
                  (long long) proc_get_pid());
         if (!strcmp(path, pidbuf) || !strcmp(path, pidslash) ||
+            !strcmp(path, "/proc/1") || !strcmp(path, "/proc/1/") ||
             !strcmp(path, "/proc/self") || !strcmp(path, "/proc/self/")) {
             stat_fill_proc_dir(st, 0555, 3, path);
             return 0;
