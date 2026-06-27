@@ -358,6 +358,7 @@ SC_FORWARD(sc_prlimit64, sys_prlimit64(g, (int) x0, (int) x1, x2, x3))
 SC_FORWARD(sc_getrlimit, sys_prlimit64(g, 0, (int) x0, 0, x1))
 SC_FORWARD(sc_setrlimit, sys_prlimit64(g, 0, (int) x0, x1, 0))
 SC_FORWARD(sc_getgroups, sys_getgroups(g, (int) x0, x1))
+SC_FORWARD(sc_setgroups, sys_setgroups(g, (int) x0, x1))
 SC_FORWARD(sc_getrusage, sys_getrusage(g, (int) x0, x1))
 SC_FORWARD(sc_sched_getaffinity,    sys_sched_getaffinity(g, (int) x0, x1, x2))
 SC_FORWARD(sc_sched_getscheduler,   sys_sched_getscheduler((int) x0))
@@ -1018,7 +1019,7 @@ static int64_t sc_prctl(guest_t *g,
     case LINUX_PR_SET_NO_NEW_PRIVS:
         return 0;
     case LINUX_PR_GET_NO_NEW_PRIVS:
-        return 1;
+        return 0;
     case LINUX_PR_SET_DUMPABLE:
         return 0;
     case LINUX_PR_GET_DUMPABLE:

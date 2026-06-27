@@ -114,18 +114,26 @@ uint32_t proc_get_sgid(void)
 
 static bool uid_is_permitted(uint32_t val)
 {
-    return val == emu_uid || val == emu_euid || val == emu_suid;
+    return emu_euid == 0 || val == emu_uid || val == emu_euid ||
+           val == emu_suid;
 }
 
 static bool gid_is_permitted(uint32_t val)
 {
-    return val == emu_gid || val == emu_egid || val == emu_sgid;
+    return emu_euid == 0 || val == emu_gid || val == emu_egid ||
+           val == emu_sgid;
 }
 
 int64_t proc_sys_setuid(uint32_t uid)
 {
     if (!uid_is_permitted(uid))
         return -LINUX_EPERM;
+    if (emu_euid == 0) {
+        emu_uid = uid;
+        emu_euid = uid;
+        emu_suid = uid;
+        return 0;
+    }
     emu_euid = uid;
     return 0;
 }
@@ -134,6 +142,12 @@ int64_t proc_sys_setgid(uint32_t gid)
 {
     if (!gid_is_permitted(gid))
         return -LINUX_EPERM;
+    if (emu_euid == 0) {
+        emu_gid = gid;
+        emu_egid = gid;
+        emu_sgid = gid;
+        return 0;
+    }
     emu_egid = gid;
     return 0;
 }
@@ -142,7 +156,8 @@ int64_t proc_sys_setgid(uint32_t gid)
     int64_t proc_sys_setre##suffix(uint32_t r, uint32_t e) \
     {                                                      \
         uint32_t old_real = real;                          \
-        if (r != (uint32_t) -1 && r != real && r != eff)   \
+        if (proc_get_euid() != 0 && r != (uint32_t) -1 && r != real && \
+            r != eff)                                         \
             return -LINUX_EPERM;                           \
         if (e != (uint32_t) -1 && !perm_fn(e))             \
             return -LINUX_EPERM;                           \

@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include "runtime/fork-state.h"
 #include "syscall/chown-overlay.h"
@@ -155,6 +156,13 @@ void chown_overlay_clear(uint64_t dev, uint64_t ino)
 
 void chown_overlay_apply(struct stat *st)
 {
+    /* Rootfs archives are extracted by the host user. Treat that host
+     * ownership as guest root unless a guest chown override says otherwise. */
+    if (st->st_uid == getuid())
+        st->st_uid = 0;
+    if (st->st_gid == getgid())
+        st->st_gid = 0;
+
     if (atomic_load_explicit(&entry_count, memory_order_acquire) == 0)
         return;
 

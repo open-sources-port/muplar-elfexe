@@ -83,14 +83,8 @@ static bool sched_pid_alive(int pid);
 
 static void groups_init_cached_linux_groups(void)
 {
-    gid_t groups[64];
-    int ngroups = getgroups(64, groups);
-    if (ngroups < 0)
-        return;
-
-    for (int i = 0; i < ngroups; i++)
-        cached_linux_groups[i] = (uint32_t) groups[i];
-    cached_ngroups = ngroups;
+    cached_linux_groups[0] = proc_get_gid();
+    cached_ngroups = 1;
 }
 
 static void sysinfo_init_cached_host_state(void)
@@ -501,6 +495,20 @@ int64_t sys_getgroups(guest_t *g, int size, uint64_t list_gva)
         return -LINUX_EFAULT;
 
     return ngroups;
+}
+
+int64_t sys_setgroups(guest_t *g, int size, uint64_t list_gva)
+{
+    if (proc_get_euid() != 0)
+        return -LINUX_EPERM;
+    if (size < 0 || size > (int) ARRAY_SIZE(cached_linux_groups))
+        return -LINUX_EINVAL;
+    if (size > 0 &&
+        guest_read_small(g, list_gva, cached_linux_groups,
+                         (size_t) size * sizeof(cached_linux_groups[0])) < 0)
+        return -LINUX_EFAULT;
+    cached_ngroups = size;
+    return 0;
 }
 
 int64_t sys_getrusage(guest_t *g, int who, uint64_t usage_gva)

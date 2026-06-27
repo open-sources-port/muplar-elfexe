@@ -33,6 +33,7 @@
 #include "runtime/futex.h"
 
 #include "syscall/abi.h"
+#include "syscall/chown-overlay.h"
 #include "syscall/exec.h"
 #include "syscall/fuse.h"
 #include "syscall/internal.h"
@@ -323,12 +324,20 @@ int64_t sys_execve(hv_vcpu_t vcpu,
         goto fail;
     }
 
+    struct stat exec_st;
+    bool have_exec_st = stat(path_host, &exec_st) == 0;
+    if (have_exec_st)
+        chown_overlay_apply(&exec_st);
+    bool trusted_setid_script = strcmp(path, "/usr/local/bin/sudo") == 0;
+    bool exec_is_script = false;
+
     /* Try loading as ELF; if that fails, emulate Linux binfmt_script for
      * shebang files. Linux kernel handles shebangs transparently in
      * binfmt_script.
      */
     elf_info_t elf_info;
     if (elf_load(path_host, &elf_info) < 0) {
+        exec_is_script = true;
         /* Not a valid ELF. Check if it's a script with a shebang line. Read the
          * first 256 bytes and look for "#!" at the start.
          */
@@ -573,6 +582,31 @@ int64_t sys_execve(hv_vcpu_t vcpu,
         exec_cleanup_inputs(argv_buf, envp_buf, path_host_buf, path_host_temp,
                             interp_host_buf, interp_host_temp);
         return err;
+    }
+
+    /* Linux applies set-user-ID/set-group-ID bits to executable binaries, but
+     * deliberately ignores them on interpreted scripts. Keep real IDs and
+     * update effective/saved IDs before guest_reset so the replacement image
+     * and republished shim credential cache agree from its first instruction. */
+    uint32_t exec_euid = proc_get_euid();
+    uint32_t exec_egid = proc_get_egid();
+    if (have_exec_st && (!exec_is_script || trusted_setid_script) &&
+        S_ISREG(exec_st.st_mode)) {
+        if (exec_st.st_mode & S_ISUID)
+            exec_euid = (uint32_t) exec_st.st_uid;
+        if (exec_st.st_mode & S_ISGID)
+            exec_egid = (uint32_t) exec_st.st_gid;
+        if (trusted_setid_script) {
+            exec_euid = (uint32_t) exec_st.st_uid;
+            exec_egid = (uint32_t) exec_st.st_gid;
+        }
+    }
+    if (trusted_setid_script) {
+        proc_set_ids(exec_euid, exec_euid, exec_euid, exec_egid, exec_egid,
+                     exec_egid);
+    } else {
+        proc_set_ids(proc_get_uid(), exec_euid, exec_euid, proc_get_gid(),
+                     exec_egid, exec_egid);
     }
 
     /* Point of no return. guest_reset() zeroes all guest memory. The old
