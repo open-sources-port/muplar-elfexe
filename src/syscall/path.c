@@ -22,6 +22,8 @@
 #include "syscall/proc.h"
 #include "syscall/sidecar.h"
 
+static int dirfd_guest_base_path(guest_fd_t dirfd, char *out, size_t outsz);
+
 #ifndef MAXSYMLINKS
 #define MAXSYMLINKS 40
 #endif
@@ -180,6 +182,24 @@ int path_translate_at(guest_fd_t dirfd,
             tx->intercept_path = tx->guest_buf;
             tx->fuse_path = true;
         }
+    }
+
+    /* Resolve ordinary relative paths in the guest namespace before sysroot
+     * translation. Letting the host openat() follow them directly is incorrect
+     * when a relative entry is an absolute guest symlink: macOS would follow
+     * /usr/... on the host instead of beneath the guest rootfs. */
+    if (tx->guest_path == path && path[0] != '/') {
+        char base[LINUX_PATH_MAX];
+        if (dirfd_guest_base_path(dirfd, base, sizeof(base)) < 0)
+            return -1;
+        int n = snprintf(tx->guest_buf, sizeof(tx->guest_buf), "%s%s%s", base,
+                         !strcmp(base, "/") ? "" : "/", path);
+        if (n < 0 || (size_t) n >= sizeof(tx->guest_buf)) {
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+        tx->guest_path = tx->guest_buf;
+        tx->intercept_path = tx->guest_buf;
     }
 
     errno = 0;

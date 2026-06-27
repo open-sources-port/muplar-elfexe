@@ -3264,6 +3264,20 @@ int proc_intercept_open(const guest_t *g,
         return proc_synthetic_fd(buf, off);
     }
 
+    /* Linux distributions provide real files that package managers update
+     * atomically, so never hide those behind the bootstrap fallback. */
+    if (!strcmp(path, "/etc/passwd") || !strcmp(path, "/etc/group")) {
+        const char *sysroot = proc_get_sysroot();
+        if (sysroot) {
+            char host_path[LINUX_PATH_MAX];
+            int n = snprintf(host_path, sizeof(host_path), "%s%s", sysroot,
+                             path);
+            if (n >= 0 && (size_t) n < sizeof(host_path) &&
+                access(host_path, F_OK) == 0)
+                return PROC_NOT_INTERCEPTED;
+        }
+    }
+
     /* /etc/passwd -> synthetic passwd with root + current user */
     if (!strcmp(path, "/etc/passwd")) {
         return proc_emit_literal(
