@@ -254,9 +254,9 @@ int64_t sys_execve(hv_vcpu_t vcpu,
     char interp_host_buf[LINUX_PATH_MAX];
     bool interp_host_temp = false;
 
-#define MAX_ARGS 256
+#define MAX_ARGS 4096
 #define MAX_ENVS 4096
-#define STR_BUF_SIZE ((size_t) 256 * 1024)
+#define STR_BUF_SIZE ((size_t) 2048 * 1024)
 
     int64_t err = 0;
     char *argv[MAX_ARGS + 1];
