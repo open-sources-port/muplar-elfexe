@@ -1021,9 +1021,12 @@ int64_t sys_fcntl(guest_t *g, int fd, int cmd, uint64_t arg)
         host_fd_ref_close(&host_ref);
         return rc < 0 ? linux_errno() : 0;
     }
-    case 5:   /* F_GETLK */
-    case 6:   /* F_SETLK */
-    case 7: { /* F_SETLKW */
+    case 5:    /* F_GETLK */
+    case 6:    /* F_SETLK */
+    case 7:    /* F_SETLKW */
+    case 36:   /* F_OFD_GETLK */
+    case 37:   /* F_OFD_SETLK */
+    case 38: { /* F_OFD_SETLKW */
         host_fd_ref_t host_ref;
         if (host_fd_ref_open(fd, &host_ref) < 0)
             return -LINUX_EBADF;
@@ -1078,14 +1081,34 @@ int64_t sys_fcntl(guest_t *g, int fd, int cmd, uint64_t arg)
             .l_whence = l_whence, /* SEEK_SET=0, SEEK_CUR=1, SEEK_END=2 same */
         };
 
-        int mac_cmd = (cmd == 5) ? F_GETLK : (cmd == 6) ? F_SETLK : F_SETLKW;
+        int mac_cmd;
+        switch (cmd) {
+        case 5:
+            mac_cmd = F_GETLK;
+            break;
+        case 6:
+            mac_cmd = F_SETLK;
+            break;
+        case 7:
+            mac_cmd = F_SETLKW;
+            break;
+        case 36:
+            mac_cmd = F_OFD_GETLK;
+            break;
+        case 37:
+            mac_cmd = F_OFD_SETLK;
+            break;
+        default:
+            mac_cmd = F_OFD_SETLKW;
+            break;
+        }
         if (fcntl(host_ref.fd, mac_cmd, &mac_fl) < 0) {
             host_fd_ref_close(&host_ref);
             return linux_errno();
         }
 
-        /* For F_GETLK, write back the result */
-        if (cmd == 5) {
+        /* GETLK commands return the conflicting lock description. */
+        if (cmd == 5 || cmd == 36) {
             /* Map macOS l_type back to Linux constants (see above). */
             int16_t rt;
             switch (mac_fl.l_type) {
@@ -1861,8 +1884,27 @@ int64_t sys_linkat(guest_t *g,
     int mac_flags = translate_at_flags(flags);
     if (linkat(olddir_ref.fd, old_tx.host_path, newdir_ref.fd, new_tx.host_path,
                mac_flags) < 0) {
+        int saved_errno = errno;
+        if (saved_errno == EPERM) {
+            struct stat old_st;
+            if (fstatat(olddir_ref.fd, old_tx.host_path, &old_st, AT_SYMLINK_NOFOLLOW) == 0 &&
+                S_ISLNK(old_st.st_mode)) {
+                char target[LINUX_PATH_MAX];
+                ssize_t len = readlinkat(olddir_ref.fd, old_tx.host_path, target, sizeof(target) - 1);
+                if (len >= 0) {
+                    target[len] = '\0';
+                    if (symlinkat(target, newdir_ref.fd, new_tx.host_path) == 0) {
+                        host_fd_ref_close(&olddir_ref);
+                        host_fd_ref_close(&newdir_ref);
+                        return 0;
+                    }
+                    saved_errno = errno;
+                }
+            }
+        }
         host_fd_ref_close(&olddir_ref);
         host_fd_ref_close(&newdir_ref);
+        errno = saved_errno;
         return linux_errno();
     }
 
@@ -2033,8 +2075,16 @@ int64_t sys_fchmodat(guest_t *g,
                      int flags)
 {
     char path[LINUX_PATH_MAX];
-    if (!validate_at_flags(flags, LINUX_AT_SYMLINK_NOFOLLOW))
+    if (!validate_at_flags(
+            flags, LINUX_AT_SYMLINK_NOFOLLOW | LINUX_AT_EMPTY_PATH))
         return -LINUX_EINVAL;
+    if (guest_read_str(g, path_gva, path, sizeof(path)) < 0)
+        return -LINUX_EFAULT;
+    if (path[0] == '\0') {
+        if (!(flags & LINUX_AT_EMPTY_PATH))
+            return -LINUX_ENOENT;
+        return sys_fchmod(dirfd, mode);
+    }
     path_translation_t tx;
     int64_t rc = read_translated_path(
         g, dirfd, path_gva,
@@ -2102,8 +2152,16 @@ int64_t sys_fchownat(guest_t *g,
                      int flags)
 {
     char path[LINUX_PATH_MAX];
-    if (!validate_at_flags(flags, LINUX_AT_SYMLINK_NOFOLLOW))
+    if (!validate_at_flags(
+            flags, LINUX_AT_SYMLINK_NOFOLLOW | LINUX_AT_EMPTY_PATH))
         return -LINUX_EINVAL;
+    if (guest_read_str(g, path_gva, path, sizeof(path)) < 0)
+        return -LINUX_EFAULT;
+    if (path[0] == '\0') {
+        if (!(flags & LINUX_AT_EMPTY_PATH))
+            return -LINUX_ENOENT;
+        return sys_fchown(dirfd, owner, group);
+    }
     path_translation_t tx;
     int64_t rc = read_translated_path(
         g, dirfd, path_gva,

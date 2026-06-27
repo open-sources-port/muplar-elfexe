@@ -457,6 +457,21 @@ static bool sysroot_path_is_contained(const char *resolved_path,
     if (!realpath(sysroot, real_sysroot))
         return false;
 
+    // Check if the resolved_path itself is a guest absolute symbolic link.
+    // Absolute symlinks are always contained within the guest rootfs because
+    // the emulator path translator prepends the sysroot to them.
+    struct stat st;
+    if (lstat(resolved_path, &st) == 0 && S_ISLNK(st.st_mode)) {
+        char target[LINUX_PATH_MAX];
+        ssize_t len = readlink(resolved_path, target, sizeof(target) - 1);
+        if (len >= 0) {
+            target[len] = '\0';
+            if (target[0] == '/') {
+                return true;
+            }
+        }
+    }
+
     if (follow_final) {
         if (!realpath(resolved_path, real_path))
             return false;
@@ -505,13 +520,58 @@ static bool sysroot_path_is_contained(const char *resolved_path,
     return real_path[sr_len] == '\0' || real_path[sr_len] == '/';
 }
 
-static bool sysroot_path_exists(const char *resolved_path, bool follow_final)
+static bool resolve_guest_symlinks_rec(const char *sysroot, const char *path, char *out, size_t outsz, int depth)
 {
-    if (follow_final)
-        return access(resolved_path, F_OK) == 0;
+    if (depth > 16) {
+        return false;
+    }
 
     struct stat st;
-    return lstat(resolved_path, &st) == 0;
+    if (lstat(path, &st) == 0) {
+        if (S_ISLNK(st.st_mode)) {
+            char target[LINUX_PATH_MAX];
+            ssize_t len = readlink(path, target, sizeof(target) - 1);
+            if (len < 0)
+                return false;
+            target[len] = '\0';
+
+            char next_path[LINUX_PATH_MAX];
+            if (target[0] == '/') {
+                snprintf(next_path, sizeof(next_path), "%s%s", sysroot, target);
+            } else {
+                char parent[LINUX_PATH_MAX];
+                str_copy_trunc(parent, path, sizeof(parent));
+                char *slash = strrchr(parent, '/');
+                if (slash) {
+                    *slash = '\0';
+                    snprintf(next_path, sizeof(next_path), "%s/%s", parent, target);
+                } else {
+                    snprintf(next_path, sizeof(next_path), "%s", target);
+                }
+            }
+            return resolve_guest_symlinks_rec(sysroot, next_path, out, outsz, depth + 1);
+        } else {
+            str_copy_trunc(out, path, outsz);
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool sysroot_path_exists(char *resolved_path, size_t bufsz, const char *sysroot, bool follow_final)
+{
+    if (follow_final) {
+        char out[LINUX_PATH_MAX];
+        if (resolve_guest_symlinks_rec(sysroot, resolved_path, out, sizeof(out), 0)) {
+            str_copy_trunc(resolved_path, out, bufsz);
+            return true;
+        }
+        struct stat st;
+        return lstat(resolved_path, &st) == 0;
+    } else {
+        struct stat st;
+        return lstat(resolved_path, &st) == 0;
+    }
 }
 
 /* Resolve an absolute guest path against --sysroot. This keeps absolute guest
@@ -540,13 +600,37 @@ static const char *proc_resolve_sysroot_path_flags(const char *path,
             errno = EINVAL;
         return NULL;
     }
+
+    bool must_resolve = false;
+    if (strncmp(path, "/etc/", 5) == 0 ||
+        strncmp(path, "/usr/", 5) == 0 ||
+        strncmp(path, "/var/", 5) == 0 ||
+        strncmp(path, "/lib/", 5) == 0 ||
+        strncmp(path, "/lib64/", 7) == 0 ||
+        strncmp(path, "/bin/", 5) == 0 ||
+        strncmp(path, "/sbin/", 6) == 0 ||
+        strncmp(path, "/opt/", 5) == 0 ||
+        strncmp(path, "/run/", 5) == 0 ||
+        strncmp(path, "/boot/", 6) == 0 ||
+        strncmp(path, "/sys/", 5) == 0 ||
+        strncmp(path, "/proc/", 6) == 0 ||
+        strncmp(path, "/dev/", 5) == 0 ||
+        strncmp(path, "/home/", 6) == 0 ||
+        strncmp(path, "/root/", 6) == 0) {
+        must_resolve = true;
+    }
+
     bool full_path_truncated = (size_t) n >= bufsz;
-    if (!full_path_truncated && sysroot_path_exists(buf, follow_final)) {
-        if (!sysroot_path_is_contained(buf, sr, follow_final)) {
-            errno = ELOOP;
-            return NULL;
+    if (!full_path_truncated) {
+        if (sysroot_path_exists(buf, bufsz, sr, follow_final)) {
+            if (!sysroot_path_is_contained(buf, sr, follow_final)) {
+                errno = ELOOP;
+                return NULL;
+            }
+            return buf;
+        } else if (must_resolve) {
+            return buf;
         }
-        return buf;
     }
 
     if (full_path_truncated) {
@@ -614,6 +698,25 @@ const char *proc_resolve_sysroot_create_path(const char *path,
     if (!slash || slash == parent)
         return buf;
 
+    bool must_resolve = false;
+    if (strncmp(path, "/etc/", 5) == 0 ||
+        strncmp(path, "/usr/", 5) == 0 ||
+        strncmp(path, "/var/", 5) == 0 ||
+        strncmp(path, "/lib/", 5) == 0 ||
+        strncmp(path, "/lib64/", 7) == 0 ||
+        strncmp(path, "/bin/", 5) == 0 ||
+        strncmp(path, "/sbin/", 6) == 0 ||
+        strncmp(path, "/opt/", 5) == 0 ||
+        strncmp(path, "/run/", 5) == 0 ||
+        strncmp(path, "/boot/", 6) == 0 ||
+        strncmp(path, "/sys/", 5) == 0 ||
+        strncmp(path, "/proc/", 6) == 0 ||
+        strncmp(path, "/dev/", 5) == 0 ||
+        strncmp(path, "/home/", 6) == 0 ||
+        strncmp(path, "/root/", 6) == 0) {
+        must_resolve = true;
+    }
+
     *slash = '\0';
     if (access(parent, F_OK) == 0) {
         if (!sysroot_path_is_contained(parent, sr, true)) {
@@ -630,6 +733,21 @@ const char *proc_resolve_sysroot_create_path(const char *path,
      */
     if (errno != ENOENT && errno != ENOTDIR)
         return NULL;
+
+    if (must_resolve) {
+        if (!create_parents) {
+            if (sysroot_validate_dir_prefix(parent) < 0)
+                return NULL;
+            return buf;
+        }
+        if (sysroot_ensure_dir_exists(parent) < 0)
+            return NULL;
+        if (!sysroot_path_is_contained(parent, sr, true)) {
+            errno = ELOOP;
+            return NULL;
+        }
+        return buf;
+    }
 
     /* Parent doesn't exist in sysroot. Only /tmp, /var/tmp, and ccache get
      * forcefully redirected to the sysroot to avoid host case-collisions;
