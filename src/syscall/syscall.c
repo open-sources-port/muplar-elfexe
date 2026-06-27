@@ -824,8 +824,17 @@ static int64_t sc_kill(guest_t *g,
         }
         return r;
     }
-    if (pid == (int) our_pid || pid == 0 || pid == -1 ||
-        pid == -(int) our_pid) {
+    if (pid == -1) {
+        pid_t child_pids[256];
+        int count = proc_get_child_pids(child_pids, ARRAY_SIZE(child_pids));
+        int delivered = 0;
+        for (int i = 0; i < count; i++) {
+            if (proc_send_guest_signal(child_pids[i], sig) == 0)
+                delivered++;
+        }
+        return delivered > 0 ? 0 : -LINUX_ESRCH;
+    }
+    if (pid == (int) our_pid || pid == 0 || pid == -(int) our_pid) {
         signal_queue(sig);
         return 0;
     }
