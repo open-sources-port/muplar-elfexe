@@ -41,6 +41,13 @@
 #include "syscall/proc.h"
 #include "syscall/signal.h"
 
+static _Thread_local uint64_t expected_exec_elr;
+
+uint64_t exec_expected_elr(void)
+{
+    return expected_exec_elr;
+}
+
 /* fd_cleanup_entry() releases type-specific fd resources after the CLOEXEC
  * entry has been removed from the shared fd table.
  */
@@ -326,17 +333,29 @@ int64_t sys_execve(hv_vcpu_t vcpu,
 
     struct stat exec_st;
     bool have_exec_st = stat(path_host, &exec_st) == 0;
+    if (!have_exec_st) {
+        err = (errno == EACCES) ? -LINUX_EACCES : -LINUX_ENOENT;
+        goto fail;
+    }
     if (have_exec_st)
         chown_overlay_apply(&exec_st);
     bool trusted_setid_script = strcmp(path, "/usr/local/bin/sudo") == 0;
     bool exec_is_script = false;
 
-    /* Try loading as ELF; if that fails, emulate Linux binfmt_script for
-     * shebang files. Linux kernel handles shebangs transparently in
-     * binfmt_script.
-     */
+    /* Detect shebangs before elf_load so valid scripts do not emit its
+     * misleading "not an ELF file" diagnostic. */
+    bool path_is_shebang = false;
+    int probe_fd = open(path_host, O_RDONLY);
+    if (probe_fd >= 0) {
+        unsigned char magic[2];
+        path_is_shebang = read(probe_fd, magic, sizeof(magic)) == 2 &&
+                          magic[0] == '#' && magic[1] == '!';
+        close(probe_fd);
+    }
+
+    /* Try loading as ELF; for scripts, emulate Linux binfmt_script. */
     elf_info_t elf_info;
-    if (elf_load(path_host, &elf_info) < 0) {
+    if (path_is_shebang || elf_load(path_host, &elf_info) < 0) {
         exec_is_script = true;
         /* Not a valid ELF. Check if it's a script with a shebang line. Read the
          * first 256 bytes and look for "#!" at the start.
@@ -806,6 +825,7 @@ int64_t sys_execve(hv_vcpu_t vcpu,
 
         uint64_t entry_ipa = guest_ipa(g, r_entry);
         uint64_t sp_ipa = guest_ipa(g, r_sp);
+        expected_exec_elr = entry_ipa;
 
         hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TTBR0_EL1, r_ttbr0);
         hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TCR_EL1, TCR_EL1_VALUE_KBUF);
@@ -1090,6 +1110,7 @@ int64_t sys_execve(hv_vcpu_t vcpu,
 
     /* Replace the saved syscall-return state with the new program entry. */
     uint64_t entry_ipa = guest_ipa(g, entry_point), sp_ipa = guest_ipa(g, sp);
+    expected_exec_elr = entry_ipa;
 
     /* Switch EL0 translation to the rebuilt page tables. */
     hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TTBR0_EL1, ttbr0);

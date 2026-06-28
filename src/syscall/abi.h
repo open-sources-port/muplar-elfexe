@@ -357,6 +357,7 @@ typedef struct {
 #define LINUX_TIOCSCTTY 0x540E  /* -> macOS TIOCSCTTY (same semantics) */
 #define LINUX_TIOCGWINSZ 0x5413 /* -> macOS TIOCGWINSZ (same struct) */
 #define LINUX_TIOCSWINSZ 0x5414 /* -> macOS TIOCSWINSZ (same struct) */
+#define LINUX_TIOCPKT 0x5420     /* PTY packet mode; request differs on macOS */
 #define LINUX_FIONREAD 0x541B   /* -> macOS FIONREAD (same semantics) */
 #define LINUX_FIONBIO 0x5421    /* set/clear O_NONBLOCK (arg: int *) */
 #define LINUX_FIONCLEX 0x5450   /* clear close-on-exec on fd */

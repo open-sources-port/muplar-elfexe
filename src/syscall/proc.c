@@ -39,6 +39,7 @@
 #include "runtime/futex.h"
 
 #include "syscall/internal.h"
+#include "syscall/exec.h"
 #include "syscall/poll.h"
 #include "syscall/proc-identity.h"
 #include "syscall/proc.h"
@@ -773,6 +774,54 @@ int64_t sys_wait4(guest_t *g,
             } else if (ret == 0) {
                 return 0; /* WNOHANG */
             }
+
+            /* The child-monitor thread may win the host waitpid race after we
+             * drop pid_lock above. In that case the status is already stored
+             * in the process table; return it instead of exposing ECHILD to
+             * the guest process that owns this child. */
+            if (errno == ECHILD) {
+                pthread_mutex_lock(&pid_lock);
+                /* wait4() and the monitor thread race for the same host
+                 * child. ECHILD means the monitor has reaped it, but it may
+                 * still be waiting to acquire pid_lock and publish status.
+                 * Blocking guest waits must wait for that publication rather
+                 * than leaking the transient host ECHILD to dpkg-deb and
+                 * similar process supervisors. */
+                if (!(mac_options & WNOHANG) &&
+                    proc_table[slot].active &&
+                    proc_table[slot].host_pid == host_pid &&
+                    !proc_table[slot].exited) {
+                    struct timespec ts;
+                    timespec_deadline_in_ms(&ts, 1000);
+                    while (proc_table[slot].active &&
+                           proc_table[slot].host_pid == host_pid &&
+                           !proc_table[slot].exited) {
+                        int wait_rc = pthread_cond_timedwait(
+                            &pid_cond, &pid_lock, &ts);
+                        if (wait_rc == ETIMEDOUT)
+                            break;
+                    }
+                }
+                if (proc_table[slot].active &&
+                    proc_table[slot].host_pid == host_pid &&
+                    proc_table[slot].exited) {
+                    int32_t linux_status = proc_table[slot].exit_status;
+                    proc_table[slot].active = false;
+                    pthread_mutex_unlock(&pid_lock);
+                    if (status_gva &&
+                        guest_write_small(g, status_gva, &linux_status,
+                                          sizeof(linux_status)) < 0)
+                        return -LINUX_EFAULT;
+                    if (rusage_gva)
+                        write_rusage_to_guest(g, rusage_gva,
+                                              &(struct rusage) {0});
+                    return gpid;
+                }
+                pthread_mutex_unlock(&pid_lock);
+                if (mac_options & WNOHANG)
+                    return 0;
+                return -LINUX_ECHILD;
+            }
             return linux_errno();
         }
     }
@@ -1229,14 +1278,26 @@ int vcpu_run_loop(hv_vcpu_t vcpu,
                         hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ELR_EL1,
                                             &verify_elr);
                         if (verify_elr == 0) {
-                            log_fatal(
-                                "%s: ELR_EL1=0 after exec, register sync "
-                                "failed",
-                                prefix);
-                            crash_report(vcpu, g, CRASH_ELR_ZERO,
-                                         "ELR_EL1=0 after exec");
-                            exit_code = 128;
-                            running = false;
+                            uint64_t expected = exec_expected_elr();
+                            if (expected != 0) {
+                                log_warn(
+                                    "%s: restoring ELR_EL1 after asynchronous "
+                                    "exec register-write race",
+                                    prefix);
+                                hv_vcpu_set_sys_reg(
+                                    vcpu, HV_SYS_REG_ELR_EL1, expected);
+                                (void) vcpu_get_sysreg(
+                                    vcpu, HV_SYS_REG_ELR_EL1);
+                            } else {
+                                log_fatal(
+                                    "%s: ELR_EL1=0 after exec and no recovery "
+                                    "entry is available",
+                                    prefix);
+                                crash_report(vcpu, g, CRASH_ELR_ZERO,
+                                             "ELR_EL1=0 after exec");
+                                exit_code = 128;
+                                running = false;
+                            }
                         }
                     }
                     break;

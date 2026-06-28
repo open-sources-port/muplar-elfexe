@@ -1600,6 +1600,20 @@ int64_t sys_ioctl(guest_t *g, int fd, uint64_t request, uint64_t arg)
         return rc < 0 ? linux_errno() : 0;
     }
 
+    case LINUX_TIOCPKT: {
+        /* VTE enables packet mode on the PTY master before spawning a shell.
+         * Linux and macOS expose the same operation under different ioctl
+         * request numbers, so forwarding the Linux value produces ENOTTY. */
+        int32_t enabled = 0;
+        if (guest_read_small(g, arg, &enabled, sizeof(enabled)) < 0) {
+            host_fd_ref_close(&host_ref);
+            return -LINUX_EFAULT;
+        }
+        int rc = ioctl(host_fd, TIOCPKT, &enabled);
+        host_fd_ref_close(&host_ref);
+        return rc < 0 ? linux_errno() : 0;
+    }
+
     case LINUX_TCGETS: {
         /* Get terminal attributes. c_cc index mapping is in file-scope
          * linux_mac_cc[].

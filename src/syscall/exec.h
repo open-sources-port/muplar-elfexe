@@ -27,3 +27,6 @@ int64_t sys_execve(hv_vcpu_t vcpu,
                    uint64_t envp_gva,
                    bool verbose,
                    const char *host_path);
+
+/* Intended ELR for the most recent successful exec on this host thread. */
+uint64_t exec_expected_elr(void);

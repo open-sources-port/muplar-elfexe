@@ -1402,6 +1402,35 @@ int64_t sys_clone(hv_vcpu_t vcpu,
      */
     int64_t child_guest_pid = proc_alloc_pid();
 
+    /* A persistent Muplar Linux session needs to cancel one submitted app
+     * without stopping the warm parent VM. Publish the host helper PID through
+     * a manager-owned 0700 directory when explicitly requested. Guest PIDs are
+     * what the shell can report; this mapping crosses the emulation boundary
+     * without exposing it to ordinary guests. */
+    const char *session_map_dir = getenv("MUPLAR_SESSION_MAP_DIR");
+    if (session_map_dir && session_map_dir[0]) {
+        char map_path[LINUX_PATH_MAX];
+        char map_tmp_path[LINUX_PATH_MAX];
+        int map_path_len = snprintf(map_path, sizeof(map_path), "%s/%lld.hostpid",
+                                    session_map_dir, (long long) child_guest_pid);
+        int tmp_len = snprintf(map_tmp_path, sizeof(map_tmp_path),
+                               "%s/%lld.hostpid.%d.tmp", session_map_dir,
+                               (long long) child_guest_pid, (int) getpid());
+        if (map_path_len > 0 && map_path_len < (int) sizeof(map_path) &&
+            tmp_len > 0 && tmp_len < (int) sizeof(map_tmp_path)) {
+            int map_fd = open(map_tmp_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+            if (map_fd >= 0) {
+                char pid_text[32];
+                int pid_len = snprintf(pid_text, sizeof(pid_text), "%d\n",
+                                       (int) child_host_pid);
+                if (write(map_fd, pid_text, (size_t) pid_len) == pid_len)
+                    rename(map_tmp_path, map_path);
+                close(map_fd);
+                unlink(map_tmp_path);
+            }
+        }
+    }
+
     /* Quiesce sibling vCPUs for snapshot consistency. In multithreaded guests,
      * sibling vCPUs may be actively mutating guest memory during the fork
      * snapshot (CoW or legacy IPC copy). Without quiescing them, the child
