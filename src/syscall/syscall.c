@@ -274,6 +274,8 @@ SC_FORWARD(sc_fchdir,      sys_fchdir((int) x0))
 SC_FORWARD(sc_chroot,      sys_chroot(g, x0))
 SC_FORWARD(sc_umask,       (int64_t) umask((mode_t) x0))
 SC_FORWARD(sc_getdents64,  sys_getdents64(g, (int) x0, x1, x2))
+SC_STUB(sc_name_to_handle_at, -LINUX_EOPNOTSUPP)
+SC_STUB(sc_io_submit, -LINUX_EINVAL)
 
 /* FD operations */
 SC_FORWARD(sc_dup,         sys_dup((int) x0))

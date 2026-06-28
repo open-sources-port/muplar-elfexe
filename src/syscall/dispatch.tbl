@@ -43,6 +43,7 @@ SYS_pselect6 sc_pselect6 1
 SYS_ppoll sc_ppoll 1
 
 # Filesystem: open, stat, dir, xattr, permissions
+SYS_name_to_handle_at sc_name_to_handle_at 0
 SYS_openat sc_openat 1
 SYS_openat2 sc_openat2 1
 SYS_close sc_close 0
@@ -196,6 +197,7 @@ SYS_prlimit64 sc_prlimit64 1
 SYS_getrusage sc_getrusage 1
 SYS_getrandom sc_getrandom 0
 SYS_io_destroy sc_io_destroy 1
+SYS_io_submit sc_io_submit 1
 
 # Memory
 SYS_brk sc_brk 0

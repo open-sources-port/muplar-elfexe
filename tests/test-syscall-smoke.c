@@ -513,6 +513,11 @@ static void test_stub_errnos(void)
     EXPECT_ERRNO(syscall(SYS_io_destroy, 1), EINVAL,
                  "io_destroy should fail with EINVAL");
 
+    TEST("io_submit rejects an invalid AIO context");
+    errno = 0;
+    EXPECT_ERRNO(syscall(SYS_io_submit, 17, 1, NULL), EINVAL,
+                 "io_submit should reject an invalid context");
+
     TEST("mincore returns ENOSYS");
     char page[4096];
     unsigned char vec = 0xff;

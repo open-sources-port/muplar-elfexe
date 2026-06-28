@@ -18,6 +18,7 @@
  * include/uapi/asm-generic/unistd.h in Linux source.
  */
 #define SYS_io_destroy 1
+#define SYS_io_submit 2
 #define SYS_getcwd 17
 #define SYS_epoll_create1 20
 #define SYS_epoll_ctl 21
@@ -192,6 +193,7 @@
 /* network batch I/O */
 #define SYS_recvmmsg 243
 #define SYS_sendmmsg 269
+#define SYS_name_to_handle_at 264
 /* file advisory */
 #define SYS_fadvise64 223
 /* vectored positioned I/O */
