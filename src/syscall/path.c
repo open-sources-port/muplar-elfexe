@@ -75,7 +75,7 @@ bool path_might_use_stat_intercept(const char *path)
         return true;
     if (!strncmp(path, "/dev/shm", 8))
         return true;
-    if (!strcmp(path, "/dev/fuse"))
+    if (!strcmp(path, "/dev/fuse") || !strcmp(path, "/dev/ptmx"))
         return true;
     /* glibc ptsname(3) stats /dev/pts/N after TIOCGPTN to confirm the slave
      * exists and is a char device; without this the stat falls through to the
