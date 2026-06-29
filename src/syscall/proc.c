@@ -245,7 +245,7 @@ int rseq_try_abort(guest_t *g,
 int64_t proc_alloc_pid(void)
 {
     pthread_mutex_lock(&pid_lock);
-    int64_t pid = next_guest_pid++;
+    int64_t pid = proc_get_pid() + (next_guest_pid++ * 100000);
     pthread_mutex_unlock(&pid_lock);
     return pid;
 }

@@ -1388,7 +1388,7 @@ int64_t sys_clone(hv_vcpu_t vcpu,
     /* Allocate guest PID before serialization so the child header carries its
      * final Linux-visible identity.
      */
-    int64_t child_guest_pid = proc_alloc_pid();
+    int64_t child_guest_pid = child_host_pid;
 
     /* A persistent Muplar Linux session needs to cancel one submitted app
      * without stopping the warm parent VM. Publish the host helper PID through
