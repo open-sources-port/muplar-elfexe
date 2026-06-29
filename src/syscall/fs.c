@@ -2083,7 +2083,15 @@ int64_t sys_fchmodat(guest_t *g,
     if (path[0] == '\0') {
         if (!(flags & LINUX_AT_EMPTY_PATH))
             return -LINUX_ENOENT;
-        return sys_fchmod(dirfd, mode);
+        host_fd_ref_t host_ref;
+        if (host_fd_ref_open(dirfd, &host_ref) < 0)
+            return -LINUX_EBADF;
+        int64_t ret = 0;
+        if (fchmod(host_ref.fd, mode) < 0) {
+            ret = linux_errno();
+        }
+        host_fd_ref_close(&host_ref);
+        return ret;
     }
     path_translation_t tx;
     int64_t rc = read_translated_path(
@@ -2160,7 +2168,19 @@ int64_t sys_fchownat(guest_t *g,
     if (path[0] == '\0') {
         if (!(flags & LINUX_AT_EMPTY_PATH))
             return -LINUX_ENOENT;
-        return sys_fchown(dirfd, owner, group);
+        host_fd_ref_t host_ref;
+        if (host_fd_ref_open(dirfd, &host_ref) < 0)
+            return -LINUX_EBADF;
+        int host_rc = fchown(host_ref.fd, owner, group);
+        int saved_errno = errno;
+        struct stat host_st;
+        const struct stat *st_ptr = NULL;
+        if (fstat(host_ref.fd, &host_st) == 0)
+            st_ptr = &host_st;
+        errno = saved_errno;
+        int64_t out = chown_result(host_rc, st_ptr, owner, group);
+        host_fd_ref_close(&host_ref);
+        return out;
     }
     path_translation_t tx;
     int64_t rc = read_translated_path(

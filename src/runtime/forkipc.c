@@ -1156,23 +1156,11 @@ static void *vm_clone_thread_run(void *arg)
     log_debug("vm_clone tid=%lld exiting (code=%d)", (long long) t->guest_tid,
               exit_code);
 
-    /* Check if this was the last VM-clone child BEFORE destroying the vCPU,
-     * because thread_interrupt_all needs valid vCPU handles. In real Linux,
-     * child exit delivers exit_signal (SIGCHLD) which interrupts the parent's
-     * futex_wait with -EINTR. The emulator simulates this by requesting
-     * exit_group and interrupting all vCPUs.
-     */
     int last_clone = (thread_count_active_vm_clones() == 0);
 
     if (last_clone) {
         log_debug("last vm_clone exited, triggering exit_group");
         proc_request_exit_group(exit_code);
-        /* Interrupt all vCPUs while the current one is still valid. The main
-         * thread's vCPU may be blocked in hv_vcpu_run; this forces it out so it
-         * can check proc_exit_group_requested. The current vCPU is not in
-         * hv_vcpu_run (loop already exited) so the exit call on it is a
-         * harmless no-op.
-         */
         thread_interrupt_all();
     }
 
@@ -1527,18 +1515,11 @@ int64_t sys_clone(hv_vcpu_t vcpu,
          */
         snapshot_shm_fd = fork_snapshot_shm_via_clonefile(g->shm_fd);
         if (snapshot_shm_fd < 0) {
-            if (g->is_rosetta) {
-                log_warn(
-                    "clone: rosetta CoW snapshot via fclonefileat failed "
-                    "(%s); falling back to region-copy path",
-                    strerror(errno));
-                use_shm = false;
-            } else {
-                log_debug(
-                    "clone: CoW snapshot via fclonefileat failed (%s); "
-                    "sending live shm fd as fallback",
-                    strerror(errno));
-            }
+            log_warn(
+                "clone: CoW snapshot via fclonefileat failed (%s); "
+                "falling back to region-copy path",
+                strerror(errno));
+            use_shm = false;
         }
     }
 

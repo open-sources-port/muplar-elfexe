@@ -71,6 +71,7 @@ static _Thread_local int sigreturn_cookie_depth;
  * thread_entry_t has its own blocked / saved_blocked).
  */
 static pthread_mutex_t sig_lock = PTHREAD_MUTEX_INITIALIZER; /* Lock order: 4 */
+static pthread_cond_t sig_cond = PTHREAD_COND_INITIALIZER;
 
 /* Atomic "maybe pending" hint. signal_queue() sets it before releasing the
  * queue lock, and signal_deliver() clears it after draining visible state. The
@@ -373,6 +374,7 @@ void signal_queue(int signum)
     /* Publish hint before releasing lock so vCPU hot path sees it. */
     atomic_store_explicit(&sig_pending_hint, sig_state.pending,
                           memory_order_release);
+    pthread_cond_broadcast(&sig_cond);
     pthread_mutex_unlock(&sig_lock);
 
     /* Notify any signalfd instances whose mask includes this signal. This makes
@@ -431,6 +433,7 @@ void signal_queue_info(int signum,
         signal_standard_enqueue_locked(signum, &info);
     atomic_store_explicit(&sig_pending_hint, sig_state.pending,
                           memory_order_release);
+    pthread_cond_broadcast(&sig_cond);
     pthread_mutex_unlock(&sig_lock);
     signalfd_notify(signum);
     /* Same shim-globals attention raise as signal_queue: force the fast path
@@ -1152,24 +1155,33 @@ int64_t signal_rt_sigsuspend(guest_t *g, uint64_t mask_gva, uint64_t sigsetsize)
         uint64_t unmaskable = sig_bit(LINUX_SIGKILL) | sig_bit(LINUX_SIGSTOP);
         *blocked = mask & ~unmaskable;
 
-        /* If no signal is pending with the new mask, restore immediately. In a
-         * real kernel, sigsuspend blocks until a signal arrives. Signal
-         * emulation check if any signal became deliverable with the new mask.
-         * If yes, the vCPU loop will deliver it. If no, restore the mask; the
-         * caller will loop (musl retries on -EINTR).
-         */
+        *saved_ptr = saved_blocked;
+        *valid_ptr = true;
+
+        while (!(sig_state.pending & ~*blocked) &&
+               !proc_exit_group_requested()) {
+            struct timespec deadline;
+            clock_gettime(CLOCK_REALTIME, &deadline);
+            deadline.tv_nsec += 10000000;
+            if (deadline.tv_nsec >= 1000000000) {
+                deadline.tv_sec++;
+                deadline.tv_nsec -= 1000000000;
+            }
+            pthread_cond_timedwait(&sig_cond, &sig_lock, &deadline);
+
+            /* Guest interval timers are advanced from the syscall epilogue.
+             * Drop the signal lock while refreshing them to avoid recursive
+             * locking when an expiry queues a signal. */
+            if (!(sig_state.pending & ~*blocked)) {
+                pthread_mutex_unlock(&sig_lock);
+                signal_check_timer();
+                pthread_mutex_lock(&sig_lock);
+            }
+        }
+
         if (!(sig_state.pending & ~*blocked)) {
             *blocked = saved_blocked;
-        }
-        /* If a signal IS pending, the mask stays temporarily modified.
-         * signal_deliver() will execute the handler, and rt_sigreturn will
-         * restore uc_sigmask. But signal delivery needs to set uc_sigmask to
-         * the ORIGINAL mask (saved_blocked), not the sigsuspend mask. Store it
-         * for signal_deliver to use.
-         */
-        else {
-            *saved_ptr = saved_blocked;
-            *valid_ptr = true;
+            *valid_ptr = false;
         }
 
         pthread_mutex_unlock(&sig_lock);
