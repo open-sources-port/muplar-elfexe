@@ -758,11 +758,26 @@ static int proc_alias_self(const char *path, char *alias, size_t alias_sz)
         return 0;
     char *endp;
     long pid = strtol(path + 6, &endp, 10);
-    if (endp == path + 6 || pid != (long) proc_get_pid())
+    if (endp == path + 6)
         return 0;
+
+    long target_pid = (long) proc_get_pid();
+    const char *prefix = "/proc/self";
+
+    if (pid != target_pid) {
+        long ppid = (long) proc_get_ppid();
+        if (ppid > 0 && pid == ppid) {
+            target_pid = ppid;
+            prefix = "/proc/parent";
+        } else {
+            return 0;
+        }
+    }
+
     if (*endp != '\0' && *endp != '/')
         return 0;
-    int n = snprintf(alias, alias_sz, "/proc/self%s", endp);
+    int n = snprintf(alias, alias_sz, "%s%s", prefix, endp);
+    log_error("[elfuse] proc_alias_self: %s -> %s", path, alias);
     if (n < 0 || (size_t) n >= alias_sz) {
         errno = ENAMETOOLONG;
         return -1;
@@ -1176,6 +1191,18 @@ static const char *ensure_proc_tmpdir(const guest_t *g)
     populate_proc_snapshot(g, piddir, "status", "/proc/self/status");
     populate_proc_snapshot(g, piddir, "cmdline", "/proc/self/cmdline");
     populate_proc_snapshot(g, piddir, "maps", "/proc/self/maps");
+
+    long long ppid = (long long) proc_get_ppid();
+    if (ppid > 0) {
+        char ppidbuf[128];
+        snprintf(ppidbuf, sizeof(ppidbuf), "%s/%lld", proc_tmpdir, ppid);
+        if (mkdir(ppidbuf, 0755) == 0 || errno == EEXIST) {
+            populate_proc_snapshot(g, ppidbuf, "stat", "/proc/parent/stat");
+            populate_proc_snapshot(g, ppidbuf, "status", "/proc/parent/status");
+            populate_proc_snapshot(g, ppidbuf, "cmdline", "/proc/parent/cmdline");
+            populate_proc_snapshot(g, ppidbuf, "maps", "/proc/parent/maps");
+        }
+    }
 
     /* Create task subdirectory for /proc/self/task enumeration */
     char taskdir[128];
@@ -2421,6 +2448,19 @@ int proc_intercept_open(const guest_t *g,
         return proc_open_numbered_dir(dir, proc_get_pid(), linux_flags);
     }
 
+    /* /proc/parent -> directory fd for the PPID subdirectory */
+    if (!strcmp(path, "/proc/parent") || !strcmp(path, "/proc/parent/")) {
+        const char *dir = ensure_proc_tmpdir(g);
+        if (!dir)
+            return -1;
+        long long ppid = (long long) proc_get_ppid();
+        if (ppid <= 0) {
+            errno = ENOENT;
+            return -1;
+        }
+        return proc_open_numbered_dir(dir, ppid, linux_flags);
+    }
+
     /* /proc/self/fd -> directory listing of guest-visible file descriptors.
      * Each open gets its own scratch dir so concurrent enumerations cannot
      * mutate one another (see proc_open_fd_scratch).
@@ -2519,6 +2559,35 @@ int proc_intercept_open(const guest_t *g,
         if (buf != stackbuf)
             free(buf);
         return fd;
+    }
+
+    if (!strcmp(path, "/proc/parent/status")) {
+        char parent_comm[16] = "parent";
+        proc_name(getppid(), parent_comm, sizeof(parent_comm));
+        return proc_emit_fmt(
+            "Name:\t%.15s\n"
+            "State:\tR (running)\n"
+            "Tgid:\t%lld\n"
+            "Pid:\t%lld\n"
+            "PPid:\t%lld\n"
+            "Uid:\t%u\t%u\t%u\t%u\n"
+            "Gid:\t%u\t%u\t%u\t%u\n"
+            "VmPeak:\t0 kB\n"
+            "VmSize:\t0 kB\n"
+            "VmRSS:\t0 kB\n"
+            "Threads:\t1\n",
+            parent_comm, (long long) proc_get_ppid(), (long long) proc_get_ppid(),
+            (long long) 1, proc_get_uid(), proc_get_euid(),
+            proc_get_suid(), proc_get_euid(), proc_get_gid(), proc_get_egid(),
+            proc_get_sgid(), proc_get_egid());
+    }
+
+    if (!strcmp(path, "/proc/parent/cmdline")) {
+        return proc_synthetic_fd("", 0);
+    }
+
+    if (!strcmp(path, "/proc/parent/maps")) {
+        return proc_synthetic_fd("", 0);
     }
 
     /* /proc/self/status -> synthetic process status */
@@ -3184,6 +3253,26 @@ int proc_intercept_open(const guest_t *g,
             "cancelled_write_bytes: 0\n");
     }
 
+    if (!strcmp(path, "/proc/parent/stat")) {
+        char parent_comm[16] = "parent";
+        proc_name(getppid(), parent_comm, sizeof(parent_comm));
+        log_error("[elfuse] intercepting /proc/parent/stat: parent_pid=%lld, parent_comm=%s",
+                  (long long) proc_get_ppid(), parent_comm);
+        int fd = proc_emit_fmt(
+            "%lld (%.15s) R %lld %lld %lld 0 -1 0 "        /* 1-9 */
+            "0 0 0 0 0 0 0 0 "                            /* 10-17 */
+            "20 0 1 0 1000 0 0 "                          /* 18-24 */
+            "18446744073709551615 0 0 0 0 0 0 "            /* 25-31 */
+            "0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n", /* 32-52 */
+            (long long) proc_get_ppid(), parent_comm,
+            (long long) 1,
+            (long long) proc_get_ppid(),
+            (long long) proc_get_ppid()
+        );
+        log_error("[elfuse] /proc/parent/stat fd=%d", fd);
+        return fd;
+    }
+
     /* /proc/self/stat -> single-line process stat (man 5 proc). Managed
      * runtimes read this for resource monitoring (utime, stime, rss, vsize).
      * Format: pid (comm) state ppid pgrp session tty_nr tpgid flags ... Fields
@@ -3191,6 +3280,7 @@ int proc_intercept_open(const guest_t *g,
      * stime(15), vsize(23), rss(24). Rest are zero/defaults.
      */
     if (!strcmp(path, "/proc/self/stat")) {
+        log_error("[elfuse] intercepting /proc/self/stat");
         /* Get process CPU times for utime/stime fields */
         struct rusage ru;
         getrusage(RUSAGE_SELF, &ru);
@@ -3221,7 +3311,7 @@ int proc_intercept_open(const guest_t *g,
         return proc_emit_fmt(
             "%lld (%.15s) R %lld %lld %lld 0 -1 0 "        /* 1-9 */
             "0 0 0 0 %ld %ld 0 0 "                         /* 10-17 */
-            "20 0 %d 0 0 %llu %llu "                       /* 18-24 */
+            "20 0 %d 0 1000 %llu %llu "                    /* 18-24 */
             "18446744073709551615 0 0 0 0 0 0 "            /* 25-31 */
             "0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n", /* 32-52 */
             (long long) proc_get_pid(), proc_comm_name(),
@@ -3444,7 +3534,8 @@ int proc_intercept_stat(const char *path, struct stat *st)
                  (long long) proc_get_pid());
         if (!strcmp(path, pidbuf) || !strcmp(path, pidslash) ||
             !strcmp(path, "/proc/1") || !strcmp(path, "/proc/1/") ||
-            !strcmp(path, "/proc/self") || !strcmp(path, "/proc/self/")) {
+            !strcmp(path, "/proc/self") || !strcmp(path, "/proc/self/") ||
+            !strcmp(path, "/proc/parent") || !strcmp(path, "/proc/parent/")) {
             stat_fill_proc_dir(st, 0555, 3, path);
             return 0;
         }
@@ -3528,6 +3619,16 @@ int proc_intercept_stat(const char *path, struct stat *st)
         "/proc/self/auxv",
         "/proc/self/mountinfo",
         "/proc/self/mounts",
+        "/proc/parent/io",
+        "/proc/parent/stat",
+        "/proc/parent/status",
+        "/proc/parent/cmdline",
+        "/proc/parent/maps",
+        "/proc/parent/exe",
+        "/proc/parent/environ",
+        "/proc/parent/auxv",
+        "/proc/parent/mountinfo",
+        "/proc/parent/mounts",
         "/proc/cpuinfo",
         "/proc/meminfo",
         "/proc/stat",
@@ -3622,6 +3723,21 @@ int proc_intercept_readlink(const char *path, char *buf, size_t bufsiz)
      * /opt/sr/bin/ls, matching the chroot-like abstraction the rest of the path
      * layer presents.
      */
+    /* /proc/parent/exe -> path of parent ELF binary */
+    if (!strcmp(path, "/proc/parent/exe")) {
+        char parent_path[PROC_PIDPATHINFO_MAXSIZE];
+        int len = proc_pidpath(getppid(), parent_path, sizeof(parent_path));
+        if (len <= 0) {
+            errno = ENOENT;
+            return -1;
+        }
+        size_t copy_len = (size_t) len;
+        if (copy_len > bufsiz)
+            copy_len = bufsiz;
+        memcpy(buf, parent_path, copy_len);
+        return (int) copy_len;
+    }
+
     if (!strcmp(path, "/proc/self/exe")) {
         /* Under rosetta, readlink("/proc/self/exe") points at the rosetta
          * translator (the binfmt_misc interpreter). Matches the behavior Linux
