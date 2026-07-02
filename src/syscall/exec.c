@@ -1,4 +1,5 @@
-/* execve syscall handler
+/*
+ * execve syscall handler
  *
  * Copyright 2026 elfuse contributors
  * Copyright 2025 Moritz Angermann, zw3rk pte. ltd.
@@ -367,8 +368,6 @@ int64_t sys_execve(hv_vcpu_t vcpu,
             err = -LINUX_E2BIG;
             goto fail;
         }
-        int new_argc = argc - 1 + prefix;
-
         /* Use a fixed-size stack array (MAX_ARGS+3 covers interpreter +
          * optional arg + script + original argv[1:]).
          */

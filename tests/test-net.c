@@ -1,4 +1,5 @@
-/* Test AF_INET/AF_INET6 networking syscalls
+/*
+ * Test AF_INET/AF_INET6 networking syscalls
  *
  * Copyright 2026 elfuse contributors
  * Copyright 2025 Moritz Angermann, zw3rk pte. ltd.
@@ -302,6 +303,31 @@ udp_done:;
     }
 ipv6_done:;
 
+    TEST("IPV6_V6ONLY after bind still fails");
+    {
+        int sock = socket(AF_INET6, SOCK_STREAM, 0);
+        if (sock >= 0) {
+            struct sockaddr_in6 addr6;
+            memset(&addr6, 0, sizeof(addr6));
+            addr6.sin6_family = AF_INET6;
+            addr6.sin6_addr = in6addr_loopback;
+            addr6.sin6_port = 0;
+
+            if (bind(sock, (struct sockaddr *) &addr6, sizeof(addr6)) < 0) {
+                FAIL("bind ::1");
+            } else {
+                int val = 0;
+                errno = 0;
+                int rc = setsockopt(sock, IPPROTO_IPV6, IPV6_V6ONLY, &val,
+                                    sizeof(val));
+                EXPECT_TRUE(rc < 0 && errno == EINVAL,
+                            "setsockopt(IPV6_V6ONLY) did not fail with EINVAL");
+            }
+            close(sock);
+        } else
+            FAIL("socket failed");
+    }
+
     /* Test setsockopt + getsockopt: SO_REUSEADDR */
     TEST("SO_REUSEADDR set+get");
     {
@@ -332,6 +358,58 @@ ipv6_done:;
                 EXPECT_TRUE(val > 0, "SO_SNDBUF is 0");
             } else
                 FAIL("getsockopt failed");
+            close(sock);
+        } else
+            FAIL("socket failed");
+    }
+
+    TEST("cached SO_TYPE setsockopt still fails");
+    {
+        int sock = socket(AF_INET, SOCK_STREAM, 0);
+        if (sock >= 0) {
+            int val = 0;
+            socklen_t len = sizeof(val);
+            if (getsockopt(sock, SOL_SOCKET, SO_TYPE, &val, &len) < 0) {
+                FAIL("getsockopt failed");
+            } else {
+                errno = 0;
+                EXPECT_TRUE(setsockopt(sock, SOL_SOCKET, SO_TYPE, &val,
+                                       sizeof(val)) < 0,
+                            "setsockopt(SO_TYPE) unexpectedly succeeded");
+            }
+            close(sock);
+        } else
+            FAIL("socket failed");
+    }
+
+    TEST("cached SO_SNDLOWAT setsockopt still fails");
+    {
+        int sock = socket(AF_INET, SOCK_STREAM, 0);
+        if (sock >= 0) {
+            int val = 0;
+            socklen_t len = sizeof(val);
+            if (getsockopt(sock, SOL_SOCKET, SO_SNDLOWAT, &val, &len) < 0) {
+                FAIL("getsockopt failed");
+            } else {
+                errno = 0;
+                EXPECT_TRUE(setsockopt(sock, SOL_SOCKET, SO_SNDLOWAT, &val,
+                                       sizeof(val)) < 0,
+                            "setsockopt(SO_SNDLOWAT) unexpectedly succeeded");
+            }
+            close(sock);
+        } else
+            FAIL("socket failed");
+    }
+
+    TEST("SO_ACCEPTCONN setsockopt still fails");
+    {
+        int sock = socket(AF_INET, SOCK_STREAM, 0);
+        if (sock >= 0) {
+            int val = 0;
+            errno = 0;
+            EXPECT_TRUE(setsockopt(sock, SOL_SOCKET, SO_ACCEPTCONN, &val,
+                                   sizeof(val)) < 0,
+                        "setsockopt(SO_ACCEPTCONN) unexpectedly succeeded");
             close(sock);
         } else
             FAIL("socket failed");

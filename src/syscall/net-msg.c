@@ -1,4 +1,5 @@
-/* Socket message syscalls
+/*
+ * Socket message syscalls
  *
  * Copyright 2026 elfuse contributors
  * SPDX-License-Identifier: Apache-2.0
@@ -105,6 +106,34 @@ static void recvmsg_close_host_rights(const void *data_src, size_t data_len)
     const int *fds = (const int *) data_src;
     for (size_t i = 0; i < nfds; i++)
         close(fds[i]);
+}
+
+/* Wire size of a Linux SCM_CREDENTIALS control message: cmsghdr (16) + ucred,
+ * rounded up to the 8-byte cmsg alignment.
+ */
+#define SCM_CRED_CMSG_SPACE \
+    (((size_t) (16 + sizeof(linux_ucred_t)) + 7) & ~(size_t) 7)
+
+/* Pack an SCM_CREDENTIALS control message carrying this process's identity into
+ * dst, which must have room for SCM_CRED_CMSG_SPACE bytes. Zero-fills the
+ * alignment tail so no host stack bytes leak to the guest. Injected on recvmsg
+ * when the guest set SO_PASSCRED, since macOS has no SCM_CREDENTIALS.
+ */
+static void build_scm_cred_cmsg(uint8_t *dst)
+{
+    linux_ucred_t cred = {
+        .pid = (int32_t) proc_get_pid(),
+        .uid = proc_get_uid(),
+        .gid = proc_get_gid(),
+    };
+    uint64_t cred_cmsg_len = 16 + sizeof(cred);
+    int32_t cred_level = 1; /* SOL_SOCKET */
+    int32_t cred_type = LINUX_SCM_CREDENTIALS;
+    memset(dst, 0, SCM_CRED_CMSG_SPACE);
+    memcpy(dst, &cred_cmsg_len, 8);
+    memcpy(dst + 8, &cred_level, 4);
+    memcpy(dst + 12, &cred_type, 4);
+    memcpy(dst + 16, &cred, sizeof(cred));
 }
 
 int64_t sys_sendmsg(guest_t *g, int fd, uint64_t msg_gva, int linux_flags)
@@ -609,23 +638,10 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags)
         if (net_socket_cached_int_get(fd, LINUX_SOL_SOCKET, LINUX_SO_PASSCRED,
                                       &passcred_val) &&
             passcred_val && host_socket_is_unix(host_ref.fd)) {
-            linux_ucred_t cred = {
-                .pid = (int32_t) proc_get_pid(),
-                .uid = proc_get_uid(),
-                .gid = proc_get_gid(),
-            };
-            uint64_t cred_cmsg_len = 16 + sizeof(cred);
-            size_t cred_cmsg_space = (size_t) ((cred_cmsg_len + 7) & ~7ULL);
-            if (lpos + cred_cmsg_space <= lctrl_size &&
-                lpos + cred_cmsg_space <= lmsg.msg_controllen) {
-                int32_t cred_level = 1;
-                int32_t cred_type = LINUX_SCM_CREDENTIALS;
-                memset(linux_ctrl + lpos, 0, cred_cmsg_space);
-                memcpy(linux_ctrl + lpos, &cred_cmsg_len, 8);
-                memcpy(linux_ctrl + lpos + 8, &cred_level, 4);
-                memcpy(linux_ctrl + lpos + 12, &cred_type, 4);
-                memcpy(linux_ctrl + lpos + 16, &cred, sizeof(cred));
-                lpos += cred_cmsg_space;
+            if (lpos + SCM_CRED_CMSG_SPACE <= lctrl_size &&
+                lpos + SCM_CRED_CMSG_SPACE <= lmsg.msg_controllen) {
+                build_scm_cred_cmsg(linux_ctrl + lpos);
+                lpos += SCM_CRED_CMSG_SPACE;
             }
         }
 
@@ -663,33 +679,22 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags)
         }
         free(lctrl_heap);
     } else if (lmsg.msg_control && lmsg.msg_controllen > 0) {
-        int injected = 0, passcred_val = 0;
+        bool injected = false;
+        int passcred_val = 0;
         if (net_socket_cached_int_get(fd, LINUX_SOL_SOCKET, LINUX_SO_PASSCRED,
                                       &passcred_val) &&
             passcred_val && host_socket_is_unix(host_ref.fd)) {
-            linux_ucred_t cred = {
-                .pid = (int32_t) proc_get_pid(),
-                .uid = proc_get_uid(),
-                .gid = proc_get_gid(),
-            };
-            uint64_t cred_cmsg_len = 16 + sizeof(cred);
-            size_t cred_cmsg_space = (size_t) ((cred_cmsg_len + 7) & ~7ULL);
-            if (cred_cmsg_space <= lmsg.msg_controllen &&
-                cred_cmsg_space <= 64) {
+            if (SCM_CRED_CMSG_SPACE <= lmsg.msg_controllen &&
+                SCM_CRED_CMSG_SPACE <= 64) {
                 uint8_t cred_buf[64];
-                int32_t cred_level = 1, cred_type = LINUX_SCM_CREDENTIALS;
-                memset(cred_buf, 0, sizeof(cred_buf));
-                memcpy(cred_buf, &cred_cmsg_len, 8);
-                memcpy(cred_buf + 8, &cred_level, 4);
-                memcpy(cred_buf + 12, &cred_type, 4);
-                memcpy(cred_buf + 16, &cred, sizeof(cred));
+                build_scm_cred_cmsg(cred_buf);
                 if (guest_write_small(g, lmsg.msg_control, cred_buf,
-                                      cred_cmsg_space) == 0) {
-                    uint64_t cred_ctl_len = cred_cmsg_space;
+                                      SCM_CRED_CMSG_SPACE) == 0) {
+                    uint64_t cred_ctl_len = SCM_CRED_CMSG_SPACE;
                     guest_write_small(
                         g, msg_gva + offsetof(linux_msghdr_t, msg_controllen),
                         &cred_ctl_len, sizeof(cred_ctl_len));
-                    injected = 1;
+                    injected = true;
                 }
             }
         }

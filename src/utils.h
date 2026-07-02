@@ -1,4 +1,5 @@
-/* Shared utility helpers
+/*
+ * Shared utility helpers
  *
  * Copyright 2026 elfuse contributors
  * SPDX-License-Identifier: Apache-2.0
@@ -15,6 +16,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
@@ -108,6 +110,34 @@ static inline void close_keep_errno(int fd)
     if (fd >= 0)
         (void) close(fd);
     errno = saved;
+}
+
+/* Create a private per-user scratch directory. mkdir(path, 0700), then tolerate
+ * an already-existing entry only if it is a real directory, owned by the
+ * current uid, with no group/other access bits. That rejects a symlink, a
+ * foreign-owned directory, or a stale world-writable one that a local user
+ * could use to interpose on the contents. The group/other check matters because
+ * an existing 0777 dir owned by this uid would otherwise pass and let other
+ * local users drop files into it.
+ *
+ * Returns 0 on success, -1 with errno set (EACCES when the ownership, type, or
+ * permission check fails). Centralized so every caller applies the same guard;
+ * drift here is a security bug.
+ */
+static inline int create_private_dir(const char *path)
+{
+    if (mkdir(path, 0700) < 0 && errno != EEXIST)
+        return -1;
+
+    struct stat st;
+    if (lstat(path, &st) < 0)
+        return -1;
+    if (!S_ISDIR(st.st_mode) || st.st_uid != getuid() ||
+        (st.st_mode & (S_IRWXG | S_IRWXO)) != 0) {
+        errno = EACCES;
+        return -1;
+    }
+    return 0;
 }
 
 /* Enable an fd flag if it is not already set.

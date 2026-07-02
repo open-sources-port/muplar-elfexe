@@ -1,4 +1,5 @@
-/* Socket/networking syscalls
+/*
+ * Socket/networking syscalls
  *
  * Copyright 2026 elfuse contributors
  * Copyright 2025 Moritz Angermann, zw3rk pte. ltd.
@@ -551,6 +552,45 @@ int64_t sys_connect(guest_t *g, int fd, uint64_t addr_gva, uint32_t addrlen)
     return 0;
 }
 
+/* Convert a resolved macOS sockaddr to Linux form and write it, plus its actual
+ * (untruncated) length, back to the guest, honoring the guest-supplied addrlen
+ * cap. Closes host_ref on every path. Shared tail of getsockname/getpeername.
+ */
+static int64_t sockaddr_writeback(guest_t *g,
+                                  host_fd_ref_t *host_ref,
+                                  const struct sockaddr_storage *mac_sa,
+                                  socklen_t mac_len,
+                                  uint64_t addr_gva,
+                                  uint64_t addrlen_gva,
+                                  uint32_t guest_addrlen)
+{
+    uint8_t linux_sa[128];
+    int out_len =
+        mac_to_linux_sockaddr((const struct sockaddr *) mac_sa, mac_len,
+                              linux_sa, (uint32_t) sizeof(linux_sa));
+    if (out_len < 0) {
+        host_fd_ref_close(host_ref);
+        return -LINUX_EINVAL;
+    }
+
+    uint32_t actual_len = (uint32_t) out_len, write_len = actual_len;
+    if (write_len > guest_addrlen)
+        write_len = guest_addrlen;
+    if (guest_write_small(g, addr_gva, linux_sa, write_len) < 0) {
+        host_fd_ref_close(host_ref);
+        return -LINUX_EFAULT;
+    }
+    /* Write back actual (not truncated) length per Linux semantics */
+    if (guest_write_small(g, addrlen_gva, &actual_len, sizeof(actual_len)) <
+        0) {
+        host_fd_ref_close(host_ref);
+        return -LINUX_EFAULT;
+    }
+
+    host_fd_ref_close(host_ref);
+    return 0;
+}
+
 int64_t sys_getsockname(guest_t *g,
                         int fd,
                         uint64_t addr_gva,
@@ -606,29 +646,8 @@ int64_t sys_getsockname(guest_t *g,
         }
     }
 
-    int out_len = mac_to_linux_sockaddr((struct sockaddr *) &mac_sa, mac_len,
-                                        linux_sa, (uint32_t) sizeof(linux_sa));
-    if (out_len < 0) {
-        host_fd_ref_close(&host_ref);
-        return -LINUX_EINVAL;
-    }
-
-    uint32_t actual_len = (uint32_t) out_len, write_len = actual_len;
-    if (write_len > guest_addrlen)
-        write_len = guest_addrlen;
-    if (guest_write_small(g, addr_gva, linux_sa, write_len) < 0) {
-        host_fd_ref_close(&host_ref);
-        return -LINUX_EFAULT;
-    }
-    /* Write back actual (not truncated) length per Linux semantics */
-    if (guest_write_small(g, addrlen_gva, &actual_len, sizeof(actual_len)) <
-        0) {
-        host_fd_ref_close(&host_ref);
-        return -LINUX_EFAULT;
-    }
-
-    host_fd_ref_close(&host_ref);
-    return 0;
+    return sockaddr_writeback(g, &host_ref, &mac_sa, mac_len, addr_gva,
+                              addrlen_gva, guest_addrlen);
 }
 
 int64_t sys_getpeername(guest_t *g,
@@ -655,30 +674,8 @@ int64_t sys_getpeername(guest_t *g,
         return -LINUX_EFAULT;
     }
 
-    uint8_t linux_sa[128];
-    int out_len = mac_to_linux_sockaddr((struct sockaddr *) &mac_sa, mac_len,
-                                        linux_sa, (uint32_t) sizeof(linux_sa));
-    if (out_len < 0) {
-        host_fd_ref_close(&host_ref);
-        return -LINUX_EINVAL;
-    }
-
-    uint32_t actual_len = (uint32_t) out_len, write_len = actual_len;
-    if (write_len > guest_addrlen)
-        write_len = guest_addrlen;
-    if (guest_write_small(g, addr_gva, linux_sa, write_len) < 0) {
-        host_fd_ref_close(&host_ref);
-        return -LINUX_EFAULT;
-    }
-    /* Write back actual (not truncated) length per Linux semantics */
-    if (guest_write_small(g, addrlen_gva, &actual_len, sizeof(actual_len)) <
-        0) {
-        host_fd_ref_close(&host_ref);
-        return -LINUX_EFAULT;
-    }
-
-    host_fd_ref_close(&host_ref);
-    return 0;
+    return sockaddr_writeback(g, &host_ref, &mac_sa, mac_len, addr_gva,
+                              addrlen_gva, guest_addrlen);
 }
 
 int64_t sys_sendto(guest_t *g,
@@ -833,6 +830,81 @@ int64_t sys_recvfrom(guest_t *g,
     return ret;
 }
 
+/* Translate a Linux (level, optname) socket-option pair to the macOS pair for
+ * the level dispatch common to setsockopt/getsockopt.
+ *
+ * Returns true on success with the mac_level and mac_optname out-params set;
+ * false when the option is unknown for a recognized level (caller returns
+ * -ENOPROTOOPT). Both out-params must be pre-seeded with the Linux values so an
+ * unrecognized level passes through unchanged for the host to reject.
+ *
+ * The small-int options (including all four TCP keepalive/nodelay options) are
+ * handled by translate_small_int_sockopt before this is reached, and
+ * IP_MTU_DISCOVER / IP_RECVERR are handled by an earlier return, so neither
+ * reaches this dispatch.
+ */
+static bool translate_sockopt_level(int level,
+                                    int optname,
+                                    int *mac_level,
+                                    int *mac_optname)
+{
+    if (level == LINUX_SOL_SOCKET) {
+        *mac_level = SOL_SOCKET;
+        *mac_optname = translate_sockopt(optname);
+        return *mac_optname >= 0;
+    }
+    if (level == LINUX_IPPROTO_TCP) {
+        *mac_level = IPPROTO_TCP;
+        return true;
+    }
+    if (level == LINUX_IPPROTO_IP) {
+        *mac_level = IPPROTO_IP;
+        *mac_optname = translate_ip_sockopt_to_mac(optname);
+        return *mac_optname >= 0;
+    }
+    if (level == LINUX_IPPROTO_IPV6) {
+        *mac_level = IPPROTO_IPV6;
+        if (optname == LINUX_IPV6_V6ONLY)
+            *mac_optname = IPV6_V6ONLY;
+    }
+    return true;
+}
+
+static bool cached_setsockopt_may_succeed(int level, int optname)
+{
+    if (level == LINUX_SOL_SOCKET) {
+        switch (optname) {
+        case LINUX_SO_KEEPALIVE:
+        case LINUX_SO_REUSEADDR:
+        case LINUX_SO_REUSEPORT:
+        case LINUX_SO_BROADCAST:
+        case LINUX_SO_DONTROUTE:
+        case LINUX_SO_OOBINLINE:
+        case LINUX_SO_RCVLOWAT:
+        case LINUX_SO_RCVBUF:
+        case LINUX_SO_SNDBUF:
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    return (level == LINUX_IPPROTO_TCP &&
+            (optname == LINUX_TCP_NODELAY || optname == LINUX_TCP_KEEPIDLE ||
+             optname == LINUX_TCP_KEEPINTVL || optname == LINUX_TCP_KEEPCNT)) ||
+           (level == LINUX_IPPROTO_IP &&
+            (optname == LINUX_IP_TOS || optname == LINUX_IP_TTL ||
+             optname == LINUX_IP_HDRINCL || optname == LINUX_IP_PKTINFO ||
+             optname == LINUX_IP_RECVTTL || optname == LINUX_IP_RECVTOS));
+}
+
+static bool readonly_setsockopt(int level, int optname)
+{
+    return level == LINUX_SOL_SOCKET &&
+           (optname == LINUX_SO_TYPE || optname == LINUX_SO_ERROR ||
+            optname == LINUX_SO_ACCEPTCONN || optname == LINUX_SO_SNDLOWAT);
+}
+
 int64_t sys_setsockopt(guest_t *g,
                        int fd,
                        int level,
@@ -906,6 +978,12 @@ int64_t sys_setsockopt(guest_t *g,
         return 0;
     }
 
+    if (readonly_setsockopt(level, optname)) {
+        if (!net_socket_fd_is_valid(fd))
+            return -LINUX_EBADF;
+        return -LINUX_ENOPROTOOPT;
+    }
+
     if (optlen > 0 && optlen <= sizeof(int) && small_int_opt) {
         int value = 0;
         if (guest_read_small(g, optval_gva, &value, optlen) < 0)
@@ -913,7 +991,11 @@ int64_t sys_setsockopt(guest_t *g,
         value = socket_small_int_normalize(level, optname, value);
 
         int cached_value = 0;
-        if (net_socket_cached_int_get(fd, level, optname, &cached_value) &&
+        int cached_mac_level = level, cached_mac_optname = optname;
+        if (cached_setsockopt_may_succeed(level, optname) &&
+            translate_small_int_sockopt(level, optname, &cached_mac_level,
+                                        &cached_mac_optname) &&
+            net_socket_cached_int_get(fd, level, optname, &cached_value) &&
             cached_value == value)
             return 0;
     }
@@ -929,45 +1011,9 @@ int64_t sys_setsockopt(guest_t *g,
         goto setsockopt_translated;
     }
 
-    if (level == LINUX_SOL_SOCKET) {
-        mac_level = SOL_SOCKET;
-        mac_optname = translate_sockopt(optname);
-        if (mac_optname < 0) {
-            host_fd_ref_close(&host_ref);
-            return -LINUX_ENOPROTOOPT;
-        }
-    } else if (level == LINUX_IPPROTO_TCP) {
-        mac_level = IPPROTO_TCP;
-        switch (optname) {
-        case LINUX_TCP_NODELAY:
-            mac_optname = TCP_NODELAY;
-            break;
-        case LINUX_TCP_KEEPIDLE:
-            mac_optname = TCP_KEEPALIVE;
-            break;
-        case LINUX_TCP_KEEPINTVL:
-            mac_optname = 0x101;
-            break; /* TCP_KEEPINTVL */
-        case LINUX_TCP_KEEPCNT:
-            mac_optname = 0x102;
-            break; /* TCP_KEEPCNT */
-        default:
-            break;
-        }
-    } else if (level == LINUX_IPPROTO_IP) {
-        mac_level = IPPROTO_IP;
-        mac_optname = translate_ip_sockopt_to_mac(optname);
-        /* IP_MTU_DISCOVER and IP_RECVERR are handled by the early return above
-         * (before host_fd_ref_open), so they never reach here.
-         */
-        if (mac_optname < 0) {
-            host_fd_ref_close(&host_ref);
-            return -LINUX_ENOPROTOOPT;
-        }
-    } else if (level == LINUX_IPPROTO_IPV6) {
-        mac_level = IPPROTO_IPV6;
-        if (optname == LINUX_IPV6_V6ONLY)
-            mac_optname = IPV6_V6ONLY;
+    if (!translate_sockopt_level(level, optname, &mac_level, &mac_optname)) {
+        host_fd_ref_close(&host_ref);
+        return -LINUX_ENOPROTOOPT;
     }
 
 setsockopt_translated:
@@ -983,20 +1029,11 @@ setsockopt_translated:
         }
         value = socket_small_int_normalize(level, optname, value);
 
-        if ((level == LINUX_SOL_SOCKET &&
-             (optname == LINUX_SO_KEEPALIVE || optname == LINUX_SO_REUSEADDR ||
-              optname == LINUX_SO_DONTROUTE ||
-              optname == LINUX_SO_OOBINLINE)) ||
-            (level == LINUX_IPPROTO_TCP && optname == LINUX_TCP_NODELAY)) {
-            int cached_value = 0;
-            if (net_socket_cached_int_get(fd, level, optname, &cached_value) &&
-                cached_value == value) {
-                host_fd_ref_close(&host_ref);
-                return 0;
-            }
-        }
-
-        /* Linux accepts shorter optlen for many int-valued options and
+        /* The cached-value short-circuit (return 0 when the socket already
+         * holds this value) ran before host_fd_ref_open for every small-int
+         * option with optlen > 0, so it is not repeated here.
+         *
+         * Linux accepts shorter optlen for many int-valued options and
          * zero-extends the value. macOS rejects optlen < sizeof(int) with
          * EINVAL (notably for IP_TOS / IP_TTL / IP_PKTINFO / IP_RECVTTL /
          * IP_RECVTOS). The value has already been zero-extended into an int, so
@@ -1141,45 +1178,9 @@ int64_t sys_getsockopt(guest_t *g,
         goto getsockopt_translated;
     }
 
-    if (level == LINUX_SOL_SOCKET) {
-        mac_level = SOL_SOCKET;
-        mac_optname = translate_sockopt(optname);
-        if (mac_optname < 0) {
-            host_fd_ref_close(&host_ref);
-            return -LINUX_ENOPROTOOPT;
-        }
-    } else if (level == LINUX_IPPROTO_TCP) {
-        mac_level = IPPROTO_TCP;
-        switch (optname) {
-        case LINUX_TCP_NODELAY:
-            mac_optname = TCP_NODELAY;
-            break;
-        case LINUX_TCP_KEEPIDLE:
-            mac_optname = TCP_KEEPALIVE;
-            break;
-        case LINUX_TCP_KEEPINTVL:
-            mac_optname = 0x101;
-            break;
-        case LINUX_TCP_KEEPCNT:
-            mac_optname = 0x102;
-            break;
-        default:
-            break;
-        }
-    } else if (level == LINUX_IPPROTO_IP) {
-        mac_level = IPPROTO_IP;
-        mac_optname = translate_ip_sockopt_to_mac(optname);
-        /* IP_MTU_DISCOVER and IP_RECVERR are handled by the early return above
-         * (before host_fd_ref_open), so they never reach here.
-         */
-        if (mac_optname < 0) {
-            host_fd_ref_close(&host_ref);
-            return -LINUX_ENOPROTOOPT;
-        }
-    } else if (level == LINUX_IPPROTO_IPV6) {
-        mac_level = IPPROTO_IPV6;
-        if (optname == LINUX_IPV6_V6ONLY)
-            mac_optname = IPV6_V6ONLY;
+    if (!translate_sockopt_level(level, optname, &mac_level, &mac_optname)) {
+        host_fd_ref_close(&host_ref);
+        return -LINUX_ENOPROTOOPT;
     }
 
 getsockopt_translated:

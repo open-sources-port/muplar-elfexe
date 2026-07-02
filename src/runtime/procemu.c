@@ -1,4 +1,5 @@
-/* /proc and /dev path emulation
+/*
+ * /proc and /dev path emulation
  *
  * Copyright 2026 elfuse contributors
  * Copyright 2025 Moritz Angermann, zw3rk pte. ltd.
@@ -470,27 +471,13 @@ static void shm_dir_init(void)
     shm_dir_errno = EACCES;
     snprintf(shm_dir, sizeof(shm_dir), "/tmp/elfuse-shm-%u",
              (unsigned) getuid());
-    if (mkdir(shm_dir, 0700) < 0 && errno != EEXIST) {
-        shm_dir_errno = errno;
-        shm_dir[0] = '\0';
-        return;
-    }
-    /* Verify the path is a directory owned by the current UID (not a symlink).
+    /* create_private_dir rejects a symlink or foreign-owned directory that a
+     * local user could have pre-planted at this guessable /tmp path.
      */
-    struct stat st;
-    if (lstat(shm_dir, &st) < 0) {
+    if (create_private_dir(shm_dir) < 0) {
         shm_dir_errno = errno;
-        log_error("/dev/shm dir %s: lstat failed: %s", shm_dir,
+        log_error("/dev/shm dir %s: not a private directory: %s", shm_dir,
                   strerror(errno));
-        shm_dir[0] = '\0';
-        return;
-    }
-    if (!S_ISDIR(st.st_mode) || st.st_uid != getuid()) {
-        shm_dir_errno = EACCES;
-        log_error(
-            "/dev/shm dir %s is not a directory owned by "
-            "uid %u",
-            shm_dir, (unsigned) getuid());
         shm_dir[0] = '\0';
         return;
     }
@@ -2277,6 +2264,373 @@ static int pty_open_master(int linux_flags)
     return master;
 }
 
+/* Emit /proc/self/maps into a synthetic fd. Merges contiguous regions[] runs
+ * that came from one mmap, then folds in preannounced[] shadow entries whose
+ * advertised interval is not yet fully covered by live regions.
+ *
+ * Returns a host fd, or -1 on error. Split out of proc_intercept_open to keep
+ * that dispatcher readable.
+ */
+static int proc_open_self_maps(const guest_t *g)
+{
+    /* Heap-allocated: guest threads run on host pthreads whose stacks do not
+     * comfortably hold a 16KiB frame.
+     */
+    const size_t bufsz = 16384;
+    char *buf = malloc(bufsz);
+    if (!buf)
+        return -1;
+    int off = 0;
+
+    /* Build a flat array of (va_start, va_end, prot, flags, offset, name) from
+     * regions[] plus /proc/self/maps-only preannounced[] entries.
+     * preannounced[] is intentionally NOT consulted by mmap conflict detection,
+     * so advertise-only Rosetta/JIT regions do not trip MAP_FIXED_NOREPLACE
+     * with -EEXIST.
+     *
+     * entries is heap-allocated: MAPS_ENTRY_MAX * sizeof(maps_entry_t) is
+     * ~24KiB, too large for a guest-thread pthread stack.
+     */
+    maps_entry_t *entries = calloc(MAPS_ENTRY_MAX, sizeof(*entries));
+    if (!entries) {
+        free(buf);
+        return -1;
+    }
+    int nentries = 0;
+
+    /* Convert regions[] to maps entries. regions[] is already sorted by start
+     * address; merge contiguous runs that came from one mmap.
+     */
+    for (int i = 0; i < g->nregions && nentries < MAPS_ENTRY_MAX; i++) {
+        const guest_region_t *r = &g->regions[i];
+        uint64_t start = r->start & ~0xFFFULL;
+        uint64_t end = (r->end + 0xFFF) & ~0xFFFULL;
+
+        if (nentries > 0 && entries[nentries - 1].end == start &&
+            entries[nentries - 1].prot == r->prot &&
+            entries[nentries - 1].flags == r->flags &&
+            entries[nentries - 1].offset == r->offset &&
+            !strcmp(entries[nentries - 1].name, r->name)) {
+            entries[nentries - 1].end = end;
+            continue;
+        }
+        maps_entry_insert(entries, &nentries, start, end, r->prot, r->flags,
+                          r->offset, r->name);
+    }
+
+    /* Add preannounced entries only while they still have an uncovered tail.
+     * Once the union of live regions covers the full advertised interval,
+     * suppress the shadow entry so /proc/self/maps shows only the realized
+     * split VMAs. A partial union must stay visible because some
+     * reserved-but-not-realized span remains to advertise.
+     */
+    for (int i = 0; i < g->npreannounced && nentries < MAPS_ENTRY_MAX; i++) {
+        const guest_region_t *r = &g->preannounced[i];
+        bool shadowed = false;
+        uint64_t covered_end = r->start;
+
+        for (int j = 0; j < g->nregions; j++) {
+            const guest_region_t *live = &g->regions[j];
+
+            if (live->end <= covered_end)
+                continue;
+            if (live->start > covered_end)
+                break;
+
+            covered_end = live->end;
+            if (covered_end >= r->end) {
+                shadowed = true;
+                break;
+            }
+        }
+
+        if (shadowed)
+            continue;
+
+        maps_entry_insert(entries, &nentries, r->start & ~0xFFFULL,
+                          (r->end + 0xFFFULL) & ~0xFFFULL, r->prot, r->flags,
+                          r->offset, r->name);
+    }
+    maps_entries_merge_adjacent(entries, &nentries);
+
+    /* Emit lines after merging so buffer accounting is centralized. */
+    for (int i = 0; i < nentries && off < (int) bufsz - 256; i++) {
+        const maps_entry_t *e = &entries[i];
+        char perms[5];
+        perms[0] = (e->prot & 0x1) ? 'r' : '-';
+        perms[1] = (e->prot & 0x2) ? 'w' : '-';
+        perms[2] = (e->prot & 0x4) ? 'x' : '-';
+        perms[3] = (e->flags & 0x01) ? 's' : 'p';
+        perms[4] = '\0';
+
+        /* Format matches real Linux /proc/<pid>/maps exactly:
+         *   %lx-%lx %s %08lx %02x:%02x %lu  <padding>  %s\n
+         * Verified against strace in a real Lima VZ VM.
+         */
+        char line[256];
+        int lineoff =
+            snprintf(line, sizeof(line), "%llx-%llx %s %08llx 00:00 0",
+                     (unsigned long long) e->start, (unsigned long long) e->end,
+                     perms, (unsigned long long) e->offset);
+        /* Cap lineoff to buffer size (snprintf may return more than available
+         * on truncation)
+         */
+        if (lineoff >= (int) sizeof(line))
+            lineoff = (int) sizeof(line) - 1;
+        if (e->name[0]) {
+            while (lineoff < MAPS_NAME_COLUMN &&
+                   lineoff < (int) sizeof(line) - 1)
+                line[lineoff++] = ' ';
+            int n =
+                snprintf(line + lineoff, sizeof(line) - lineoff, "%s", e->name);
+            if (n > 0)
+                lineoff += n;
+            if (lineoff >= (int) sizeof(line))
+                lineoff = (int) sizeof(line) - 1;
+        } else if (lineoff < (int) sizeof(line) - 1) {
+            line[lineoff++] = ' ';
+        }
+        int wrote = snprintf(buf + off, bufsz - off, "%.*s\n", lineoff, line);
+        if (wrote > 0 && off + wrote < (int) bufsz)
+            off += wrote;
+        else
+            break; /* Stop before truncating a maps line. */
+    }
+
+    log_debug("/proc/self/maps (%d bytes):\n%.*s", off, off, buf);
+    int fd = proc_synthetic_fd(buf, off);
+    free(entries);
+    free(buf);
+    return fd;
+}
+
+/* Emit /proc/meminfo from host sysctl (HW_MEMSIZE) plus mach vm_statistics64,
+ * approximating the Linux fields macOS does not expose.
+ *
+ * Returns a host fd, or -1. Split out of proc_intercept_open to keep that
+ * dispatcher readable.
+ */
+static int proc_open_meminfo(void)
+{
+    int64_t physmem = 0;
+    size_t sz = sizeof(physmem);
+    int mib[2] = {CTL_HW, HW_MEMSIZE};
+    sysctl(mib, 2, &physmem, &sz, NULL, 0);
+    uint64_t total_kb = (uint64_t) physmem / 1024;
+
+    /* Query host vm_statistics for accurate free/active/inactive. Falls back to
+     * approximations if the mach call fails.
+     */
+    uint64_t free_kb, avail_kb, buffers_kb, cached_kb;
+    vm_statistics64_data_t vm_stat = {0};
+    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+    uint64_t page_size = 4096;
+    if (host_statistics64(mach_host_self(), HOST_VM_INFO64,
+                          (host_info64_t) &vm_stat, &count) == KERN_SUCCESS) {
+        host_page_size(mach_host_self(), (vm_size_t *) &page_size);
+        free_kb = (uint64_t) vm_stat.free_count * page_size / 1024;
+        uint64_t inactive_kb =
+            (uint64_t) vm_stat.inactive_count * page_size / 1024;
+        uint64_t purgeable_kb =
+            (uint64_t) vm_stat.purgeable_count * page_size / 1024;
+        /* Available ~= free + inactive + purgeable (Linux heuristic) */
+        avail_kb = free_kb + inactive_kb + purgeable_kb;
+        if (avail_kb > total_kb)
+            avail_kb = total_kb;
+        cached_kb = inactive_kb + purgeable_kb;
+        buffers_kb = 0; /* macOS does not expose buffer cache separately */
+    } else {
+        free_kb = total_kb / 2;
+        avail_kb = total_kb * 3 / 4;
+        buffers_kb = total_kb / 20;
+        cached_kb = total_kb / 4;
+    }
+
+    /* Saturating subtraction. On macOS free + cached (inactive + purgeable) can
+     * exceed physical total, which would unsigned-underflow these derived
+     * fields into absurd values.
+     */
+    uint64_t fc_kb = free_kb + cached_kb;
+    uint64_t active_kb = total_kb > fc_kb ? total_kb - fc_kb : 0;
+    uint64_t anon_kb =
+        total_kb > fc_kb + buffers_kb ? total_kb - fc_kb - buffers_kb : 0;
+
+    return proc_emit_fmt(
+        "MemTotal:       %llu kB\n"
+        "MemFree:        %llu kB\n"
+        "MemAvailable:   %llu kB\n"
+        "Buffers:        %llu kB\n"
+        "Cached:         %llu kB\n"
+        "SwapCached:     0 kB\n"
+        "Active:         %llu kB\n"
+        "Inactive:       %llu kB\n"
+        "SwapTotal:      0 kB\n"
+        "SwapFree:       0 kB\n"
+        "Dirty:          0 kB\n"
+        "Writeback:      0 kB\n"
+        "AnonPages:      %llu kB\n"
+        "Mapped:         %llu kB\n"
+        "Shmem:          0 kB\n"
+        "Slab:           0 kB\n"
+        "SReclaimable:   0 kB\n"
+        "SUnreclaim:     0 kB\n"
+        "KernelStack:    0 kB\n"
+        "PageTables:     0 kB\n"
+        "CommitLimit:    %llu kB\n"
+        "Committed_AS:   0 kB\n"
+        "VmallocTotal:   0 kB\n"
+        "VmallocUsed:    0 kB\n"
+        "VmallocChunk:   0 kB\n",
+        (unsigned long long) total_kb, (unsigned long long) free_kb,
+        (unsigned long long) avail_kb, (unsigned long long) buffers_kb,
+        (unsigned long long) cached_kb, (unsigned long long) active_kb,
+        (unsigned long long) (cached_kb / 2), (unsigned long long) anon_kb,
+        (unsigned long long) (cached_kb / 2),
+        (unsigned long long) (total_kb / 2));
+}
+
+/* Handle /proc/self/task/<tid>/{stat,status} and the <tid> directory itself.
+ * path must start with "/proc/self/task/".
+ *
+ * Returns a host fd, -1 on a matched failure, or PROC_NOT_INTERCEPTED (-2) when
+ * the tid is unparseable or the leaf is unknown. Split out of
+ * proc_intercept_open to keep that dispatcher readable.
+ */
+static int proc_open_self_task_node(const char *path, int linux_flags)
+{
+    char *endp;
+    long tid = strtol(path + 16, &endp, 10);
+    if (endp == path + 16 || tid <= 0)
+        return PROC_NOT_INTERCEPTED;
+
+    /* Verify this TID is actually active */
+    if (!thread_tid_alive((int64_t) tid)) {
+        errno = ENOENT;
+        return -1;
+    }
+
+    if (!strcmp(endp, "/stat")) {
+        return proc_emit_fmt(
+            "%ld (%.15s) R %lld %lld %lld 0 0 0 0 0 0 0 0 0 0 0 "
+            "20 0 %d 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 "
+            "0 0 0 0 0 0 0 0\n",
+            tid, proc_comm_name(), (long long) proc_get_ppid(),
+            (long long) proc_get_pid(), /* pgid */
+            (long long) proc_get_sid(), thread_active_count());
+    }
+
+    if (!strcmp(endp, "/status")) {
+        return proc_emit_fmt(
+            "Name:\t%.15s\n"
+            "State:\tR (running)\n"
+            "Tgid:\t%lld\n"
+            "Pid:\t%ld\n"
+            "PPid:\t%lld\n"
+            "Uid:\t%u\t%u\t%u\t%u\n"
+            "Gid:\t%u\t%u\t%u\t%u\n"
+            "Threads:\t%d\n",
+            proc_comm_name(), (long long) proc_get_pid(), tid,
+            (long long) proc_get_ppid(), proc_get_uid(), proc_get_euid(),
+            proc_get_suid(), proc_get_euid(), proc_get_gid(), proc_get_egid(),
+            proc_get_sgid(), proc_get_egid(), thread_active_count());
+    }
+
+    /* /proc/self/task/<tid> directory itself: synthesize a dir with stat/status
+     * placeholder entries. Persistent so getdents sees the entries on macOS
+     * (which cannot enumerate unlinked dirs).
+     */
+    if (*endp == '\0' || !strcmp(endp, "/")) {
+        static proc_persistent_dir_t tiddir =
+            PROC_PERSISTENT_DIR("/tmp/elfuse-tid-XXXXXX");
+        const char *dir = proc_persistent_dir_acquire(&tiddir);
+        if (!dir)
+            return -1;
+
+        char p[160];
+        snprintf(p, sizeof(p), "%s/stat", dir);
+        close(open(p, O_CREAT | O_WRONLY, 0444));
+        snprintf(p, sizeof(p), "%s/status", dir);
+        close(open(p, O_CREAT | O_WRONLY, 0444));
+
+        int fd = proc_open_dir_fd(dir, linux_flags);
+        proc_persistent_dir_release(&tiddir);
+        return fd;
+    }
+
+    return PROC_NOT_INTERCEPTED; /* unknown /proc/self/task/<tid>/XXX */
+}
+
+/* Handle the mount-table /proc nodes: /proc/filesystems, /proc/self/mountinfo,
+ * and /proc/{mounts,self/mounts} plus /etc/mtab.
+ *
+ * Returns a host fd, -1 on a matched failure, or PROC_NOT_INTERCEPTED when path
+ * is none of them. Split out of proc_intercept_open to keep that dispatcher
+ * readable.
+ */
+static int proc_open_mounts_node(const char *path)
+{
+    if (!strcmp(path, "/proc/filesystems")) {
+        return proc_emit_literal(
+            "\tmpfs\n"
+            "\tproc\n"
+            "\tsysfs\n"
+            "\tdevtmpfs\n"
+            "\tfuse\n"
+            "\text4\n"
+            "\tvfat\n");
+    }
+
+    /* /proc/self/mountinfo -> Linux mountinfo format (different from
+     * /proc/mounts). Format: id parent_id major:minor root mount_point options
+     * - type source super_options
+     */
+    if (!strcmp(path, "/proc/self/mountinfo")) {
+        const size_t bufsz = 8192;
+        char *buf = malloc(bufsz);
+        if (!buf)
+            return -1;
+        size_t off = (size_t) snprintf(
+            buf, bufsz,
+            "1 0 0:1 / / rw,relatime - ext4 /dev/root rw\n"
+            "2 1 0:2 / /proc rw,nosuid,nodev,noexec - proc proc rw\n"
+            "3 1 0:3 / /tmp rw,nosuid,nodev - tmpfs tmpfs rw\n"
+            "4 1 0:4 / /dev rw,nosuid - devtmpfs devtmpfs rw\n"
+            "5 4 0:5 / /dev/shm rw,nosuid,nodev - tmpfs tmpfs rw\n");
+        if (off >= bufsz || fuse_append_mountinfo(buf, bufsz, &off) < 0) {
+            free(buf);
+            return -1;
+        }
+        int fd = proc_synthetic_fd(buf, off);
+        free(buf);
+        return fd;
+    }
+
+    /* /proc/mounts, /etc/mtab -> synthetic mount table */
+    if (!strcmp(path, "/proc/mounts") || !strcmp(path, "/proc/self/mounts") ||
+        !strcmp(path, "/etc/mtab")) {
+        const size_t bufsz = 8192;
+        char *buf = malloc(bufsz);
+        if (!buf)
+            return -1;
+        size_t off =
+            (size_t) snprintf(buf, bufsz,
+                              "/ / ext4 rw,relatime 0 0\n"
+                              "proc /proc proc rw,nosuid,nodev,noexec 0 0\n"
+                              "tmpfs /tmp tmpfs rw,nosuid,nodev 0 0\n"
+                              "devtmpfs /dev devtmpfs rw,nosuid 0 0\n"
+                              "tmpfs /dev/shm tmpfs rw,nosuid,nodev 0 0\n");
+        if (off >= bufsz || fuse_append_mounts(buf, bufsz, &off) < 0) {
+            free(buf);
+            return -1;
+        }
+        int fd = proc_synthetic_fd(buf, off);
+        free(buf);
+        return fd;
+    }
+
+    return PROC_NOT_INTERCEPTED;
+}
+
 int proc_intercept_open(const guest_t *g,
                         const char *path,
                         int linux_flags,
@@ -2627,70 +2981,9 @@ int proc_intercept_open(const guest_t *g,
         return fd;
     }
 
-    /* /proc/self/task/<tid>/stat -> per-thread stat line */
-    if (!strncmp(path, "/proc/self/task/", 16)) {
-        char *endp;
-        long tid = strtol(path + 16, &endp, 10);
-        if (endp == path + 16 || tid <= 0)
-            return -2; /* not intercepted */
-
-        /* Verify this TID is actually active */
-        if (!thread_tid_alive((int64_t) tid)) {
-            errno = ENOENT;
-            return -1;
-        }
-
-        if (!strcmp(endp, "/stat")) {
-            return proc_emit_fmt(
-                "%ld (%.15s) R %lld %lld %lld 0 0 0 0 0 0 0 0 0 0 0 "
-                "20 0 %d 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 "
-                "0 0 0 0 0 0 0 0\n",
-                tid, proc_comm_name(), (long long) proc_get_ppid(),
-                (long long) proc_get_pid(), /* pgid */
-                (long long) proc_get_sid(), thread_active_count());
-        }
-
-        if (!strcmp(endp, "/status")) {
-            return proc_emit_fmt(
-                "Name:\t%.15s\n"
-                "State:\tR (running)\n"
-                "Tgid:\t%lld\n"
-                "Pid:\t%ld\n"
-                "PPid:\t%lld\n"
-                "Uid:\t%u\t%u\t%u\t%u\n"
-                "Gid:\t%u\t%u\t%u\t%u\n"
-                "Threads:\t%d\n",
-                proc_comm_name(), (long long) proc_get_pid(), tid,
-                (long long) proc_get_ppid(), proc_get_uid(), proc_get_euid(),
-                proc_get_suid(), proc_get_euid(), proc_get_gid(),
-                proc_get_egid(), proc_get_sgid(), proc_get_egid(),
-                thread_active_count());
-        }
-
-        /* /proc/self/task/<tid> directory itself: synthesize a dir with
-         * stat/status placeholder entries. Persistent so getdents sees the
-         * entries on macOS (which cannot enumerate unlinked dirs).
-         */
-        if (*endp == '\0' || !strcmp(endp, "/")) {
-            static proc_persistent_dir_t tiddir =
-                PROC_PERSISTENT_DIR("/tmp/elfuse-tid-XXXXXX");
-            const char *dir = proc_persistent_dir_acquire(&tiddir);
-            if (!dir)
-                return -1;
-
-            char p[160];
-            snprintf(p, sizeof(p), "%s/stat", dir);
-            close(open(p, O_CREAT | O_WRONLY, 0444));
-            snprintf(p, sizeof(p), "%s/status", dir);
-            close(open(p, O_CREAT | O_WRONLY, 0444));
-
-            int fd = proc_open_dir_fd(dir, linux_flags);
-            proc_persistent_dir_release(&tiddir);
-            return fd;
-        }
-
-        return -2; /* unknown /proc/self/task/<tid>/XXX */
-    }
+    /* /proc/self/task/<tid>/{stat,status} and the <tid> directory. */
+    if (!strncmp(path, "/proc/self/task/", 16))
+        return proc_open_self_task_node(path, linux_flags);
 
     /* /proc/self/maps -> generated from guest region tracking. Addresses are
      * page-aligned (rounded down/up) to match real Linux behavior. Output
@@ -2699,123 +2992,8 @@ int proc_intercept_open(const guest_t *g,
      * mmap() call produces one maps entry even when the backing pages span
      * multiple physical frames.
      */
-    if (!strcmp(path, "/proc/self/maps")) {
-        char buf[16384];
-        int off = 0;
-
-        /* Build a flat array of (va_start, va_end, prot, flags, offset, name)
-         * from regions[] plus /proc/self/maps-only preannounced[] entries.
-         * preannounced[] is intentionally NOT consulted by mmap conflict
-         * detection, so advertise-only Rosetta/JIT regions do not trip
-         * MAP_FIXED_NOREPLACE with -EEXIST.
-         */
-        maps_entry_t entries[MAPS_ENTRY_MAX];
-        int nentries = 0;
-
-        /* Convert regions[] to maps entries. regions[] is already sorted by
-         * start address; merge contiguous runs that came from one mmap.
-         */
-        for (int i = 0; i < g->nregions && nentries < MAPS_ENTRY_MAX; i++) {
-            const guest_region_t *r = &g->regions[i];
-            uint64_t start = r->start & ~0xFFFULL;
-            uint64_t end = (r->end + 0xFFF) & ~0xFFFULL;
-
-            if (nentries > 0 && entries[nentries - 1].end == start &&
-                entries[nentries - 1].prot == r->prot &&
-                entries[nentries - 1].flags == r->flags &&
-                entries[nentries - 1].offset == r->offset &&
-                !strcmp(entries[nentries - 1].name, r->name)) {
-                entries[nentries - 1].end = end;
-                continue;
-            }
-            maps_entry_insert(entries, &nentries, start, end, r->prot, r->flags,
-                              r->offset, r->name);
-        }
-
-        /* Add preannounced entries only while they still have an uncovered
-         * tail. Once the union of live regions covers the full advertised
-         * interval, suppress the shadow entry so /proc/self/maps shows only the
-         * realized split VMAs. A partial union must stay visible because some
-         * reserved-but-not-realized span remains to advertise.
-         */
-        for (int i = 0; i < g->npreannounced && nentries < MAPS_ENTRY_MAX;
-             i++) {
-            const guest_region_t *r = &g->preannounced[i];
-            bool shadowed = false;
-            uint64_t covered_end = r->start;
-
-            for (int j = 0; j < g->nregions; j++) {
-                const guest_region_t *live = &g->regions[j];
-
-                if (live->end <= covered_end)
-                    continue;
-                if (live->start > covered_end)
-                    break;
-
-                covered_end = live->end;
-                if (covered_end >= r->end) {
-                    shadowed = true;
-                    break;
-                }
-            }
-
-            if (shadowed)
-                continue;
-
-            maps_entry_insert(entries, &nentries, r->start & ~0xFFFULL,
-                              (r->end + 0xFFFULL) & ~0xFFFULL, r->prot,
-                              r->flags, r->offset, r->name);
-        }
-        maps_entries_merge_adjacent(entries, &nentries);
-
-        /* Emit lines after merging so buffer accounting is centralized. */
-        for (int i = 0; i < nentries && off < (int) sizeof(buf) - 256; i++) {
-            const maps_entry_t *e = &entries[i];
-            char perms[5];
-            perms[0] = (e->prot & 0x1) ? 'r' : '-';
-            perms[1] = (e->prot & 0x2) ? 'w' : '-';
-            perms[2] = (e->prot & 0x4) ? 'x' : '-';
-            perms[3] = (e->flags & 0x01) ? 's' : 'p';
-            perms[4] = '\0';
-
-            /* Format matches real Linux /proc/<pid>/maps exactly:
-             *   %lx-%lx %s %08lx %02x:%02x %lu  <padding>  %s\n
-             * Verified against strace in a real Lima VZ VM.
-             */
-            char line[256];
-            int lineoff = snprintf(
-                line, sizeof(line), "%llx-%llx %s %08llx 00:00 0",
-                (unsigned long long) e->start, (unsigned long long) e->end,
-                perms, (unsigned long long) e->offset);
-            /* Cap lineoff to buffer size (snprintf may return more than
-             * available on truncation)
-             */
-            if (lineoff >= (int) sizeof(line))
-                lineoff = (int) sizeof(line) - 1;
-            if (e->name[0]) {
-                while (lineoff < MAPS_NAME_COLUMN &&
-                       lineoff < (int) sizeof(line) - 1)
-                    line[lineoff++] = ' ';
-                int n = snprintf(line + lineoff, sizeof(line) - lineoff, "%s",
-                                 e->name);
-                if (n > 0)
-                    lineoff += n;
-                if (lineoff >= (int) sizeof(line))
-                    lineoff = (int) sizeof(line) - 1;
-            } else if (lineoff < (int) sizeof(line) - 1) {
-                line[lineoff++] = ' ';
-            }
-            int wrote =
-                snprintf(buf + off, sizeof(buf) - off, "%.*s\n", lineoff, line);
-            if (wrote > 0 && off + wrote < (int) sizeof(buf))
-                off += wrote;
-            else
-                break; /* Stop before truncating a maps line. */
-        }
-
-        log_debug("/proc/self/maps (%d bytes):\n%.*s", off, off, buf);
-        return proc_synthetic_fd(buf, off);
-    }
+    if (!strcmp(path, "/proc/self/maps"))
+        return proc_open_self_maps(g);
 
     /* /proc/uptime -> synthetic uptime in seconds. Uses sysctl(KERN_BOOTTIME),
      * same as sys_sysinfo() in syscall/sys.c. Idle time is 0 (no meaningful
@@ -2890,29 +3068,38 @@ int proc_intercept_open(const guest_t *g,
             .want_tcp = want_tcp,
             .want_v6 = want_v6,
         };
-        char buf[16384];
+        char *buf = malloc(ctx.bufsz);
+        if (!buf)
+            return -1;
         ctx.buf = buf;
         ctx.off = snprintf(
-            buf, sizeof(buf), "%s",
+            buf, ctx.bufsz, "%s",
             want_tcp ? "  sl  local_address rem_address   st tx_queue "
                        "rx_queue tr tm->when retrnsmt   uid  timeout inode\n"
                      : "  sl  local_address rem_address   st tx_queue "
                        "rx_queue tr tm->when retrnsmt   uid  timeout inode"
                        " ref pointer drops\n");
         proc_net_for_each_socket(proc_net_inet_visit, &ctx);
-        return proc_synthetic_fd_str(buf, ctx.off, sizeof(buf));
+        int fd = proc_synthetic_fd_str(buf, ctx.off, ctx.bufsz);
+        free(buf);
+        return fd;
     }
     if (!strcmp(path, "/proc/net/unix")) {
-        char buf[8192];
+        const size_t bufsz = 8192;
+        char *buf = malloc(bufsz);
+        if (!buf)
+            return -1;
         struct proc_net_unix_ctx ctx = {
             .buf = buf,
-            .bufsz = sizeof(buf),
-            .off = snprintf(buf, sizeof(buf),
+            .bufsz = bufsz,
+            .off = snprintf(buf, bufsz,
                             "Num       RefCount Protocol Flags    Type St "
                             "Inode Path\n"),
         };
         proc_net_for_each_socket(proc_net_unix_visit, &ctx);
-        return proc_synthetic_fd_str(buf, ctx.off, sizeof(buf));
+        int fd = proc_synthetic_fd_str(buf, ctx.off, bufsz);
+        free(buf);
+        return fd;
     }
 
     /* /proc/sys/vm/mmap_min_addr -> synthetic mmap minimum address. */
@@ -2933,52 +3120,11 @@ int proc_intercept_open(const guest_t *g,
             "#20-Ubuntu SMP PREEMPT_DYNAMIC\n");
     }
 
-    /* /proc/filesystems -> supported filesystem types */
-    if (!strcmp(path, "/proc/filesystems")) {
-        return proc_emit_literal(
-            "\tmpfs\n"
-            "\tproc\n"
-            "\tsysfs\n"
-            "\tdevtmpfs\n"
-            "\tfuse\n"
-            "\text4\n"
-            "\tvfat\n");
-    }
-
-    /* /proc/self/mountinfo -> Linux mountinfo format (different from
-     * /proc/mounts). Format: id parent_id major:minor root mount_point options
-     * - type source super_options
-     */
-    if (!strcmp(path, "/proc/self/mountinfo")) {
-        char buf[8192];
-        size_t off = (size_t) snprintf(
-            buf, sizeof(buf),
-            "1 0 0:1 / / rw,relatime - ext4 /dev/root rw\n"
-            "2 1 0:2 / /proc rw,nosuid,nodev,noexec - proc proc rw\n"
-            "3 1 0:3 / /tmp rw,nosuid,nodev - tmpfs tmpfs rw\n"
-            "4 1 0:4 / /dev rw,nosuid - devtmpfs devtmpfs rw\n"
-            "5 4 0:5 / /dev/shm rw,nosuid,nodev - tmpfs tmpfs rw\n");
-        if (off >= sizeof(buf) ||
-            fuse_append_mountinfo(buf, sizeof(buf), &off) < 0)
-            return -1;
-        return proc_synthetic_fd(buf, off);
-    }
-
-    /* /proc/mounts, /etc/mtab -> synthetic mount table */
-    if (!strcmp(path, "/proc/mounts") || !strcmp(path, "/proc/self/mounts") ||
-        !strcmp(path, "/etc/mtab")) {
-        char buf[8192];
-        size_t off =
-            (size_t) snprintf(buf, sizeof(buf),
-                              "/ / ext4 rw,relatime 0 0\n"
-                              "proc /proc proc rw,nosuid,nodev,noexec 0 0\n"
-                              "tmpfs /tmp tmpfs rw,nosuid,nodev 0 0\n"
-                              "devtmpfs /dev devtmpfs rw,nosuid 0 0\n"
-                              "tmpfs /dev/shm tmpfs rw,nosuid,nodev 0 0\n");
-        if (off >= sizeof(buf) ||
-            fuse_append_mounts(buf, sizeof(buf), &off) < 0)
-            return -1;
-        return proc_synthetic_fd(buf, off);
+    /* /proc/filesystems, /proc/self/mountinfo, /proc/mounts, /etc/mtab. */
+    {
+        int r = proc_open_mounts_node(path);
+        if (r != PROC_NOT_INTERCEPTED)
+            return r;
     }
 
     /* OOM nodes share one stored adjustment.
@@ -3096,77 +3242,8 @@ int proc_intercept_open(const guest_t *g,
         return dev_fd_dup(path, 14);
 
     /* /proc/meminfo -> synthetic memory info from host vm_statistics */
-    if (!strcmp(path, "/proc/meminfo")) {
-        int64_t physmem = 0;
-        size_t sz = sizeof(physmem);
-        int mib[2] = {CTL_HW, HW_MEMSIZE};
-        sysctl(mib, 2, &physmem, &sz, NULL, 0);
-        uint64_t total_kb = (uint64_t) physmem / 1024;
-
-        /* Query host vm_statistics for accurate free/active/inactive. Falls
-         * back to approximations if the mach call fails.
-         */
-        uint64_t free_kb, avail_kb, buffers_kb, cached_kb;
-        vm_statistics64_data_t vm_stat = {0};
-        mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
-        uint64_t page_size = 4096;
-        if (host_statistics64(mach_host_self(), HOST_VM_INFO64,
-                              (host_info64_t) &vm_stat,
-                              &count) == KERN_SUCCESS) {
-            host_page_size(mach_host_self(), (vm_size_t *) &page_size);
-            free_kb = (uint64_t) vm_stat.free_count * page_size / 1024;
-            uint64_t inactive_kb =
-                (uint64_t) vm_stat.inactive_count * page_size / 1024;
-            uint64_t purgeable_kb =
-                (uint64_t) vm_stat.purgeable_count * page_size / 1024;
-            /* Available ~= free + inactive + purgeable (Linux heuristic) */
-            avail_kb = free_kb + inactive_kb + purgeable_kb;
-            if (avail_kb > total_kb)
-                avail_kb = total_kb;
-            cached_kb = inactive_kb + purgeable_kb;
-            buffers_kb = 0; /* macOS does not expose buffer cache separately */
-        } else {
-            free_kb = total_kb / 2;
-            avail_kb = total_kb * 3 / 4;
-            buffers_kb = total_kb / 20;
-            cached_kb = total_kb / 4;
-        }
-
-        return proc_emit_fmt(
-            "MemTotal:       %llu kB\n"
-            "MemFree:        %llu kB\n"
-            "MemAvailable:   %llu kB\n"
-            "Buffers:        %llu kB\n"
-            "Cached:         %llu kB\n"
-            "SwapCached:     0 kB\n"
-            "Active:         %llu kB\n"
-            "Inactive:       %llu kB\n"
-            "SwapTotal:      0 kB\n"
-            "SwapFree:       0 kB\n"
-            "Dirty:          0 kB\n"
-            "Writeback:      0 kB\n"
-            "AnonPages:      %llu kB\n"
-            "Mapped:         %llu kB\n"
-            "Shmem:          0 kB\n"
-            "Slab:           0 kB\n"
-            "SReclaimable:   0 kB\n"
-            "SUnreclaim:     0 kB\n"
-            "KernelStack:    0 kB\n"
-            "PageTables:     0 kB\n"
-            "CommitLimit:    %llu kB\n"
-            "Committed_AS:   0 kB\n"
-            "VmallocTotal:   0 kB\n"
-            "VmallocUsed:    0 kB\n"
-            "VmallocChunk:   0 kB\n",
-            (unsigned long long) total_kb, (unsigned long long) free_kb,
-            (unsigned long long) avail_kb, (unsigned long long) buffers_kb,
-            (unsigned long long) cached_kb,
-            (unsigned long long) (total_kb - free_kb - cached_kb),
-            (unsigned long long) (cached_kb / 2),
-            (unsigned long long) (total_kb - free_kb - cached_kb - buffers_kb),
-            (unsigned long long) (cached_kb / 2),
-            (unsigned long long) (total_kb / 2));
-    }
+    if (!strcmp(path, "/proc/meminfo"))
+        return proc_open_meminfo();
 
     /* /proc/self/io -> synthetic I/O counters. Some node-style observability
      * runtimes read this for resource monitoring metrics. procfs emulation

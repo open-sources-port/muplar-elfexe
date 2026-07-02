@@ -1,4 +1,5 @@
-/* Linux futex emulation
+/*
+ * Linux futex emulation
  *
  * Copyright 2026 elfuse contributors
  * Copyright 2025 Moritz Angermann, zw3rk pte. ltd.
@@ -44,8 +45,8 @@
  * the Linux -EAGAIN pre-block race into a successful wait; futex_os_sync_wait
  * closes that common gap with a compare-after-block re-check (word moved off
  * the expected value on a rc>=0 return maps to -EAGAIN). FUTEX_WAIT_BITSET, PI
- * variants, and futex_waitv stay on the bucket path: they need state the
- * kernel API does not expose.
+ * variants, and futex_waitv stay on the bucket path: they need state the kernel
+ * API does not expose.
  *
  * SDK gate: probe the header via __has_include so older SDKs build clean.
  * Runtime gate: __builtin_available cached in futex_init().
@@ -191,6 +192,21 @@ static void bucket_unlink_locked(futex_bucket_t *b, const futex_waiter_t *w)
             return;
         }
     }
+}
+
+/* Unlink the waiter at *pp from its bucket list and wake it. The bucket lock
+ * must be held. Unlinking before the store/signal keeps a woken waiter from
+ * observing itself still queued; the release store pairs with the waiter's
+ * acquire load of woken. On return *pp points at the next entry, so a scanning
+ * loop should re-test *pp without advancing pp.
+ */
+static void futex_wake_waiter_locked(futex_waiter_t **pp)
+{
+    futex_waiter_t *w = *pp;
+    *pp = w->next; /* unlink before signaling */
+    __atomic_store_n(&w->woken, 1, __ATOMIC_RELEASE);
+    pthread_cond_signal(&w->cond);
+    futex_waiter_notify_group(w);
 }
 
 /* Public API */
@@ -395,12 +411,12 @@ static uint32_t futex_os_sync_wake_n(const guest_t *g,
  * returns -EAGAIN in that case, so an explicit __atomic_load_n bridges the
  * contract gap.
  *
- * Quantum is bounded by FUTEX_OS_SYNC_POLL_CAP_NS so proc_exit_group_requested,
- * futex_interrupt_pending, and the 1-second EINTR simulation get observed
- * without a global wake-everyone broadcast channel. ETIMEDOUT, EINTR, EFAULT,
- * and ENOMEM are all transient per Apple's docs; each must run the flag check
- * before re-arming. EINVAL would indicate a programmer error here (size != 4/8
- * or bad flags), so it surfaces directly rather than spinning.
+ * Quantum is bounded by FUTEX_OS_SYNC_POLL_CAP_NS so proc_exit_group_requested
+ * and futex_interrupt_pending get observed without a global wake-everyone
+ * broadcast channel. ETIMEDOUT, EINTR, EFAULT, and ENOMEM are all transient per
+ * Apple's docs; each must run the flag check before re-arming. EINVAL would
+ * indicate a programmer error here (size != 4/8 or bad flags), so it surfaces
+ * directly rather than spinning.
  */
 static int64_t futex_os_sync_wait(guest_t *g,
                                   uint64_t uaddr,
@@ -432,10 +448,10 @@ static int64_t futex_os_sync_wait(guest_t *g,
     /* Bound consecutive EFAULT retries. Apple documents EFAULT as transient
      * (kernel copyin failure under memory pressure), so a few retries are fine;
      * but a genuinely bad page would otherwise cause the loop to spin with no
-     * real sleep -- timeout_ns is supplied to syscall that returns immediately
-     * -- until the user deadline finally bails out. Surface EFAULT to the
-     * guest after this many back-to-back failures so the host CPU does not
-     * burn for ~1 s.
+     * real sleep (timeout_ns is supplied to a syscall that returns immediately)
+     * until the user deadline finally bails out. Surface EFAULT to the guest
+     * after this many back-to-back failures so the host CPU does not burn for
+     * ~1 s.
      */
     int efault_retries = 0;
 
@@ -455,21 +471,20 @@ static int64_t futex_os_sync_wait(guest_t *g,
             OS_CLOCK_MACH_ABSOLUTE_TIME, timeout_ns);
         if (rc >= 0) {
             /* Compare-after-block re-check. Darwin folds two distinct Linux
-             * outcomes into a single rc>=0: a genuine wake, and the racy
-             * "value moved off expected between the pre-check and the
-             * in-kernel compare" case that Linux reports as -EAGAIN. Reload
-             * the word: value still == expected means a real (or spurious)
-             * wake -> return 0; value != expected means it moved, which is
-             * -EAGAIN under Linux for the pre-block race and is equally safe
-             * for the post-wake case, since a correct futex caller must
-             * re-read the word and re-test its condition on either return.
-             * This is not a perfect oracle: a value that moves off expected
-             * and back before the reload returns 0 where Linux returns
-             * -EAGAIN, a benign spurious wake the futex contract permits. No
-             * wake is lost: the kernel's atomic compare-and-block already
-             * guarantees a waiter enqueued at expected cannot miss an
-             * os_sync_wake_by_address, and any value change carries the state
-             * the caller re-reads.
+             * outcomes into a single rc>=0: a genuine wake, and the racy "value
+             * moved off expected between the pre-check and the in-kernel
+             * compare" case that Linux reports as -EAGAIN. Reload the word:
+             * value still == expected means a real (or spurious) wake -> return
+             * 0; value != expected means it moved, which is -EAGAIN under Linux
+             * for the pre-block race and is equally safe for the post-wake
+             * case, since a correct futex caller must re-read the word and
+             * re-test its condition on either return. This is not a perfect
+             * oracle: a value that moves off expected and back before the
+             * reload returns 0 where Linux returns -EAGAIN, a benign spurious
+             * wake the futex contract permits. No wake is lost: the kernel's
+             * atomic compare-and-block already guarantees a waiter enqueued at
+             * expected cannot miss an os_sync_wake_by_address, and any value
+             * change carries the state the caller re-reads.
              */
             uint32_t observed = __atomic_load_n(host_addr, __ATOMIC_SEQ_CST);
             return observed == expected ? 0 : -LINUX_EAGAIN;
@@ -495,26 +510,26 @@ static int64_t futex_os_sync_wait(guest_t *g,
          */
         signal_check_timer();
 
-        /* Return EINTR only when a real deliverable signal is queued for
-         * this thread. POSIX callers (e.g. glibc sem_wait, foot's render
-         * worker) often do not retry on EINTR, so synthetic spurious
-         * wakeups cannot be issued here. signal_pending() confirms under
-         * sig_lock so the atomic hint cannot produce a stale-true edge
-         * after rt_sigprocmask masked the queued signal.
+        /* Return EINTR only when a real deliverable signal is queued for this
+         * thread. POSIX callers (e.g. glibc sem_wait, foot's render worker)
+         * often do not retry on EINTR, so synthetic spurious wakeups cannot be
+         * issued here. signal_pending() confirms under sig_lock so the atomic
+         * hint cannot produce a stale-true edge after rt_sigprocmask masked the
+         * queued signal.
          */
         if (signal_pending())
             return -LINUX_EINTR;
-        /* For has_timeout: futex_remaining_ns returns 0 next iteration once
-         * the user deadline elapses, so the loop exits with -ETIMEDOUT.
+        /* For has_timeout: futex_remaining_ns returns 0 next iteration once the
+         * user deadline elapses, so the loop exits with -ETIMEDOUT.
          */
     }
 }
 
 #else /* !ELFUSE_HAVE_OS_SYNC_WAIT_ON_ADDRESS */
 
-/* Stub fallback: dead branch on builds whose SDK lacks the header. The
- * dispatch sites guard on os_sync_available, so this stub is unreachable
- * at runtime, but it keeps the link clean.
+/* Stub fallback: dead branch on builds whose SDK lacks the header. The dispatch
+ * sites guard on os_sync_available, so this stub is unreachable at runtime, but
+ * it keeps the link clean.
  */
 static uint32_t futex_os_sync_wake_n(const guest_t *g,
                                      uint64_t uaddr,
@@ -533,10 +548,10 @@ static uint32_t futex_os_sync_wake_n(const guest_t *g,
  * the bucket must also drain the os_sync queue at the same address or it
  * strands those waiters. woken is how many of target the bucket walk already
  * satisfied at uaddr; this drains the shortfall and returns the new total.
- * futex_os_sync_wake_n is a no-op when the address-wait path is disabled
- * or when no kernel waiter sits at uaddr, so this is safe to call
- * unconditionally. Call it AFTER dropping the bucket lock: os_sync_wake is a
- * syscall and must not run under the leaf lock.
+ * futex_os_sync_wake_n is a no-op when the address-wait path is disabled or
+ * when no kernel waiter sits at uaddr, so this is safe to call unconditionally.
+ * Call it AFTER dropping the bucket lock: os_sync_wake is a syscall and must
+ * not run under the leaf lock.
  *
  * Every bucket-walking wake site (futex_wake, futex_requeue, futex_wake_op)
  * routes through here so the "drain both queues" invariant is one named step,
@@ -709,12 +724,13 @@ static int64_t futex_wait(guest_t *g,
  * waiters are unlinked from the bucket list so subsequent operations do not
  * count them as still-sleeping entries.
  *
- * If the Darwin address-wait path is ever enabled again, drain any kernel-side
- * waiters at the same address up to the remaining budget so a wake site that
- * walked only the bucket would not strand them. Plain FUTEX_WAIT enqueues with
- * implicit FUTEX_BITSET_MATCH_ANY, which matches every legal FUTEX_WAKE_BITSET
- * mask (mask must be non-zero by Linux contract), so those waiters remain valid
- * wake targets.
+ * After walking the bucket, futex_wake_topup_osync drains any kernel-side
+ * waiters at the same address up to the remaining budget so a wake that walked
+ * only the bucket does not strand them; it is a no-op when the Darwin
+ * address-wait path is inactive. Plain FUTEX_WAIT enqueues with implicit
+ * FUTEX_BITSET_MATCH_ANY, which matches every legal FUTEX_WAKE_BITSET mask
+ * (mask must be non-zero by Linux contract), so those waiters remain valid wake
+ * targets.
  */
 static int64_t futex_wake(const guest_t *g,
                           uint64_t uaddr,
@@ -736,10 +752,7 @@ static int64_t futex_wake(const guest_t *g,
     while (*pp && (uint32_t) woken < val) {
         futex_waiter_t *w = *pp;
         if (w->uaddr == uaddr && (w->bitset & bitset) != 0) {
-            *pp = w->next; /* Unlink before signaling */
-            __atomic_store_n(&w->woken, 1, __ATOMIC_RELEASE);
-            pthread_cond_signal(&w->cond);
-            futex_waiter_notify_group(w);
+            futex_wake_waiter_locked(pp);
             woken++;
         } else {
             pp = &w->next;
@@ -822,10 +835,7 @@ static int64_t futex_requeue(guest_t *g,
 
         if ((uint32_t) woken < wake_count) {
             /* Wake this waiter: unlink from source, then signal */
-            *pp = w->next;
-            __atomic_store_n(&w->woken, 1, __ATOMIC_RELEASE);
-            pthread_cond_signal(&w->cond);
-            futex_waiter_notify_group(w);
+            futex_wake_waiter_locked(pp);
             woken++;
             /* Leave pp unchanged because *pp is already the next node */
         } else if ((uint32_t) requeued < requeue_count) {
@@ -968,10 +978,7 @@ static int64_t futex_wake_op(guest_t *g,
     while (*pp1 && (uint32_t) woken1 < val) {
         futex_waiter_t *w = *pp1;
         if (w->uaddr == uaddr) {
-            *pp1 = w->next;
-            __atomic_store_n(&w->woken, 1, __ATOMIC_RELEASE);
-            pthread_cond_signal(&w->cond);
-            futex_waiter_notify_group(w);
+            futex_wake_waiter_locked(pp1);
             woken1++;
         } else {
             pp1 = &w->next;
@@ -1012,10 +1019,7 @@ static int64_t futex_wake_op(guest_t *g,
         while (*pp2 && (uint32_t) woken2 < val2) {
             futex_waiter_t *w2 = *pp2;
             if (w2->uaddr == uaddr2) {
-                *pp2 = w2->next;
-                __atomic_store_n(&w2->woken, 1, __ATOMIC_RELEASE);
-                pthread_cond_signal(&w2->cond);
-                futex_waiter_notify_group(w2);
+                futex_wake_waiter_locked(pp2);
                 woken2++;
             } else {
                 pp2 = &w2->next;
@@ -1231,14 +1235,7 @@ static int64_t futex_lock_pi(guest_t *g, uint64_t uaddr, uint64_t timeout_gva)
         }
 
         /* Dequeue waiter from bucket list */
-        futex_waiter_t **pp = &b->head;
-        while (*pp) {
-            if (*pp == &waiter) {
-                *pp = waiter.next;
-                break;
-            }
-            pp = &(*pp)->next;
-        }
+        bucket_unlink_locked(b, &waiter);
         pthread_mutex_unlock(&b->lock);
         pthread_cond_destroy(&waiter.cond);
 
@@ -1327,10 +1324,7 @@ static int64_t futex_unlock_pi(guest_t *g, uint64_t uaddr)
     while (*pp) {
         futex_waiter_t *w = *pp;
         if (w->uaddr == uaddr) {
-            *pp = w->next; /* Unlink before signaling */
-            __atomic_store_n(&w->woken, 1, __ATOMIC_RELEASE);
-            pthread_cond_signal(&w->cond);
-            futex_waiter_notify_group(w);
+            futex_wake_waiter_locked(pp);
             break; /* Wake exactly one */
         }
         pp = &w->next;

@@ -385,7 +385,8 @@ void thread_interrupt_all(void)
 
     pthread_mutex_lock(&thread_lock);
     THREAD_FOR_EACH_ACTIVE (t)
-        vcpus[count++] = t->vcpu;
+        if (t->vcpu) /* skip slots whose vCPU was already torn down */
+            vcpus[count++] = t->vcpu;
     pthread_mutex_unlock(&thread_lock);
 
     /* Force all active vCPUs out of hv_vcpu_run(). Each vCPU will see

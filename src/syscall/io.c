@@ -1,4 +1,5 @@
-/* Core I/O syscall handlers
+/*
+ * Core I/O syscall handlers
  *
  * Copyright 2026 elfuse contributors
  * Copyright 2025 Moritz Angermann, zw3rk pte. ltd.
@@ -419,10 +420,9 @@ static uint32_t mac_iflag_to_linux(tcflag_t mf)
 /* Linux aarch64 c_oflag bits (asm-generic/termbits-common.h + termbits.h). Only
  * OPOST (0x01) has the same value on both platforms. macOS 0x02 = ONLCR; Linux
  * 0x02 = OLCUC (output lowercase->uppercase, rare). macOS 0x04 = OXTABS; Linux
- * 0x04 = ONLCR. All other bits shift by one.
- */
-/* OLCUC (Linux 0x002, output lowercase->uppercase) has no macOS equivalent and
- * is silently dropped. macOS uses 0x002 for ONLCR.
+ * 0x04 = ONLCR. All other bits shift by one. OLCUC (Linux 0x002, output
+ * lowercase->uppercase) has no macOS equivalent and is silently dropped. macOS
+ * uses 0x002 for ONLCR.
  */
 #define LINUX_OPOST 0x001
 #define LINUX_ONLCR 0x004  /* macOS ONLCR=0x002 */
@@ -519,8 +519,6 @@ static speed_t linux_cbaud_to_speed(uint32_t cbaud)
     };
     uint32_t rate_idx = cbaud & 0xF;
 
-    if (cbaud == LINUX_BOTHER)
-        return 0; /* caller should use c_ispeed/c_ospeed directly */
     if (cbaud < 16)
         return std_rates[cbaud];
     if (cbaud & LINUX_BOTHER)
@@ -604,10 +602,8 @@ static uint32_t mac_cflag_to_linux(tcflag_t mf)
 
 /* Linux aarch64 c_lflag bits (asm-generic/termbits.h). Virtually every flag has
  * a different value from macOS. Only ECHO (0x0008) is the same on both
- * platforms.
- */
-/* XCASE (Linux 0x004, rarely used, no macOS equivalent) is dropped; macOS 0x004
- * has different semantics and is not translated here.
+ * platforms. XCASE (Linux 0x004, rarely used, no macOS equivalent) is dropped;
+ * macOS 0x004 has different semantics and is not translated here.
  */
 #define LINUX_ISIG 0x00001
 #define LINUX_ICANON 0x00002
@@ -1778,7 +1774,8 @@ int64_t sys_ioctl(guest_t *g, int fd, uint64_t request, uint64_t arg)
          * elfuse does not forward host SIGIO into the guest, and nginx workers
          * receive both client I/O and channel commands via epoll rather than
          * SIGIO, so accept the request as a no-op: read the int arg for EFAULT
-         * parity and report success without arming host async delivery. */
+         * parity and report success without arming host async delivery.
+         */
         int32_t on = 0;
         if (guest_read_small(g, arg, &on, sizeof(on)) < 0) {
             host_fd_ref_close(&host_ref);
@@ -2006,6 +2003,96 @@ int64_t sys_fallocate(int fd, int mode, int64_t offset, int64_t len)
     return 0;
 }
 
+/* Scratch buffer size for the file-copy syscall emulations. Heap-allocated per
+ * call rather than placed on the stack: guest threads run on host pthreads
+ * whose stacks are far smaller than a 64KiB frame would tolerate.
+ */
+#define IO_COPY_BUF_SIZE (64 * 1024)
+
+/* Chunked read/write copy shared by sendfile and copy_file_range. Reads from
+ * in_hfd (honoring proc_try_chunk_read_intercept for /proc-backed guest fd
+ * in_gfd) and writes to out_hfd. A non-negative *off_in / *off_out selects
+ * pread/pwrite at that offset and is advanced by the bytes moved; -1 selects
+ * read/write against the fd's own position. Queues SIGPIPE on EPIPE. Stops on
+ * EOF or short write.
+ *
+ * Returns the byte count moved, or a negative Linux errno only when the very
+ * first read or write failed (partial transfers report the count so the caller
+ * can still write offsets back).
+ */
+static int64_t copy_fd_range(int in_gfd,
+                             int in_hfd,
+                             int out_hfd,
+                             int64_t *off_in,
+                             int64_t *off_out,
+                             uint64_t len)
+{
+    char *buf = malloc(IO_COPY_BUF_SIZE);
+    if (!buf)
+        return -LINUX_ENOMEM;
+
+    size_t total = 0, remaining = len;
+    int64_t ret;
+    while (remaining > 0) {
+        size_t chunk =
+            remaining > IO_COPY_BUF_SIZE ? IO_COPY_BUF_SIZE : remaining;
+        ssize_t nr;
+        if (*off_in >= 0) {
+            int64_t intercepted = proc_try_chunk_read_intercept(
+                in_gfd, in_hfd, buf, chunk, *off_in, 1);
+            nr = (intercepted != INT64_MIN)
+                     ? intercepted
+                     : pread(in_hfd, buf, chunk, *off_in);
+        } else {
+            int64_t intercepted =
+                proc_try_chunk_read_intercept(in_gfd, in_hfd, buf, chunk, 0, 0);
+            nr = (intercepted != INT64_MIN) ? intercepted
+                                            : read(in_hfd, buf, chunk);
+        }
+        if (nr < 0) {
+            ret = total > 0 ? (int64_t) total : linux_errno();
+            goto done;
+        }
+        if (nr == 0)
+            break; /* EOF */
+
+        ssize_t nw = (*off_out >= 0) ? pwrite(out_hfd, buf, nr, *off_out)
+                                     : write(out_hfd, buf, nr);
+        if (nw < 0) {
+            if (errno == EPIPE)
+                signal_queue(LINUX_SIGPIPE);
+            ret = total > 0 ? (int64_t) total : linux_errno();
+            goto done;
+        }
+
+        total += nw;
+        remaining -= nw;
+        if (*off_in >= 0)
+            *off_in += nw;
+        if (*off_out >= 0)
+            *off_out += nw;
+        if (nw < nr) {
+            /* Short write. For position-based input, read() already consumed
+             * all nr bytes but only nw were sent, so rewind the input fd by the
+             * unsent nr - nw so a later call re-reads them. Linux advances the
+             * input only by bytes actually transferred. For offset-based input,
+             * pread left the position untouched and off_in advanced by nw only,
+             * so there is nothing to undo. Best-effort: a non-seekable input
+             * (which sendfile/copy_file_range do not accept) simply keeps the
+             * prior behavior.
+             */
+            if (*off_in < 0)
+                (void) lseek(in_hfd, (off_t) (nw - nr), SEEK_CUR);
+            break;
+        }
+    }
+    ret = (int64_t) total;
+
+done:
+    free(buf);
+    return ret;
+}
+
 int64_t sys_sendfile(guest_t *g,
                      int out_fd,
                      int in_fd,
@@ -2037,52 +2124,15 @@ int64_t sys_sendfile(guest_t *g,
         }
     }
 
-    char buf[65536];
-    size_t total = 0, remaining = count;
-    while (remaining > 0) {
-        size_t chunk = remaining > sizeof(buf) ? sizeof(buf) : remaining;
-        ssize_t nr;
-        if (offset >= 0) {
-            int64_t intercepted = proc_try_chunk_read_intercept(
-                in_fd, in_ref.fd, buf, chunk, offset, 1);
-            if (intercepted != INT64_MIN)
-                nr = intercepted;
-            else
-                nr = pread(in_ref.fd, buf, chunk, offset);
-        } else {
-            int64_t intercepted = proc_try_chunk_read_intercept(
-                in_fd, in_ref.fd, buf, chunk, 0, 0);
-            if (intercepted != INT64_MIN)
-                nr = intercepted;
-            else
-                nr = read(in_ref.fd, buf, chunk);
-        }
-        if (nr < 0) {
-            if (total > 0)
-                break; /* Partial success: report bytes sent */
-            err = linux_errno();
-            goto out_sendfile;
-        }
-        if (nr == 0)
-            break; /* EOF */
-
-        ssize_t nw = write(out_ref.fd, buf, nr);
-        if (nw < 0) {
-            if (errno == EPIPE)
-                signal_queue(LINUX_SIGPIPE);
-            if (total > 0)
-                break; /* Report partial success below */
-            err = linux_errno();
-            goto out_sendfile;
-        }
-
-        total += nw;
-        remaining -= nw;
-        if (offset >= 0)
-            offset += nw;
-        if (nw < nr)
-            break; /* Short write */
+    /* sendfile has no output offset, so out always uses write(). */
+    int64_t off_out = -1;
+    int64_t moved =
+        copy_fd_range(in_fd, in_ref.fd, out_ref.fd, &offset, &off_out, count);
+    if (moved < 0) {
+        err = moved;
+        goto out_sendfile;
     }
+    size_t total = (size_t) moved;
 
     /* Write back updated offset (even on partial transfer). Preserve partial
      * success: if bytes were transferred but offset writeback fails, return the
@@ -2109,7 +2159,10 @@ int64_t sys_copy_file_range(guest_t *g,
                             uint64_t len,
                             unsigned int flags)
 {
-    (void) flags;
+    /* Linux reserves flags for future use and rejects any nonzero value. */
+    if (flags != 0)
+        return -LINUX_EINVAL;
+
     host_fd_ref_t in_ref, out_ref;
     int64_t err = host_fd_ref_open_regular_io(fd_in, &in_ref);
     if (err < 0)
@@ -2135,60 +2188,14 @@ int64_t sys_copy_file_range(guest_t *g,
         }
     }
 
-    /* Emulate with pread/pwrite loop */
-    char buf[65536];
-    size_t total = 0, remaining = len;
-    while (remaining > 0) {
-        size_t chunk = remaining > sizeof(buf) ? sizeof(buf) : remaining;
-        ssize_t nr;
-        if (off_in >= 0) {
-            int64_t intercepted = proc_try_chunk_read_intercept(
-                fd_in, in_ref.fd, buf, chunk, off_in, 1);
-            if (intercepted != INT64_MIN)
-                nr = intercepted;
-            else
-                nr = pread(in_ref.fd, buf, chunk, off_in);
-        } else {
-            int64_t intercepted = proc_try_chunk_read_intercept(
-                fd_in, in_ref.fd, buf, chunk, 0, 0);
-            if (intercepted != INT64_MIN)
-                nr = intercepted;
-            else
-                nr = read(in_ref.fd, buf, chunk);
-        }
-        if (nr < 0) {
-            if (total > 0)
-                break; /* Partial success: report bytes sent */
-            err = linux_errno();
-            goto out_copy_file_range;
-        }
-        if (nr == 0)
-            break; /* EOF */
-
-        ssize_t nw;
-        if (off_out >= 0) {
-            nw = pwrite(out_ref.fd, buf, nr, off_out);
-        } else {
-            nw = write(out_ref.fd, buf, nr);
-        }
-        if (nw < 0) {
-            if (errno == EPIPE)
-                signal_queue(LINUX_SIGPIPE);
-            if (total > 0)
-                break; /* Report partial success below */
-            err = linux_errno();
-            goto out_copy_file_range;
-        }
-
-        total += nw;
-        remaining -= nw;
-        if (off_in >= 0)
-            off_in += nw;
-        if (off_out >= 0)
-            off_out += nw;
-        if (nw < nr)
-            break;
+    /* Emulate with a pread/pwrite loop. */
+    int64_t moved =
+        copy_fd_range(fd_in, in_ref.fd, out_ref.fd, &off_in, &off_out, len);
+    if (moved < 0) {
+        err = moved;
+        goto out_copy_file_range;
     }
+    size_t total = (size_t) moved;
 
     /* Write back updated offsets (even on partial transfer). Preserve partial
      * success on writeback failure.
@@ -2249,15 +2256,22 @@ int64_t sys_splice(guest_t *g,
         }
     }
 
-    /* Emulate with read/write loop using a stack buffer (matching
-     * sendfile/copy_file_range which also use stack buffers).
+    /* Emulate with a read/write loop over a heap buffer. splice fully drains
+     * each read chunk (inner write loop) rather than stopping on a short write,
+     * so it does not share copy_fd_range.
      */
-    uint8_t buf[65536];
-    size_t chunk = len > sizeof(buf) ? sizeof(buf) : len;
+    uint8_t *buf = malloc(IO_COPY_BUF_SIZE);
+    if (!buf) {
+        host_fd_ref_close(&out_ref);
+        host_fd_ref_close(&in_ref);
+        return -LINUX_ENOMEM;
+    }
+    size_t chunk = len > IO_COPY_BUF_SIZE ? IO_COPY_BUF_SIZE : len;
 
     size_t total = 0;
     int saved_errno = 0;   /* Preserve errno across guest_write */
     bool rw_error = false; /* Track whether read or write failed */
+    int64_t ret;
     while (total < len) {
         size_t n = (len - total) > chunk ? chunk : (len - total);
         ssize_t r = (off_in >= 0) ? pread(in_ref.fd, buf, n, off_in)
@@ -2286,6 +2300,15 @@ int64_t sys_splice(guest_t *g,
                 if (w < 0 && saved_errno == EPIPE)
                     signal_queue(LINUX_SIGPIPE);
                 total += written; /* Account for partial bytes written */
+                /* Position-based input: read() consumed all r bytes but only
+                 * written were moved, so rewind the input fd by r - written to
+                 * match Linux advancing only by bytes transferred. Best-effort;
+                 * a pipe input (common for splice) cannot seek and keeps the
+                 * prior behavior. saved_errno is restored at done.
+                 */
+                if (off_in < 0 && written < (size_t) r)
+                    (void) lseek(in_ref.fd, (off_t) ((ssize_t) written - r),
+                                 SEEK_CUR);
                 goto done;
             }
             written += w;
@@ -2296,42 +2319,33 @@ int64_t sys_splice(guest_t *g,
     }
 
 done:
-    /* Write back updated offsets. Preserve partial transfer success: if bytes
-     * were already moved, return that count even if the offset writeback fails
-     * (consistent with sendfile/copy_file_range).
+    /* Write back updated offsets, then pick the return value. Preserve partial
+     * transfer success: if bytes were already moved, return that count even
+     * when an offset writeback faults (consistent with
+     * sendfile/copy_file_range). A failed off_in writeback skips the off_out
+     * writeback, matching the kernel.
      */
     if (off_in_gva && off_in >= 0 &&
         guest_write_small(g, off_in_gva, &off_in, sizeof(off_in)) < 0) {
-        int64_t ret = total > 0 ? (int64_t) total : -LINUX_EFAULT;
-        host_fd_ref_close(&out_ref);
-        host_fd_ref_close(&in_ref);
-        return ret;
-    }
-    if (off_out_gva && off_out >= 0 &&
-        guest_write_small(g, off_out_gva, &off_out, sizeof(off_out)) < 0) {
-        int64_t ret = total > 0 ? (int64_t) total : -LINUX_EFAULT;
-        host_fd_ref_close(&out_ref);
-        host_fd_ref_close(&in_ref);
-        return ret;
+        ret = total > 0 ? (int64_t) total : -LINUX_EFAULT;
+    } else if (off_out_gva && off_out >= 0 &&
+               guest_write_small(g, off_out_gva, &off_out, sizeof(off_out)) <
+                   0) {
+        ret = total > 0 ? (int64_t) total : -LINUX_EFAULT;
+    } else if (total > 0) {
+        ret = (int64_t) total;
+    } else if (rw_error) {
+        /* Restore saved_errno; the guest writes above may have clobbered it. */
+        errno = saved_errno;
+        ret = linux_errno();
+    } else {
+        ret = 0;
     }
 
-    /* Return bytes transferred, or errno only if read/write failed. Restore
-     * saved_errno since free/guest_write may have clobbered it.
-     */
-    if (total > 0) {
-        host_fd_ref_close(&out_ref);
-        host_fd_ref_close(&in_ref);
-        return (int64_t) total;
-    }
-    if (rw_error) {
-        errno = saved_errno;
-        host_fd_ref_close(&out_ref);
-        host_fd_ref_close(&in_ref);
-        return linux_errno();
-    }
+    free(buf);
     host_fd_ref_close(&out_ref);
     host_fd_ref_close(&in_ref);
-    return 0;
+    return ret;
 }
 
 /* vmsplice: emulate as writev to the pipe fd */

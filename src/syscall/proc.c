@@ -21,6 +21,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <limits.h>
 #include <pthread.h>
 #include <signal.h>
 #include <sys/stat.h>
@@ -330,17 +331,37 @@ pid_t proc_guest_to_host_pid(int64_t gpid)
     return result;
 }
 
+/* Build the path to the cross-process signal-transport file for host_pid.
+ *
+ * Files live in the per-user private temp directory macOS provisions (mode
+ * 0700, owned by the invoking uid) rather than world-writable /tmp, so another
+ * local user cannot pre-plant a symlink to redirect the write or inject signal
+ * numbers into the guest. confstr returns the same directory for every process
+ * of this uid, so sender and receiver agree on the path. Callers open the
+ * result O_NOFOLLOW for defense in depth.
+ *
+ * Returns false (fail closed) if the private directory cannot be resolved.
+ */
+static bool signal_transport_path(char *out, size_t out_size, pid_t host_pid)
+{
+    char dir[PATH_MAX];
+    size_t n = confstr(_CS_DARWIN_USER_TEMP_DIR, dir, sizeof(dir));
+    if (n == 0 || n > sizeof(dir))
+        return false;
+    int len = snprintf(out, out_size, "%selfuse-sig-%ld", dir, (long) host_pid);
+    return len > 0 && (size_t) len < out_size;
+}
+
 int proc_send_guest_signal(pid_t host_pid, int signum)
 {
-    char path[64];
-    int path_len =
-        snprintf(path, sizeof(path), "/tmp/elfuse-sig-%ld", (long) host_pid);
-    if (path_len < 0 || (size_t) path_len >= sizeof(path)) {
+    char path[PATH_MAX];
+    if (!signal_transport_path(path, sizeof(path), host_pid)) {
         errno = ENAMETOOLONG;
         return -1;
     }
 
-    int fd = open(path, O_CREAT | O_APPEND | O_WRONLY | O_CLOEXEC, 0600);
+    int fd = open(path, O_CREAT | O_APPEND | O_WRONLY | O_CLOEXEC | O_NOFOLLOW,
+                  0600);
     if (fd < 0)
         return -1;
 
@@ -553,6 +574,20 @@ static int write_rusage_to_guest(guest_t *g,
     return guest_write_small(g, gva, &lru, sizeof(lru));
 }
 
+/* Deactivate the wait4 process-table slot iff it still holds host_pid.
+ * sys_wait4 releases pid_lock across the host wait4 call, so another reaper
+ * thread may have recycled the slot in the meantime; the host_pid re-check
+ * guards against clobbering an unrelated child that took the slot. pid_lock
+ * must not be held.
+ */
+static void proc_deactivate_slot_if_matches(int slot, pid_t host_pid)
+{
+    pthread_mutex_lock(&pid_lock);
+    if (proc_table[slot].active && proc_table[slot].host_pid == host_pid)
+        proc_table[slot].active = false;
+    pthread_mutex_unlock(&pid_lock);
+}
+
 /* sys_wait4. */
 
 int64_t sys_wait4(guest_t *g,
@@ -637,28 +672,16 @@ int64_t sys_wait4(guest_t *g,
                                               sizeof(linux_status)) < 0) {
                             /* Child already reaped. Match Linux: return EFAULT
                              */
-                            pthread_mutex_lock(&pid_lock);
-                            if (proc_table[slot].active &&
-                                proc_table[slot].host_pid == host_pid)
-                                proc_table[slot].active = false;
-                            pthread_mutex_unlock(&pid_lock);
+                            proc_deactivate_slot_if_matches(slot, host_pid);
                             return -LINUX_EFAULT;
                         }
                     }
                     if (rusage_gva &&
                         write_rusage_to_guest(g, rusage_gva, &ru) < 0) {
-                        pthread_mutex_lock(&pid_lock);
-                        if (proc_table[slot].active &&
-                            proc_table[slot].host_pid == host_pid)
-                            proc_table[slot].active = false;
-                        pthread_mutex_unlock(&pid_lock);
+                        proc_deactivate_slot_if_matches(slot, host_pid);
                         return -LINUX_EFAULT;
                     }
-                    pthread_mutex_lock(&pid_lock);
-                    if (proc_table[slot].active &&
-                        proc_table[slot].host_pid == host_pid)
-                        proc_table[slot].active = false;
-                    pthread_mutex_unlock(&pid_lock);
+                    proc_deactivate_slot_if_matches(slot, host_pid);
                     return gpid;
                 }
                 /* ret == 0 (not exited) or ret < 0 (error): try next */
@@ -718,29 +741,17 @@ int64_t sys_wait4(guest_t *g,
                     int32_t linux_status = status;
                     if (guest_write_small(g, status_gva, &linux_status,
                                           sizeof(linux_status)) < 0) {
-                        pthread_mutex_lock(&pid_lock);
-                        if (proc_table[slot].active &&
-                            proc_table[slot].host_pid == host_pid)
-                            proc_table[slot].active = false;
-                        pthread_mutex_unlock(&pid_lock);
+                        proc_deactivate_slot_if_matches(slot, host_pid);
                         return -LINUX_EFAULT;
                     }
                 }
                 if (rusage_gva &&
                     write_rusage_to_guest(g, rusage_gva, &ru) < 0) {
-                    pthread_mutex_lock(&pid_lock);
-                    if (proc_table[slot].active &&
-                        proc_table[slot].host_pid == host_pid)
-                        proc_table[slot].active = false;
-                    pthread_mutex_unlock(&pid_lock);
+                    proc_deactivate_slot_if_matches(slot, host_pid);
                     return -LINUX_EFAULT;
                 }
-                pthread_mutex_lock(&pid_lock);
                 /* Re-validate slot: another thread may have reaped it */
-                if (proc_table[slot].active &&
-                    proc_table[slot].host_pid == host_pid)
-                    proc_table[slot].active = false;
-                pthread_mutex_unlock(&pid_lock);
+                proc_deactivate_slot_if_matches(slot, host_pid);
                 /* Queue SIGCHLD for parent process */
                 signal_queue(LINUX_SIGCHLD);
                 return gpid;
@@ -987,9 +998,10 @@ static void drain_external_guest_signal(void)
         return;
     g_external_guest_signal = 0;
 
-    char path[64];
-    snprintf(path, sizeof(path), "/tmp/elfuse-sig-%ld", (long) getpid());
-    int fd = open(path, O_RDONLY);
+    char path[PATH_MAX];
+    if (!signal_transport_path(path, sizeof(path), getpid()))
+        return;
+    int fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
     if (fd < 0)
         return;
 
