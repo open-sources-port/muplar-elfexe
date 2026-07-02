@@ -33,6 +33,12 @@
 #include "syscall/abi.h"
 #include "syscall/internal.h"
 #include "syscall/net.h"
+#include "utils.h"
+#include <poll.h>
+
+#ifndef LINUX_MSG_DONTWAIT
+#define LINUX_MSG_DONTWAIT 0x40
+#endif
 
 static void netlink_close(int guest_fd);
 
@@ -130,6 +136,8 @@ typedef struct {
     size_t buf_pos; /* Current read position */
     uint32_t seq;   /* Sequence number from last request */
     uint32_t pid;   /* Bound PID (from bind or auto-assigned) */
+    int pipe_wr;    /* Host pipe write descriptor */
+    int pipe_rd;    /* Host pipe read descriptor */
 } netlink_state_t;
 
 static netlink_state_t nl_state[MAX_NETLINK_FDS];
@@ -156,6 +164,8 @@ static netlink_state_t *nl_alloc(int guest_fd)
         memset(s, 0, sizeof(*s));
         s->in_use = true;
         s->guest_fd = guest_fd;
+        s->pipe_wr = -1;
+        s->pipe_rd = -1;
         s->buf = malloc(NETLINK_BUF_SIZE);
         if (!s->buf) {
             s->in_use = false;
@@ -165,6 +175,26 @@ static netlink_state_t *nl_alloc(int guest_fd)
         return s;
     }
     return NULL;
+}
+
+static void netlink_signal_readable(netlink_state_t *ns)
+{
+    if (ns->pipe_wr != -1) {
+        uint8_t dummy = 1;
+        (void) write(ns->pipe_wr, &dummy, 1);
+    }
+}
+
+static void netlink_clear_readable(netlink_state_t *ns)
+{
+    int host_fd = ns->pipe_rd;
+    if (host_fd < 0)
+        return;
+
+    uint8_t dummy[128];
+    while (read(host_fd, dummy, sizeof(dummy)) > 0) {
+        /* Drain non-blocking pipe */
+    }
 }
 
 /* Append a netlink attribute to the buffer. Returns bytes written. */
@@ -423,6 +453,12 @@ int64_t netlink_socket(int protocol, int type)
     if (pipe(pipefd) < 0)
         return -LINUX_EMFILE;
 
+    if (fd_set_nonblock(pipefd[0]) < 0 || fd_set_nonblock(pipefd[1]) < 0) {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        return -LINUX_EMFILE;
+    }
+
     int gfd = fd_alloc(FD_NETLINK, pipefd[0], netlink_close);
     if (gfd < 0) {
         close(pipefd[0]);
@@ -438,10 +474,8 @@ int64_t netlink_socket(int protocol, int type)
         return -LINUX_ENOMEM;
     }
 
-    /* No poll wakeup fd is needed because recvmsg drains the buffered response
-     * directly.
-     */
-    close(pipefd[1]); /* The write end is unused */
+    ns->pipe_wr = pipefd[1];
+    ns->pipe_rd = pipefd[0];
 
     return gfd;
 }
@@ -604,7 +638,12 @@ int64_t netlink_sendmsg(int guest_fd, guest_t *g, uint64_t msg_gva, int flags)
         goto out;
     }
 
+    bool was_empty = ns->buf_pos >= ns->buf_len;
     int ret = nl_process_request(ns, req, rlen);
+    if (ret == 0) {
+        if (was_empty && ns->buf_pos < ns->buf_len)
+            netlink_signal_readable(ns);
+    }
     result = (ret < 0) ? ret : (int64_t) iov.iov_len;
 
 out:
@@ -635,7 +674,12 @@ int64_t netlink_send(int guest_fd, guest_t *g, uint64_t buf_gva, uint64_t len)
         goto out;
     }
 
+    bool was_empty = ns->buf_pos >= ns->buf_len;
     int ret = nl_process_request(ns, req, rlen);
+    if (ret == 0) {
+        if (was_empty && ns->buf_pos < ns->buf_len)
+            netlink_signal_readable(ns);
+    }
     result = (ret < 0) ? ret : (int64_t) len;
 
 out:
@@ -650,6 +694,7 @@ int64_t netlink_recv(int guest_fd,
                      guest_t *g,
                      uint64_t buf_gva,
                      uint64_t len,
+                     int flags,
                      uint64_t src_gva,
                      uint64_t addrlen_gva)
 {
@@ -660,9 +705,42 @@ int64_t netlink_recv(int guest_fd,
         return -LINUX_EBADF;
     }
 
-    if (ns->buf_pos >= ns->buf_len) {
+    if (len == 0) {
         pthread_mutex_unlock(&nl_lock);
         return 0;
+    }
+
+    /* Wait for data to become available. If the buffer is empty, block
+     * on the host pipe read end. Honor MSG_DONTWAIT and O_NONBLOCK flags.
+     */
+    while (ns->buf_pos >= ns->buf_len) {
+        bool nonblock = (flags & LINUX_MSG_DONTWAIT) ||
+                        (fd_table[guest_fd].linux_flags & LINUX_O_NONBLOCK);
+        if (nonblock) {
+            pthread_mutex_unlock(&nl_lock);
+            return -LINUX_EAGAIN;
+        }
+
+        int rd_fd = ns->pipe_rd;
+        pthread_mutex_unlock(&nl_lock);
+
+        struct pollfd pfd = {
+            .fd = rd_fd,
+            .events = POLLIN,
+        };
+        int ret = poll(&pfd, 1, -1);
+        if (ret < 0) {
+            if (errno == EINTR)
+                return -LINUX_EINTR;
+            return -LINUX_EIO;
+        }
+
+        pthread_mutex_lock(&nl_lock);
+        netlink_state_t *current_ns = nl_find(guest_fd);
+        if (!current_ns || current_ns != ns) {
+            pthread_mutex_unlock(&nl_lock);
+            return -LINUX_EBADF;
+        }
     }
 
     size_t avail = ns->buf_len - ns->buf_pos;
@@ -688,6 +766,9 @@ int64_t netlink_recv(int guest_fd,
         return -LINUX_EFAULT;
     }
     ns->buf_pos += msg_end;
+
+    if (ns->buf_pos >= ns->buf_len)
+        netlink_clear_readable(ns);
 
     if (src_gva && addrlen_gva) {
         sockaddr_nl_t snl = {
@@ -738,17 +819,11 @@ int64_t netlink_getsockname(int guest_fd,
 
 int64_t netlink_recvmsg(int guest_fd, guest_t *g, uint64_t msg_gva, int flags)
 {
-    (void) flags;
     pthread_mutex_lock(&nl_lock);
     netlink_state_t *ns = nl_find(guest_fd);
     if (!ns) {
         pthread_mutex_unlock(&nl_lock);
         return -LINUX_EBADF;
-    }
-
-    if (ns->buf_pos >= ns->buf_len) {
-        pthread_mutex_unlock(&nl_lock);
-        return 0;
     }
 
     /* Parse msghdr to get iovec */
@@ -769,6 +844,44 @@ int64_t netlink_recvmsg(int guest_fd, guest_t *g, uint64_t msg_gva, int flags)
     if (guest_read_small(g, mhdr.msg_iov, &iov, sizeof(iov)) < 0) {
         pthread_mutex_unlock(&nl_lock);
         return -LINUX_EFAULT;
+    }
+
+    if (iov.iov_len == 0) {
+        pthread_mutex_unlock(&nl_lock);
+        return 0;
+    }
+
+    /* Wait for data to become available. If the buffer is empty, block
+     * on the host pipe read end. Honor MSG_DONTWAIT and O_NONBLOCK flags.
+     */
+    while (ns->buf_pos >= ns->buf_len) {
+        bool nonblock = (flags & LINUX_MSG_DONTWAIT) ||
+                        (fd_table[guest_fd].linux_flags & LINUX_O_NONBLOCK);
+        if (nonblock) {
+            pthread_mutex_unlock(&nl_lock);
+            return -LINUX_EAGAIN;
+        }
+
+        int rd_fd = ns->pipe_rd;
+        pthread_mutex_unlock(&nl_lock);
+
+        struct pollfd pfd = {
+            .fd = rd_fd,
+            .events = POLLIN,
+        };
+        int ret = poll(&pfd, 1, -1);
+        if (ret < 0) {
+            if (errno == EINTR)
+                return -LINUX_EINTR;
+            return -LINUX_EIO;
+        }
+
+        pthread_mutex_lock(&nl_lock);
+        netlink_state_t *current_ns = nl_find(guest_fd);
+        if (!current_ns || current_ns != ns) {
+            pthread_mutex_unlock(&nl_lock);
+            return -LINUX_EBADF;
+        }
     }
 
     size_t avail = ns->buf_len - ns->buf_pos;
@@ -804,6 +917,9 @@ int64_t netlink_recvmsg(int guest_fd, guest_t *g, uint64_t msg_gva, int flags)
 
     ns->buf_pos += msg_end;
 
+    if (ns->buf_pos >= ns->buf_len)
+        netlink_clear_readable(ns);
+
     /* Write back sockaddr_nl if caller provided msg_name */
     if (mhdr.msg_name && mhdr.msg_namelen >= sizeof(sockaddr_nl_t)) {
         sockaddr_nl_t snl = {
@@ -837,9 +953,42 @@ int64_t netlink_read(int guest_fd, guest_t *g, uint64_t buf_gva, uint64_t count)
         return -LINUX_EBADF;
     }
 
-    if (ns->buf_pos >= ns->buf_len) {
+    if (count == 0) {
         pthread_mutex_unlock(&nl_lock);
         return 0;
+    }
+
+    /* Wait for data to become available. If the buffer is empty, block
+     * on the host pipe read end. Honor O_NONBLOCK flag.
+     */
+    while (ns->buf_pos >= ns->buf_len) {
+        bool nonblock =
+            (fd_table[guest_fd].linux_flags & LINUX_O_NONBLOCK) != 0;
+        if (nonblock) {
+            pthread_mutex_unlock(&nl_lock);
+            return -LINUX_EAGAIN;
+        }
+
+        int rd_fd = ns->pipe_rd;
+        pthread_mutex_unlock(&nl_lock);
+
+        struct pollfd pfd = {
+            .fd = rd_fd,
+            .events = POLLIN,
+        };
+        int ret = poll(&pfd, 1, -1);
+        if (ret < 0) {
+            if (errno == EINTR)
+                return -LINUX_EINTR;
+            return -LINUX_EIO;
+        }
+
+        pthread_mutex_lock(&nl_lock);
+        netlink_state_t *current_ns = nl_find(guest_fd);
+        if (!current_ns || current_ns != ns) {
+            pthread_mutex_unlock(&nl_lock);
+            return -LINUX_EBADF;
+        }
     }
 
     size_t avail = ns->buf_len - ns->buf_pos;
@@ -851,6 +1000,10 @@ int64_t netlink_read(int guest_fd, guest_t *g, uint64_t buf_gva, uint64_t count)
     }
 
     ns->buf_pos += to_copy;
+
+    if (ns->buf_pos >= ns->buf_len)
+        netlink_clear_readable(ns);
+
     pthread_mutex_unlock(&nl_lock);
     return (int64_t) to_copy;
 }
@@ -863,6 +1016,11 @@ static void netlink_close(int guest_fd)
         pthread_mutex_unlock(&nl_lock);
         return;
     }
+    if (ns->pipe_wr != -1) {
+        close(ns->pipe_wr);
+        ns->pipe_wr = -1;
+    }
+    ns->pipe_rd = -1;
     free(ns->buf);
     ns->buf = NULL;
     ns->in_use = false;

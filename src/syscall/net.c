@@ -760,7 +760,7 @@ int64_t sys_recvfrom(guest_t *g,
                      uint64_t addrlen_gva)
 {
     if (fd_get_type(fd) == FD_NETLINK)
-        return netlink_recv(fd, g, buf_gva, len, src_gva, addrlen_gva);
+        return netlink_recv(fd, g, buf_gva, len, flags, src_gva, addrlen_gva);
 
     host_fd_ref_t host_ref;
     if (host_fd_ref_open(fd, &host_ref) < 0)

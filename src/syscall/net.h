@@ -203,6 +203,7 @@ int64_t netlink_recv(int guest_fd,
                      guest_t *g,
                      uint64_t buf_gva,
                      uint64_t len,
+                     int flags,
                      uint64_t src_gva,
                      uint64_t addrlen_gva);
 
