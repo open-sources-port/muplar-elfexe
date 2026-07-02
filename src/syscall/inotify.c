@@ -85,9 +85,9 @@ typedef struct {
     bool is_dir;   /* true if watching a directory */
     dev_t dev;     /* Device ID (for re-add lookup by inode) */
     ino_t ino;     /* Inode number (for re-add lookup by inode) */
-    /* Dir watches only: path + entry-name snapshot, diffed on change to
-     * recover the child name kqueue omits. NULL/0 for file watches. */
-    char *path;
+    /* Dir watches only: entry-name snapshot, diffed on each change to recover
+     * the child name kqueue omits. NULL/0 for file watches.
+     */
     char **entries;
     int n_entries;
 } inotify_watch_t;
@@ -314,26 +314,37 @@ static void free_dir_snapshot(char **entries, int n)
 }
 
 /* List a directory's child names, excluding "." and "..", into the out array
- * (free with free_dir_snapshot). Returns false on any failure, leaving the
- * result empty -- which the caller must treat as distinct from a true return
- * with zero entries, since a failure mistaken for "empty" would diff every
- * known child as deleted.
+ * (free with free_dir_snapshot).
+ *
+ * Returns false on any failure, leaving the result empty -- which the caller
+ * must treat as distinct from a true return with zero entries, since a failure
+ * mistaken for "empty" would diff every known child as deleted.
+ *
+ * The directory is re-opened via the watched fd (openat "."), not a stored
+ * pathname: an O_EVTONLY fd follows the inode across renames, so the diff
+ * always reads the directory the watch is registered for even after the path it
+ * was added under moves or is replaced by an unrelated inode.
  */
-static bool dir_snapshot(const char *path, char ***out, int *n_out)
+static bool dir_snapshot_fd(int dirfd, char ***out, int *n_out)
 {
     *out = NULL;
     *n_out = 0;
 
-    DIR *d = opendir(path);
-    if (!d)
+    int fd = openat(dirfd, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0)
         return false;
+    DIR *d = fdopendir(fd);
+    if (!d) {
+        close(fd);
+        return false;
+    }
 
     char **names = NULL;
     int n = 0, cap = 0;
     bool ok = true;
     for (;;) {
-        /* readdir returns NULL both at end-of-stream and on error; reset
-         * errno immediately before each call so a non-zero errno afterwards
+        /* readdir returns NULL both at end-of-stream and on error; reset errno
+         * immediately before each call so a non-zero errno afterwards
          * unambiguously signals a read error rather than EOF.
          */
         errno = 0;
@@ -385,11 +396,13 @@ static bool snapshot_contains(char *const *entries, int n, const char *name)
 /* Collect events from kqueue. */
 
 /* Translate one EVFILT_VNODE notification into queued inotify events for the
- * watch on host_fd. Returns the number queued, or -1 on buffer overflow (an
- * IN_Q_OVERFLOW marker is queued).
+ * watch on host_fd.
+ *
+ * Returns the number queued, or -1 on buffer overflow (an IN_Q_OVERFLOW marker
+ * is queued).
  *
  * Caller holds inotify_lock; it is held again on return. For a directory write
- * the lock is released around the opendir/readdir snapshot so filesystem I/O
+ * the lock is released around the openat/readdir snapshot so filesystem I/O
  * does not stall inotify operations on other instances. guest_fd identifies
  * this instance: because the table can change while unlocked, the instance and
  * the watch are re-validated (by host_fd and dev/ino) before the snapshot is
@@ -412,19 +425,22 @@ static int process_vnode_event(inotify_instance_t *inst,
     int now_n = 0;
     bool snap_ok = false;
 
-    if (w->is_dir && (fflags & NOTE_WRITE) && w->path) {
-        /* Copy the path + identity, then release the lock for the opendir/
+    if (w->is_dir && (fflags & NOTE_WRITE)) {
+        /* Dup the watched fd under the lock, then release it for the openat/
          * readdir snapshot so filesystem I/O does not block other instances.
+         * The dup pins the watched inode: even if the watch is removed and its
+         * host_fd closed and recycled during the unlocked window, the snapshot
+         * still reads the original directory.
          */
-        char *path = strdup(w->path);
-        if (path) {
+        int dupfd = dup(w->host_fd);
+        if (dupfd >= 0) {
             dev_t dev = w->dev;
             ino_t ino = w->ino;
             int slot = (int) (inst - inotify_state);
 
             pthread_mutex_unlock(&inotify_lock);
-            snap_ok = dir_snapshot(path, &now, &now_n);
-            free(path);
+            snap_ok = dir_snapshot_fd(dupfd, &now, &now_n);
+            close(dupfd);
             pthread_mutex_lock(&inotify_lock);
 
             /* Re-validate across the unlocked window: the instance may have
@@ -445,8 +461,8 @@ static int process_vnode_event(inotify_instance_t *inst,
     }
 
     if (snap_ok) {
-        /* Only diff against -- and advance to -- a snapshot that succeeded.
-         * On failure keep the previous baseline; the next successful snapshot
+        /* Only diff against -- and advance to -- a snapshot that succeeded. On
+         * failure keep the previous baseline; the next successful snapshot
          * reconciles whatever changed in between.
          */
         for (int j = 0; j < now_n && !overflow; j++) {
@@ -468,15 +484,15 @@ static int process_vnode_event(inotify_instance_t *inst,
             }
         }
 
-        /* Advance the snapshot: the directory state has moved on, and any
-         * names dropped under overflow are covered by IN_Q_OVERFLOW.
+        /* Advance the snapshot: the directory state has moved on, and any names
+         * dropped under overflow are covered by IN_Q_OVERFLOW.
          */
         free_dir_snapshot(w->entries, w->n_entries);
         w->entries = now;
         w->n_entries = now_n;
     } else {
         /* File watch or failed snapshot: nothing to apply. free_dir_snapshot
-         * tolerates the NULL result dir_snapshot leaves on failure.
+         * tolerates the NULL result dir_snapshot_fd leaves on failure.
          */
         free_dir_snapshot(now, now_n);
     }
@@ -508,9 +524,10 @@ static int process_vnode_event(inotify_instance_t *inst,
     return queued;
 }
 
-/* Poll the kqueue for pending vnode events and translate them into
- * inotify events in the instance buffer. Returns the number of
- * events collected.
+/* Poll the kqueue for pending vnode events and translate them into inotify
+ * events in the instance buffer.
+ *
+ * Returns the number of events collected.
  */
 static int collect_events(inotify_instance_t *inst)
 {
@@ -640,20 +657,18 @@ int64_t sys_inotify_add_watch(guest_t *g,
     /* Strip IN_MASK_ADD control flag before storing */
     uint32_t event_mask = mask & ~(uint32_t) IN_MASK_ADD;
 
-    /* For directory watches, snapshot the path + current entries up-front
-     * (outside the lock) so collect_events can diff on each change to emit
-     * named IN_CREATE/IN_DELETE. Ownership moves to the watch slot on success;
-     * every early-exit path below frees these.
+    /* For directory watches, snapshot the current entries up-front (outside the
+     * lock) so collect_events can diff on each change to emit named
+     * IN_CREATE/IN_DELETE. Ownership moves to the watch slot on success; every
+     * early-exit path below frees these.
      */
-    char *wpath = NULL;
     char **wentries = NULL;
     int wn = 0;
     if (is_dir) {
-        wpath = strdup(path);
         /* Best-effort: a failed listing starts the watch with an empty
          * baseline, which is the only state worth recording at add time.
          */
-        (void) dir_snapshot(path, &wentries, &wn);
+        (void) dir_snapshot_fd(host_fd, &wentries, &wn);
     }
 
     pthread_mutex_lock(&inotify_lock);
@@ -663,7 +678,6 @@ int64_t sys_inotify_add_watch(guest_t *g,
         pthread_mutex_unlock(&inotify_lock);
         close(host_fd);
         free_dir_snapshot(wentries, wn);
-        free(wpath);
         return -LINUX_EBADF;
     }
 
@@ -687,12 +701,11 @@ int64_t sys_inotify_add_watch(guest_t *g,
         uint32_t snapshot_mask = w->mask; /* Snapshot before unlock */
         pthread_mutex_unlock(&inotify_lock);
 
-        /* Close the duplicate fd; inotify emulation keeps the original.
-         * The existing watch keeps its snapshot; drop this call's copy.
+        /* Close the duplicate fd; inotify emulation keeps the original. The
+         * existing watch keeps its snapshot; drop this call's copy.
          */
         close(host_fd);
         free_dir_snapshot(wentries, wn);
-        free(wpath);
 
         /* Update kevent filter with the new mask (use snapshot -- w->mask may
          * be modified by another thread after unlock)
@@ -712,7 +725,6 @@ int64_t sys_inotify_add_watch(guest_t *g,
         pthread_mutex_unlock(&inotify_lock);
         close(host_fd);
         free_dir_snapshot(wentries, wn);
-        free(wpath);
         return -LINUX_ENOSPC;
     }
 
@@ -728,7 +740,6 @@ int64_t sys_inotify_add_watch(guest_t *g,
     w->is_dir = is_dir;
     w->dev = st.st_dev;
     w->ino = st.st_ino;
-    w->path = wpath;
     w->entries = wentries;
     w->n_entries = wn;
 
@@ -754,8 +765,6 @@ int64_t sys_inotify_add_watch(guest_t *g,
         free_dir_snapshot(w->entries, w->n_entries);
         w->entries = NULL;
         w->n_entries = 0;
-        free(w->path);
-        w->path = NULL;
         pthread_mutex_unlock(&inotify_lock);
         close(host_fd);
         errno = saved;
@@ -793,8 +802,6 @@ int64_t sys_inotify_rm_watch(int inotify_fd, int wd)
     free_dir_snapshot(w->entries, w->n_entries);
     w->entries = NULL;
     w->n_entries = 0;
-    free(w->path);
-    w->path = NULL;
     pthread_mutex_unlock(&inotify_lock);
 
     /* Remove from kqueue and close outside lock */
@@ -964,8 +971,6 @@ static void inotify_close(int guest_fd)
         free_dir_snapshot(inst->watches[i].entries, inst->watches[i].n_entries);
         inst->watches[i].entries = NULL;
         inst->watches[i].n_entries = 0;
-        free(inst->watches[i].path);
-        inst->watches[i].path = NULL;
     }
 
     inst->guest_fd = -1;
