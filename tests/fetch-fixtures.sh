@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# fetch-fixtures.sh -- Download Alpine packages and assemble a qemu/elfuse
-# test fixture tree under externals/test-fixtures/.
+# fetch-fixtures.sh -- Download Alpine packages and assemble a qemu/elfuse test
+# fixture tree under externals/test-fixtures/.
 #
-# Idempotent: re-runs are no-ops once everything is in place.  Re-execute
-# with FORCE=1 to rebuild from scratch.
+# Idempotent: re-runs are no-ops once everything is in place. Re-execute with
+# FORCE=1 to rebuild from scratch.
 #
 # Layout:
 #   externals/test-fixtures/
@@ -36,9 +36,9 @@ set -euo pipefail
 . "$(dirname "$0")/lib/bash-compat.sh"
 
 ALPINE_VERSION="${ALPINE_VERSION:-3.21}"
-# Empty by default -- the exact point release is resolved from the live
-# releases listing at fetch time (see resolve_minirootfs), then written back
-# here so the x86_64 path reuses the same patch. Set explicitly to pin one.
+# Empty by default -- the exact point release is resolved from the live releases
+# listing at fetch time (see resolve_minirootfs), then written back here so the
+# x86_64 path reuses the same patch. Set explicitly to pin one.
 ALPINE_PATCH="${ALPINE_PATCH:-}"
 ALPINE_ARCH="${ALPINE_ARCH:-aarch64}"
 
@@ -57,10 +57,10 @@ STATICBIN="${FIXTURES}/aarch64-musl/staticbin/bin"
 INITRAMFS="${FIXTURES}/initramfs.cpio.gz"
 
 # Required packages as "repo:name". Versions are NOT pinned here: Alpine's
-# mirror keeps only the latest build of each package, so any hard-coded
-# version 404s once a newer build supersedes it. resolve_versions() reads
-# each repo's live APKINDEX and fills PKG_RESOLVED with "repo:name:version"
-# tuples; the rest of the script and pkg_version go through that.
+# mirror keeps only the latest build of each package, so any hard-coded version
+# 404s once a newer build supersedes it. resolve_versions() reads each repo's
+# live APKINDEX and fills PKG_RESOLVED with "repo:name:version" tuples; the rest
+# of the script and pkg_version go through that.
 #
 # Tuples (not associative arrays) keep this working on bash 3.2 hosts (stock
 # macOS /bin/bash) -- see tests/lib/bash-compat.sh.
@@ -104,17 +104,18 @@ PKGS=(
     "main:tree"
 )
 
-# "repo:name:version" tuples, populated by resolve_versions() from live
-# APKINDEX data. Same shape the staging loops and pkg_version expect.
+# "repo:name:version" tuples, populated by resolve_versions() from live APKINDEX
+# data. Same shape the staging loops and pkg_version expect.
 PKG_RESOLVED=()
 
 # Set to 1 by main() when the resolved version set differs from versions.lock,
-# forcing a rebuild of the staged tree even without FORCE. Global so the
-# x86_64 path can honor it too.
+# forcing a rebuild of the staged tree even without FORCE. Global so the x86_64
+# path can honor it too.
 REBUILD=0
 
-# Look up a resolved package version by its "repo:name" prefix. Returns the
-# version on stdout and rc=0 on hit, rc=1 (silently) on miss so the
+# Look up a resolved package version by its "repo:name" prefix.
+#
+# Returns the version on stdout and rc=0 on hit, rc=1 (silently) on miss so the
 # old ${PKGS[key]:-} fallback callers keep working.
 pkg_version()
 {
@@ -133,9 +134,9 @@ pkg_version()
 
 # Subset whose binaries are exposed as standalone "static-bins" suite paths.
 # Most are dynamic but link only against musl/zlib/etc., already in rootfs/.
-# Applet list (hardcoded -- busybox 1.37 inventory).  Busybox does not have
-# b2sum / numfmt / base32; those tests fall through to the dynamic-coreutils
-# suite where the real coreutils binary is available.
+# Applet list (hardcoded -- busybox 1.37 inventory). Busybox does not have b2sum
+# / numfmt / base32; those tests fall through to the dynamic-coreutils suite
+# where the real coreutils binary is available.
 STATIC_APPLETS=(
     echo cat head tail wc sort tr seq expr factor base64 md5sum sha256sum
     cp touch ls stat basename dirname realpath df du
@@ -240,8 +241,8 @@ resolve_versions()
         log "resolve versions ($repo)"
         # Always try to refresh the index -- tracking the live mirror is the
         # point -- but fall back to a cached copy so warm re-runs work offline.
-        # APKINDEX records are blank-line separated; P: is the package name,
-        # V: its version. Flatten to "name version" lines.
+        # APKINDEX records are blank-line separated; P: is the package name, V:
+        # its version. Flatten to "name version" lines.
         if curl -fsSL --retry 3 -o "${idxtgz}.partial" "${base}/APKINDEX.tar.gz"; then
             mv "${idxtgz}.partial" "$idxtgz"
             tar xzOf "$idxtgz" APKINDEX 2> /dev/null | awk '
@@ -280,9 +281,9 @@ resolve_versions()
 }
 
 # Resolve the minirootfs point release. Alpine keeps only a handful of recent
-# releases under releases/, so honor an explicit ALPINE_PATCH but otherwise
-# pick the newest the mirror advertises and write it back to ALPINE_PATCH so
-# the x86_64 path reuses the same patch. Sets MINIROOTFS_TGZ.
+# releases under releases/, so honor an explicit ALPINE_PATCH but otherwise pick
+# the newest the mirror advertises and write it back to ALPINE_PATCH so the
+# x86_64 path reuses the same patch. Sets MINIROOTFS_TGZ.
 resolve_minirootfs()
 {
     if [ -z "$ALPINE_PATCH" ]; then
@@ -309,7 +310,7 @@ resolve_minirootfs()
 }
 
 # Strip Alpine apk metadata (.PKGINFO, .SIGN.*, .pre-install, etc.) when
-# extracting into a target tree.  These are not real files and pollute the
+# extracting into a target tree. These are not real files and pollute the
 # rootfs.
 extract_apk_to()
 {
@@ -337,12 +338,15 @@ main()
     resolve_minirootfs
 
     # If the resolved version set changed since the last run, the staged
-    # rootfs/kernel/initramfs are built from stale apks and must be rebuilt
-    # even without an explicit FORCE.
+    # rootfs/kernel/initramfs are built from stale apks and must be rebuilt even
+    # without an explicit FORCE.
     local entry manifest lockfile
-    manifest="$( { for entry in "${PKG_RESOLVED[@]}"; do
-        printf '%s\n' "$entry"
-    done | LC_ALL=C sort; printf 'minirootfs=%s\n' "$MINIROOTFS_TGZ"; } )"
+    manifest="$({
+        for entry in "${PKG_RESOLVED[@]}"; do
+            printf '%s\n' "$entry"
+        done | LC_ALL=C sort
+        printf 'minirootfs=%s\n' "$MINIROOTFS_TGZ"
+    })"
     lockfile="${FIXTURES}/versions.lock"
     if [ ! -f "$lockfile" ] || [ "$manifest" != "$(cat "$lockfile")" ]; then
         REBUILD=1
@@ -486,18 +490,17 @@ EOF
     fi
     ok "initramfs: $(du -h "$INITRAMFS" | cut -f1)"
 
-    # Stage the dynamic-bin aggregate directory.
-    # Single flat directory of *relative* symlinks pointing into the rootfs.
-    # Relative paths matter: this same tree is consumed by elfuse on macOS
-    # AND by qemu's guest kernel after a 9p mount, where any absolute host
-    # path would no longer resolve.
+    # Stage the dynamic-bin aggregate directory. Single flat directory of
+    # *relative* symlinks pointing into the rootfs. Relative paths matter: this
+    # same tree is consumed by elfuse on macOS AND by qemu's guest kernel after
+    # a 9p mount, where any absolute host path would no longer resolve.
     local dynbin="${FIXTURES}/aarch64-musl/dyn-bin"
     if [ ! -d "$dynbin" ] || [ "${FORCE:-0}" = "1" ] || [ "$REBUILD" = 1 ]; then
         log "stage dyn-bin aggregate"
         rm -rf "$dynbin"
         mkdir -p "$dynbin"
         # ${dynbin} is at <fixtures>/aarch64-musl/dyn-bin; rootfs is at
-        # <fixtures>/rootfs.  The relative path back is "../../rootfs/...".
+        # <fixtures>/rootfs. The relative path back is "../../rootfs/...".
         for sub in bin usr/bin; do
             [ -d "${ROOTFS}/${sub}" ] || continue
             for src in "${ROOTFS}/${sub}"/*; do
@@ -551,10 +554,10 @@ EOF
 }
 
 # Fetch just enough Alpine x86_64 packages to drive the elfuse-x86_64 test
-# matrix mode through rosetta. Userspace only: no kernel or initramfs is
-# built because elfuse runs x86_64 binaries directly. Pinned to the same
-# Alpine release as the aarch64 corpus so busybox / coreutils versions match
-# and the per-mode expected-count table stays consistent.
+# matrix mode through rosetta. Userspace only: no kernel or initramfs is built
+# because elfuse runs x86_64 binaries directly. Pinned to the same Alpine
+# release as the aarch64 corpus so busybox / coreutils versions match and the
+# per-mode expected-count table stays consistent.
 fetch_x86_64_userspace()
 {
     local x86_cache="${FIXTURES}/cache/x86_64"

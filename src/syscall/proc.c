@@ -1,4 +1,5 @@
-/* Process state and management
+/*
+ * Process state and management
  *
  * Copyright 2026 elfuse contributors
  * Copyright 2025 Moritz Angermann, zw3rk pte. ltd.
@@ -941,11 +942,10 @@ void proc_request_hvc6_yield(void)
 }
 
 /* Global vCPU handle for the SIGALRM handler (unavoidable global state --
- * signal handlers cannot receive context parameters).
- */
-/* Written once by vcpu_run_loop before signal(SIGALRM), then only read by
- * alarm_handler / guest_signal_transport_handler. The write happens-before the
- * signal() call that installs the handlers, so no volatile needed.
+ * signal handlers cannot receive context parameters). Written once by
+ * vcpu_run_loop before signal(SIGALRM), then only read by alarm_handler /
+ * guest_signal_transport_handler. The write happens-before the signal() call
+ * that installs the handlers, so no volatile needed.
  */
 static hv_vcpu_t g_timeout_vcpu;
 static volatile sig_atomic_t g_timed_out, g_external_guest_signal;
@@ -1657,6 +1657,115 @@ int vcpu_run_loop(hv_vcpu_t vcpu,
                         }
                     }
 
+                    /* Bounded retry on a stale-TLB data / instruction abort.
+                     * Re-walk the live page tables for the faulting VA before
+                     * declaring SIGSEGV. guest_ptr_avail consults pt_gen, which
+                     * the mutating vCPU bumps under mmap_lock, so the walk
+                     * reflects the current mapping regardless of this vCPU's
+                     * cached (possibly stale) hardware TLB. A non-NULL result
+                     * means the live PT is valid and grants the faulting access
+                     * -- the signature of a stale TLB entry that a cross-vCPU
+                     * mprotect + TLBI failed to evict on this PE.
+                     *
+                     * On that signature, re-issue a selective TLBI for the
+                     * faulting page from this vCPU (same accumulator + emit
+                     * path the lazy-materialization branch uses) and return to
+                     * EL0 to retry the instruction. A genuinely stale entry
+                     * clears on the first retry, so the guest makes progress
+                     * and never re-enters here for that VA.
+                     *
+                     * The retry is bounded per vCPU and per (page, faulting
+                     * PC). If the same instruction keeps faulting on the same
+                     * page despite the re-issued TLBI, the entry is not
+                     * actually stale (a walker / hardware permission-model
+                     * disagreement, or an HVF TLBI that did not take): after
+                     * STALE_TLB_RETRY_MAX attempts, stop retrying and deliver
+                     * SIGSEGV so a genuine fault is never silently swallowed.
+                     * The per-vCPU slot resets when a different page or PC
+                     * faults or when the cap is hit, so a cap-out cannot poison
+                     * a later legitimate retry.
+                     */
+                    enum { STALE_TLB_RETRY_MAX = 16 };
+                    /* Only translation (fsc_type 0x01) and permission (0x03)
+                     * faults are stale-TLB plausible. Alignment,
+                     * external-abort, and access-flag classes cannot be cleared
+                     * by re-issuing TLBI, so do not spend the retry budget on
+                     * them. A translation fault reaches here only after the
+                     * lazy- materialization branch above already declined the
+                     * address, so a live PT that still grants access is a stale
+                     * negative (translation-fault) entry; a permission fault is
+                     * the classic stale entry left by a cross-vCPU mprotect.
+                     */
+                    bool stale_plausible =
+                        (fsc_type == 0x01 || fsc_type == 0x03);
+                    int want_perm =
+                        (fault_ec == 0x20)
+                            ? MEM_PERM_X
+                            : ((esr & (1u << 6)) ? MEM_PERM_W : MEM_PERM_R);
+                    uint64_t live_avail = 0;
+                    void *live_pt = NULL;
+                    if (stale_plausible) {
+                        pthread_mutex_lock(&mmap_lock);
+                        live_pt = guest_ptr_avail(g, far_addr, &live_avail,
+                                                  want_perm);
+                        pthread_mutex_unlock(&mmap_lock);
+                    }
+                    if (live_pt) {
+                        /* Bound per vCPU and per (page, faulting PC). A
+                         * genuinely stuck entry re-faults on the same
+                         * instruction at the same page, so keying the counter
+                         * on both distinguishes a non-recovering loop (cap it)
+                         * from separate successful recoveries -- a different
+                         * PC, or the same page reached from a different
+                         * instruction -- that must each get a fresh budget.
+                         */
+                        static _Thread_local uint64_t stale_page;
+                        static _Thread_local uint64_t stale_elr;
+                        static _Thread_local int stale_count;
+                        uint64_t page = far_addr & ~(GUEST_PAGE_SIZE - 1);
+                        if (page == stale_page && elr_addr == stale_elr) {
+                            stale_count++;
+                        } else {
+                            stale_page = page;
+                            stale_elr = elr_addr;
+                            stale_count = 1;
+                        }
+                        if (stale_count <= STALE_TLB_RETRY_MAX) {
+                            static _Thread_local bool stale_warned;
+                            if (!stale_warned) {
+                                stale_warned = true;
+                                log_warn(
+                                    "%s: EL0 %s fault at 0x%llx (ESR=0x%llx) "
+                                    "but "
+                                    "live PT grants access -- stale TLB; "
+                                    "re-issuing TLBI and retrying (cap %d)",
+                                    prefix,
+                                    (fault_ec == 0x20) ? "inst" : "data",
+                                    (unsigned long long) far_addr,
+                                    (unsigned long long) esr,
+                                    STALE_TLB_RETRY_MAX);
+                            }
+                            tlbi_request_clear();
+                            tlbi_request_range(page, page + GUEST_PAGE_SIZE);
+                            if (want_perm & MEM_PERM_X)
+                                tlbi_request_mark_icache();
+                            tlbi_request_emit_to_vcpu(vcpu);
+                            break;
+                        }
+                        /* Retry budget exhausted: the entry is not actually
+                         * stale. Reset the slot and fall through to SIGSEGV.
+                         */
+                        log_warn(
+                            "%s: stale-TLB retry cap (%d) hit at 0x%llx "
+                            "(ESR=0x%llx); delivering SIGSEGV",
+                            prefix, STALE_TLB_RETRY_MAX,
+                            (unsigned long long) far_addr,
+                            (unsigned long long) esr);
+                        stale_page = 0;
+                        stale_elr = 0;
+                        stale_count = 0;
+                    }
+
                     /* Real SIGSEGV. Permission faults (xFSC[5:2] == 0x3) map to
                      * SEGV_ACCERR; address size, translation, and access-flag
                      * faults map to SEGV_MAPERR for Linux.
@@ -1940,13 +2049,13 @@ int vcpu_run_loop(hv_vcpu_t vcpu,
                    (vexit->reason == HV_EXIT_REASON_UNKNOWN &&
                     (signal_pending() || proc_exit_group_requested() ||
                      (is_main && g_timed_out)))) {
-            /* Canceled by hv_vcpus_exit(). Can be: alarm timeout,
-             * exit_group from another thread, or signal preemption
-             * (signal_queue called hv_vcpus_exit to deliver a signal
-             * while the guest was in a tight loop).
+            /* Canceled by hv_vcpus_exit(). Can be: alarm timeout, exit_group
+             * from another thread, or signal preemption (signal_queue called
+             * hv_vcpus_exit to deliver a signal while the guest was in a tight
+             * loop).
              *
-             * HV_EXIT_REASON_UNKNOWN is the same event seen from the other
-             * side of a race: when a host signal (e.g. the SIGUSR2 used by the
+             * HV_EXIT_REASON_UNKNOWN is the same event seen from the other side
+             * of a race: when a host signal (e.g. the SIGUSR2 used by the
              * cross-process guest-signal transport) is delivered to this thread
              * while it is actively executing guest code inside hv_vcpu_run, the
              * run aborts with UNKNOWN instead of the clean CANCELED that

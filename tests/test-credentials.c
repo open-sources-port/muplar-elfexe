@@ -1,4 +1,5 @@
-/* Test emulated UID/GID, capabilities, priority, and affinity
+/*
+ * Test emulated UID/GID, capabilities, priority, and affinity
  *
  * Copyright 2026 elfuse contributors
  * SPDX-License-Identifier: Apache-2.0
@@ -7,6 +8,9 @@
  *        getresuid, getresgid, capset, setpriority, getpriority,
  *        sched_setaffinity
  */
+
+#include <sys/types.h> /* gid_t */
+#include <unistd.h>    /* getgroups */
 
 #include "test-harness.h"
 #include "raw-syscall.h"
