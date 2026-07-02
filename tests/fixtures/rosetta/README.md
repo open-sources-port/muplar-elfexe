@@ -4,6 +4,15 @@ Rosetta x86_64 test fixtures vendored for self-contained matrix coverage.
   - static x86_64 Linux ELF built from `tests/x86_64-rosetta-audit.c`
 - `x86_64-rosetta-tls0`
   - static x86_64 Linux ELF built from `tests/x86_64-rosetta-tls0.c`
+- `x86_64-rosetta-madvise`
+  - static x86_64 Linux ELF built from `tests/x86_64-rosetta-madvise.c`
+  - used by `tests/test-rosetta-madvise.sh`
+- `x86_64-rosetta-msync`
+  - static x86_64 Linux ELF built from `tests/x86_64-rosetta-msync.c`
+  - used by `tests/test-rosetta-msync.sh`
+- `x86_64-rosetta-mremap`
+  - static x86_64 Linux ELF built from `tests/x86_64-rosetta-mremap.c`
+  - used by `tests/test-rosetta-mremap.sh`
 - `x86_64-glibc-rootfs.tar.gz`
   - minimal x86_64 glibc rootfs used by `tests/test-rosetta-glibc.sh`
   - contains `hello-dynamic`, `dlopen-probe`, `tls-probe`,
@@ -34,8 +43,11 @@ gcc -O2 -o tls-probe             tests/x86_64-glibc-tls.c
 gcc -O2 -fPIC -shared -o libgdtls.so tests/x86_64-glibc-gdtls-lib.c
 gcc -O2 -ldl -o gdtls-probe      tests/x86_64-glibc-gdtls.c
 gcc -O2 -pthread -o pthread-tls-probe tests/x86_64-glibc-pthread-tls.c
-gcc -O2 -static -o x86_64-rosetta-audit tests/x86_64-rosetta-audit.c
-gcc -O2 -static -o x86_64-rosetta-tls0  tests/x86_64-rosetta-tls0.c
+gcc -O2 -static -o x86_64-rosetta-audit   tests/x86_64-rosetta-audit.c
+gcc -O2 -static -o x86_64-rosetta-tls0    tests/x86_64-rosetta-tls0.c
+gcc -O2 -static -o x86_64-rosetta-madvise tests/x86_64-rosetta-madvise.c
+gcc -O2 -static -o x86_64-rosetta-msync   tests/x86_64-rosetta-msync.c
+gcc -O2 -static -o x86_64-rosetta-mremap  tests/x86_64-rosetta-mremap.c
 # Stage the matching ld.so / libc.so.6 / libm.so.6 from the same host
 # into a rootfs/ tree alongside libgdtls.so under lib/x86_64-linux-gnu/,
 # then tar -czf x86_64-glibc-rootfs.tar.gz rootfs/.

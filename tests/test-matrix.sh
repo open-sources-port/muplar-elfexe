@@ -613,10 +613,22 @@ run_rosetta_x86_64_suites()
         printf "\nRosetta glibc dynamic\n"
         run_summary_suite "rosetta-glibc" \
             bash "${REPO_ROOT}/tests/test-rosetta-glibc.sh" "$ELFUSE" || rc=1
+
+        printf "\nRosetta high-VA madvise\n"
+        run_summary_suite "rosetta-madvise" \
+            bash "${REPO_ROOT}/tests/test-rosetta-madvise.sh" "$ELFUSE" || rc=1
+
+        printf "\nRosetta high-VA msync\n"
+        run_summary_suite "rosetta-msync" \
+            bash "${REPO_ROOT}/tests/test-rosetta-msync.sh" "$ELFUSE" || rc=1
+
+        printf "\nRosetta high-VA mremap\n"
+        run_summary_suite "rosetta-mremap" \
+            bash "${REPO_ROOT}/tests/test-rosetta-mremap.sh" "$ELFUSE" || rc=1
     else
         local suite
         for suite in rosetta-statics rosetta-alpine rosetta-audit rosetta-jit \
-            rosetta-glibc; do
+            rosetta-glibc rosetta-madvise rosetta-msync rosetta-mremap; do
             skip_suite "$suite" "Rosetta translator not installed"
         done
     fi

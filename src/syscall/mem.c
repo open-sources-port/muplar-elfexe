@@ -511,7 +511,6 @@ static int64_t sys_mmap_high_va(guest_t *g,
         return -LINUX_ENOMEM;
 
     bool is_anon = (flags & LINUX_MAP_ANONYMOUS) != 0;
-    bool is_shared = (flags & LINUX_MAP_SHARED) != 0;
     host_fd_ref_t backing_ref = {.fd = -1, .owned = false};
     int host_backing_fd = -1;
     int track_backing_fd = -1;
@@ -556,8 +555,16 @@ static int64_t sys_mmap_high_va(guest_t *g,
      */
     bool siblings_quiesced = false;
 
-    if (!is_anon && is_shared)
-        return -LINUX_ENODEV;
+    /* File-backed MAP_SHARED lands here as a snapshot-style shared region: the
+     * page contents are pread into fresh high-VA backing below and tracked with
+     * the region's backing fd, and msync writes dirty bytes back through
+     * sync_shared_aliases_range (which resolves the region via gpa_base). This
+     * mirrors how the primary window treats MAP_SHARED file mappings --
+     * coherence is msync-driven, not live page-cache -- and unblocks high-VA
+     * shared file caches such as apt's package lists under Rosetta (issue
+     * #108). Shared anonymous mappings (MAP_SHARED | MAP_ANONYMOUS, no backing
+     * fd) already fell through here and are unchanged.
+     */
 
     /* Reject wrap before reusing addr + length anywhere below. The caller
      * page-rounds length, but addr is guest-supplied and a huge length against
@@ -993,13 +1000,21 @@ static int hvf_apply_file_overlay_quiesced(guest_t *g,
                                            off_t file_off);
 static int hvf_remove_file_overlay(guest_t *g, uint64_t ipa, uint64_t len);
 
+/* Copy [file_off, file_off+len) of fd into the guest page backing GPA `gpa`.
+ * The destination is resolved through host_ptr_for_gpa so both primary-window
+ * pages (gpa < guest_size -> host_base + gpa) and high-VA pages backed by a
+ * named mapping or overflow segment land on their real host buffer. Callers
+ * that stay in the primary window pass a low IPA offset, which equals its own
+ * GPA there, so their behaviour is unchanged. */
 static int read_file_range_to_guest(guest_t *g,
-                                    uint64_t guest_off,
+                                    uint64_t gpa,
                                     int fd,
                                     uint64_t file_off,
                                     uint64_t len)
 {
-    uint8_t *dst = (uint8_t *) g->host_base + guest_off;
+    uint8_t *dst = host_ptr_for_gpa(g, gpa);
+    if (!dst)
+        return -LINUX_EFAULT;
     size_t remaining = len;
 
     while (remaining > 0) {
@@ -2648,14 +2663,18 @@ int64_t sys_mremap(guest_t *g,
         ~(LINUX_MREMAP_MAYMOVE | LINUX_MREMAP_FIXED | LINUX_MREMAP_DONTUNMAP))
         return -LINUX_EINVAL;
 
-    /* Overflow check on old range. mremap's body shrinks, copies, and zeroes
-     * via raw host_base+off arithmetic, so the check stays primary-only here
-     * until the data-movement paths are made region-aware.
+    /* No primary-window bound on the source: the range is validated against the
+     * region tracker below (src_reg coverage), so high-VA mmap regions are
+     * accepted. The shrink/move paths resolve the source through the region's
+     * gpa_base, and the destination is always allocated in the primary window
+     * (find_free_gap / mremap_extend_range), so no high-VA destination backing
+     * is needed. Guard underflow (addr below ipa_base) and old_off + old_size
+     * wrap explicitly, which the old guest_size bound used to imply.
      */
-    uint64_t old_off = old_addr - g->ipa_base;
-    if (old_off > g->guest_size)
+    if (old_addr < g->ipa_base)
         return -LINUX_EFAULT;
-    if (old_size > 0 && old_size > g->guest_size - old_off)
+    uint64_t old_off = old_addr - g->ipa_base;
+    if (old_size > 0 && old_off > UINT64_MAX - old_size)
         return -LINUX_EFAULT;
 
     /* Reject mremap whose source range touches VM infrastructure (page tables,
@@ -2675,6 +2694,15 @@ int64_t sys_mremap(guest_t *g,
     if (!src_reg || src_reg->end - old_off < old_size)
         return -LINUX_EFAULT;
 
+    /* Capture the source region's GPA layout before any region mutation below
+     * invalidates src_reg. src_gpa_base + (va_off - src_start) is the backing
+     * GPA of a source VA-offset; host_ptr_for_gpa turns it into the real host
+     * pointer (identity for primary regions, overflow/mapping tier for
+     * high-VA).
+     */
+    uint64_t src_gpa_base = src_reg->gpa_base;
+    uint64_t src_start = src_reg->start;
+
     /* Same size: nothing to do */
     if (old_size == new_size && !(flags & LINUX_MREMAP_FIXED))
         return (int64_t) old_addr;
@@ -2688,8 +2716,10 @@ int64_t sys_mremap(guest_t *g,
         int cleanup_err = cleanup_overlays_in_range(g, tail_off, tail_end);
         if (cleanup_err < 0)
             return cleanup_err;
-        /* Zero the trimmed region */
-        memset((uint8_t *) g->host_base + tail_off, 0, tail_end - tail_off);
+        /* Zero the trimmed region on its real backing (high-VA tails live at
+         * gpa_base, not host_base + tail_off). */
+        memset(host_ptr_for_gpa(g, src_gpa_base + (tail_off - src_start)), 0,
+               tail_end - tail_off);
         guest_region_remove(g, tail_off, tail_end);
         guest_invalidate_ptes(g, tail_off, tail_end);
         if (tail_off < g->mmap_rw_gap_hint)
@@ -2889,8 +2919,13 @@ int64_t sys_mremap(guest_t *g,
                 return copy_err;
             }
         } else {
+            /* Read the source through its GPA (identity for primary sources,
+             * overflow/mapping backing for high-VA). The destination is always
+             * a fresh primary-window range, so it never overlaps the source and
+             * the copy direction does not matter. */
             memmove((uint8_t *) g->host_base + new_off,
-                    (uint8_t *) g->host_base + old_off, copy_len);
+                    host_ptr_for_gpa(g, src_gpa_base + (old_off - src_start)),
+                    copy_len);
         }
         /* Zero any extension beyond old data */
         if (new_size > old_size)
@@ -2899,7 +2934,8 @@ int64_t sys_mremap(guest_t *g,
 
         /* Remove old mapping */
         if (old_size > 0) {
-            memset((uint8_t *) g->host_base + old_off, 0, old_size);
+            memset(host_ptr_for_gpa(g, src_gpa_base + (old_off - src_start)), 0,
+                   old_size);
             guest_region_remove(g, old_off, old_off + old_size);
             guest_invalidate_ptes(g, old_off, old_off + old_size);
             if (old_off < g->mmap_rw_gap_hint)
@@ -3125,8 +3161,12 @@ int64_t sys_mremap(guest_t *g,
                 return copy_err;
             }
         } else {
+            /* Read the source through its GPA so high-VA sources copy from
+             * their real backing (identity for primary: == host_base +
+             * old_off). The destination is a fresh primary-window gap. */
             memcpy((uint8_t *) g->host_base + new_off,
-                   (uint8_t *) g->host_base + old_off, old_size);
+                   host_ptr_for_gpa(g, src_gpa_base + (old_off - src_start)),
+                   old_size);
         }
         memset((uint8_t *) g->host_base + new_off + old_size, 0,
                new_size - old_size);
@@ -3134,7 +3174,8 @@ int64_t sys_mremap(guest_t *g,
         /* Remove old mapping. Any live source overlay was already torn down
          * before the destination range was touched.
          */
-        memset((uint8_t *) g->host_base + old_off, 0, old_size);
+        memset(host_ptr_for_gpa(g, src_gpa_base + (old_off - src_start)), 0,
+               old_size);
         guest_region_remove(g, old_off, old_off + old_size);
         guest_invalidate_ptes(g, old_off, old_off + old_size);
         if (old_off < g->mmap_rw_gap_hint)
@@ -3212,7 +3253,13 @@ int64_t sys_madvise(guest_t *g, uint64_t addr, uint64_t length, int advice)
      * guest_is_valid_range once the body is updated.
      */
     uint64_t off = addr - g->ipa_base;
-    if (off > g->guest_size || length > g->guest_size - off)
+    /* Accept ranges in the primary IPA window, and also high-VA mmap regions
+     * (gpa_base != start) that the tracker records as mapped. Rosetta's own
+     * slab/JIT and guest JITs (e.g. V8) decommit pages in the high-VA window
+     * via mprotect(PROT_NONE)+madvise(MADV_DONTNEED); rejecting those with
+     * ENOMEM trips the guest's CHECK_EQ(0, ret) on the madvise return. */
+    bool in_primary = (off <= g->guest_size && length <= g->guest_size - off);
+    if (!in_primary && !madvise_range_mapped(g, off, length))
         return -LINUX_ENOMEM;
 
     /* Defensive guard against destructive advice on infrastructure ranges (page
@@ -3264,13 +3311,22 @@ int64_t sys_madvise(guest_t *g, uint64_t addr, uint64_t length, int advice)
 
             uint64_t zstart = (r->start > off) ? r->start : off;
             uint64_t zend = (r->end < end) ? r->end : end;
-            memset((uint8_t *) g->host_base + zstart, 0, zend - zstart);
+            /* High-VA regions back their pages at gpa_base, not at the VA;
+             * resolve the host pointer through the GPA so the reset hits the
+             * real backing (host_ptr_for_gpa also follows live overlays). For
+             * identity regions gpa_base == start, so this is unchanged. */
+            uint64_t rgpa = r->gpa_base + (zstart - r->start);
+            memset(host_ptr_for_gpa(g, rgpa), 0, zend - zstart);
             if (!(r->flags & LINUX_MAP_ANONYMOUS)) {
-                /* EOF leaves the tail zero per mmap rules; the helper already
-                 * returns 0 in that case after stopping the read loop.
+                /* Restore file-backed pages from the current backing image.
+                 * read_file_range_to_guest resolves the destination through
+                 * rgpa, so high-VA file mappings (gpa_base != start) land on
+                 * their real backing rather than being left zero-filled. EOF
+                 * leaves the tail zero per mmap rules; the helper returns 0 in
+                 * that case after stopping the read loop.
                  */
                 int err = read_file_range_to_guest(
-                    g, zstart, r->backing_fd, r->offset + (zstart - r->start),
+                    g, rgpa, r->backing_fd, r->offset + (zstart - r->start),
                     zend - zstart);
                 if (err < 0)
                     return err;
@@ -3670,8 +3726,14 @@ static int64_t sync_shared_aliases_range(guest_t *g,
             if (wfile_start >= wfile_end)
                 continue;
 
-            const uint8_t *guest = (const uint8_t *) g->host_base + src->start +
-                                   (wfile_start - src->offset);
+            /* Resolve the guest bytes through the region's GPA so high-VA
+             * shared mappings (gpa_base != start) read from their real backing
+             * rather than host_base + start. For identity regions gpa_base ==
+             * start, so this is unchanged. */
+            const uint8_t *guest = host_ptr_for_gpa(
+                g, src->gpa_base + (wfile_start - src->offset));
+            if (!guest)
+                return -LINUX_EFAULT;
             size_t offset = (size_t) (wfile_start - chunk_start);
             size_t len = (size_t) (wfile_end - wfile_start);
 
@@ -3711,9 +3773,13 @@ static int64_t refresh_shared_region_range(guest_t *g,
     if (rfile_start >= rfile_end)
         return 0;
 
-    uint64_t guest_off = r->start + (rfile_start - r->offset);
     uint64_t len = rfile_end - rfile_start, file_off = rfile_start;
-    uint8_t *buf = (uint8_t *) g->host_base + guest_off;
+    /* Resolve through the region's GPA so high-VA shared mappings refresh their
+     * real backing rather than host_base + start. Identity regions have
+     * gpa_base == start, so this is unchanged. */
+    uint8_t *buf = host_ptr_for_gpa(g, r->gpa_base + (rfile_start - r->offset));
+    if (!buf)
+        return -LINUX_EFAULT;
 
     while (len > 0) {
         size_t chunk =
@@ -3755,13 +3821,15 @@ int64_t sys_msync(guest_t *g, uint64_t addr, uint64_t length, int flags)
         return -LINUX_ENOMEM;
 
     uint64_t off = addr - g->ipa_base;
-    /* sys_msync stays primary-only here for the same reason as madvise: msync
-     * iterates regions and reaches into host_base+off to read pages back from
-     * the file overlay. Widening to extra-region ranges needs a region-aware
-     * iterator landing alongside the data-movement refactor.
+    /* Admit any range the region tracker fully covers, primary-window or
+     * high-VA. Both data-movement helpers (sync_shared_aliases_range and
+     * refresh_shared_region_range) now resolve their host pointers through the
+     * region's gpa_base via host_ptr_for_gpa, so extra-region ranges -- e.g.
+     * Rosetta's high-VA MAP_SHARED file caches that apt msyncs -- act on their
+     * real backing instead of being rejected with -ENOMEM. The coverage loop
+     * below still rejects unmapped holes. off + length cannot overflow here:
+     * addr > UINT64_MAX - length was rejected above and off <= addr.
      */
-    if (off > g->guest_size || length > g->guest_size - off)
-        return -LINUX_ENOMEM;
     uint64_t end = off + length;
 
     uint64_t cursor = off;

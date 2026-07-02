@@ -6,7 +6,8 @@
         test-glibc-coreutils test-perf \
         test-rosetta-cli test-rosetta-statics test-rosetta-failure-modes \
         test-rosetta-alpine test-rosetta-audit test-rosetta-jit \
-        test-rosetta-glibc test-rosetta-all bench-rosetta \
+        test-rosetta-glibc test-rosetta-madvise test-rosetta-msync \
+        test-rosetta-mremap test-rosetta-all bench-rosetta \
         test-matrix test-matrix-elfuse-aarch64 test-matrix-qemu-aarch64 \
         test-full test-multi-vcpu test-rwx test-sysroot-rename \
         test-case-collision test-case-collision-fallback test-getdents64-overlong \
@@ -244,10 +245,20 @@ test-rosetta-jit: $(ELFUSE_BIN)
 test-rosetta-glibc: $(ELFUSE_BIN)
 	$(call RUN_OPTIONAL_SKIP77,bash tests/test-rosetta-glibc.sh $(ELFUSE_BIN),test-rosetta-glibc)
 
+test-rosetta-madvise: $(ELFUSE_BIN)
+	$(call RUN_OPTIONAL_SKIP77,bash tests/test-rosetta-madvise.sh $(ELFUSE_BIN),test-rosetta-madvise)
+
+test-rosetta-msync: $(ELFUSE_BIN)
+	$(call RUN_OPTIONAL_SKIP77,bash tests/test-rosetta-msync.sh $(ELFUSE_BIN),test-rosetta-msync)
+
+test-rosetta-mremap: $(ELFUSE_BIN)
+	$(call RUN_OPTIONAL_SKIP77,bash tests/test-rosetta-mremap.sh $(ELFUSE_BIN),test-rosetta-mremap)
+
 ## Run every Rosetta-specific test target in sequence.
 test-rosetta-all: test-rosetta-cli test-rosetta-failure-modes \
                   test-rosetta-statics test-rosetta-alpine \
-                  test-rosetta-audit test-rosetta-jit test-rosetta-glibc
+                  test-rosetta-audit test-rosetta-jit test-rosetta-glibc \
+                  test-rosetta-madvise test-rosetta-msync test-rosetta-mremap
 
 ## Wall-clock bench harness for x86_64-via-Rosetta workloads. Prints
 ## best-of-N samples plus the aarch64 reference where available. Set
