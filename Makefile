@@ -167,6 +167,13 @@ $(BUILD_DIR)/test-proctitle-host: $(BUILD_DIR)/test-proctitle-host.o \
 	@echo "  LD      $@"
 	$(Q)$(CC) $(CFLAGS) -o $@ $^
 
+## Build the shebang parsing host test (native macOS binary)
+$(BUILD_DIR)/test-shebang-host: $(BUILD_DIR)/test-shebang-host.o \
+		$(BUILD_DIR)/core/elf.o | $(BUILD_DIR)
+	@echo "  LD      $@"
+	$(Q)$(CC) $(CFLAGS) -o $@ $^
+
+
 # Guest test binaries (cross-compiled, aarch64-linux)
 # Only used when GUEST_TEST_BINARIES is not set.
 

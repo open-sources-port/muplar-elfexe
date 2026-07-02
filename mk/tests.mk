@@ -48,6 +48,8 @@ check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage \
 	@$(BUILD_DIR)/test-fork-ipc-protocol-host
 	@printf "\n$(BLUE)━━━ identity override unit test ━━━$(RESET)\n"
 	@$(BUILD_DIR)/test-identity-override-host
+	@printf "\n$(BLUE)━━━ shebang parser unit test ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-shebang-host
 	@printf "\n$(BLUE)━━━ proctitle argv-tail regression ━━━$(RESET)\n"
 	@$(MAKE) --no-print-directory test-proctitle-host
 	@printf "\n$(BLUE)━━━ proctitle low-stack regression ━━━$(RESET)\n"
@@ -610,3 +612,8 @@ test-fork-ipc-protocol-host: $(BUILD_DIR)/test-fork-ipc-protocol-host
 ## Run the deterministic argv-tail overshoot guard test
 test-proctitle-host: $(BUILD_DIR)/test-proctitle-host
 	$(BUILD_DIR)/test-proctitle-host
+
+# Shebang parser unit test
+## Run shebang parsing unit tests
+test-shebang-host: $(BUILD_DIR)/test-shebang-host
+	$(BUILD_DIR)/test-shebang-host

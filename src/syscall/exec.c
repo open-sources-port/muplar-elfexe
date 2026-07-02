@@ -328,86 +328,54 @@ int64_t sys_execve(hv_vcpu_t vcpu,
      * binfmt_script.
      */
     elf_info_t elf_info;
-    if (elf_load(path_host, &elf_info) < 0) {
-        /* Not a valid ELF. Check if it's a script with a shebang line. Read the
-         * first 256 bytes and look for "#!" at the start.
-         */
-        int script_fd = open(path_host, O_RDONLY);
-        if (script_fd < 0) {
-            err = -LINUX_ENOENT;
+    int shebang_depth = 0;
+    const int max_shebang_depth = 5;
+
+    while (elf_load(path_host, &elf_info) < 0) {
+        if (shebang_depth >= max_shebang_depth) {
+            err = -LINUX_ELOOP;
             goto fail;
         }
-        char shebang_buf[256];
-        ssize_t nread = read(script_fd, shebang_buf, sizeof(shebang_buf) - 1);
-        close(script_fd);
 
-        if (nread < 2 || shebang_buf[0] != '#' || shebang_buf[1] != '!') {
-            err = -LINUX_ENOEXEC;
+        char interp_start[256];
+        char interp_arg[256];
+        int rc = elf_read_shebang(path_host, interp_start, sizeof(interp_start),
+                                  interp_arg, sizeof(interp_arg));
+        if (rc < 0) {
+            errno = -rc;
+            err = linux_errno();
             goto fail;
         }
-        shebang_buf[nread] = '\0';
-
-        /* Ignore script bytes after the first line; only the shebang line
-         * contributes interpreter arguments.
-         */
-        char *eol = strchr(shebang_buf + 2, '\n');
-        if (eol)
-            *eol = '\0';
-
-        /* Parse interpreter path and optional argument. Format: "#!
-         * /path/to/interpreter [optional-arg]"
-         */
-        char *interp_start = shebang_buf + 2;
-        while (*interp_start == ' ' || *interp_start == '\t')
-            interp_start++;
-        if (*interp_start == '\0') {
+        if (rc == 0) {
             err = -LINUX_ENOEXEC;
             goto fail;
         }
 
-        /* Linux preserves one optional shebang argument as a single argv
-         * element, without shell-style splitting.
-         */
-        char *interp_arg = NULL;
-        char *space = interp_start;
-        while (*space && *space != ' ' && *space != '\t')
-            space++;
-        if (*space) {
-            *space = '\0';
-            interp_arg = space + 1;
-            while (*interp_arg == ' ' || *interp_arg == '\t')
-                interp_arg++;
-            if (*interp_arg == '\0')
-                interp_arg = NULL;
-            /* Trim the line ending from the optional argument. */
-            if (interp_arg) {
-                char *end = interp_arg + strlen(interp_arg) - 1;
-                while (end > interp_arg &&
-                       (*end == ' ' || *end == '\t' || *end == '\r'))
-                    *end-- = '\0';
-            }
-        }
+        shebang_depth++;
 
-        log_debug("execve: shebang interp=\"%s\" arg=\"%s\" script=\"%s\"",
-                  interp_start, interp_arg ? interp_arg : "(none)", path);
+        bool has_arg = (interp_arg[0] != '\0');
+
+        log_debug(
+            "execve: shebang interp=\"%s\" arg=\"%s\" script=\"%s\" depth=%d",
+            interp_start, has_arg ? interp_arg : "(none)", path, shebang_depth);
 
         /* Rebuild argv: [interpreter, optional-arg, script-path,
          * original-argv[1:]]
          */
-        int new_argc = 1 + (interp_arg ? 1 : 0) + 1 + (argc > 1 ? argc - 1 : 0);
-        if (new_argc > MAX_ARGS) {
+        int prefix = (has_arg ? 2 : 1) + 1;
+        if (argc > MAX_ARGS - prefix + 1) {
             err = -LINUX_E2BIG;
             goto fail;
         }
+        int new_argc = argc - 1 + prefix;
 
         /* Use a fixed-size stack array (MAX_ARGS+3 covers interpreter +
-         * optional arg + script + original argv[1:]). The alloca was
-         * unnecessary since the bound is compile-time known.
+         * optional arg + script + original argv[1:]).
          */
         char *new_argv[MAX_ARGS + 3];
         int ni = 0;
         new_argv[ni++] = interp_start;
-        if (interp_arg)
+        if (has_arg)
             new_argv[ni++] = interp_arg;
         new_argv[ni++] = path;
         for (int i = 1; i < argc; i++)
@@ -451,6 +419,10 @@ int64_t sys_execve(hv_vcpu_t vcpu,
             unlink(path_host_buf);
             path_host_temp = false;
         }
+        if (interp_host_temp) {
+            unlink(interp_host_buf);
+            interp_host_temp = false;
+        }
         if (interp_tx.fuse_path) {
             err =
                 fuse_materialize_path(interp_tx.intercept_path, interp_host_buf,
@@ -463,11 +435,6 @@ int64_t sys_execve(hv_vcpu_t vcpu,
             str_copy_trunc(path_host_buf, interp_tx.host_path,
                            sizeof(path_host_buf));
             path_host = path_host_buf;
-        }
-
-        if (elf_load(path_host, &elf_info) < 0) {
-            err = -LINUX_ENOENT;
-            goto fail;
         }
     }
 
