@@ -151,6 +151,13 @@ $(BUILD_DIR)/test-fork-ipc-protocol-host: \
 	@echo "  LD      $@"
 	$(Q)$(CC) $(CFLAGS) -o $@ $^
 
+## Build the identity override host test (native macOS binary)
+$(BUILD_DIR)/test-identity-override-host: \
+		$(BUILD_DIR)/test-identity-override-host.o \
+		$(BUILD_DIR)/syscall/proc-identity.o | $(BUILD_DIR)
+	@echo "  LD      $@"
+	$(Q)$(CC) $(CFLAGS) -o $@ $^
+
 ## Build the proctitle argv-tail regression test (native macOS binary)
 # Links against the project-built proctitle.o so the exact in-tree code is
 # exercised; no HVF entitlement is needed because the test only manipulates

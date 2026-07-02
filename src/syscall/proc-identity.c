@@ -6,6 +6,8 @@
 
 #include <stdatomic.h>
 #include <stdbool.h>
+#include <stdlib.h>
+#include <errno.h>
 #include <pthread.h>
 
 #include "syscall/abi.h"
@@ -24,16 +26,37 @@ static _Atomic int64_t guest_sid = 1, guest_pgid = 1;
 static _Atomic int64_t guest_fg_pgrp = 1;
 static _Atomic int32_t guest_has_ctty = 1;
 
+static _Atomic bool fakeroot_enabled = false;
+
+void proc_set_fakeroot_enabled(bool enabled)
+{
+    atomic_store(&fakeroot_enabled, enabled);
+}
+
+bool proc_fakeroot_enabled(void)
+{
+    return atomic_load(&fakeroot_enabled);
+}
+
 void proc_identity_init(void)
 {
     guest_pid = 1;
     parent_pid = 0;
-    emu_uid = GUEST_UID;
-    emu_euid = GUEST_UID;
-    emu_suid = GUEST_UID;
-    emu_gid = GUEST_GID;
-    emu_egid = GUEST_GID;
-    emu_sgid = GUEST_GID;
+
+    uint32_t uid = GUEST_UID;
+    uint32_t gid = GUEST_GID;
+
+    if (proc_fakeroot_enabled()) {
+        uid = 0;
+        gid = 0;
+    }
+
+    emu_uid = uid;
+    emu_euid = uid;
+    emu_suid = uid;
+    emu_gid = gid;
+    emu_egid = gid;
+    emu_sgid = gid;
     emu_nice = 0;
     guest_sid = 1;
     guest_pgid = 1;

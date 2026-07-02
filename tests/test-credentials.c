@@ -35,15 +35,18 @@ int main(void)
 
     printf("test-credentials: UID/GID, capabilities, priority, affinity\n");
 
-    /* Baseline: UID/GID should be 1000 */
-    TEST("getuid == 1000");
-    EXPECT_TRUE(raw_syscall0(__NR_getuid) == 1000, "unexpected uid");
+    long uid = raw_syscall0(__NR_getuid);
+    long expected_id = (uid == 0) ? 0 : 1000;
 
-    TEST("geteuid == 1000");
-    EXPECT_TRUE(raw_syscall0(__NR_geteuid) == 1000, "unexpected euid");
+    /* Baseline: UID/GID should match expected_id */
+    TEST("getuid matches expected");
+    EXPECT_TRUE(raw_syscall0(__NR_getuid) == expected_id, "unexpected uid");
 
-    TEST("getgid == 1000");
-    EXPECT_TRUE(raw_syscall0(__NR_getgid) == 1000, "unexpected gid");
+    TEST("geteuid matches expected");
+    EXPECT_TRUE(raw_syscall0(__NR_geteuid) == expected_id, "unexpected euid");
+
+    TEST("getgid matches expected");
+    EXPECT_TRUE(raw_syscall0(__NR_getgid) == expected_id, "unexpected gid");
 
     /* getresuid returns coherent triple */
     TEST("getresuid coherent");
@@ -51,25 +54,26 @@ int main(void)
         unsigned int ruid = 0, euid = 0, suid = 0;
         long rc = raw_syscall3(__NR_getresuid, (long) &ruid, (long) &euid,
                                (long) &suid);
-        EXPECT_TRUE(rc == 0 && ruid == 1000 && euid == 1000 && suid == 1000,
+        EXPECT_TRUE(rc == 0 && ruid == expected_id && euid == expected_id &&
+                        suid == expected_id,
                     "getresuid mismatch");
     }
 
-    /* setuid: can set euid to current ruid (1000), no-op but must succeed */
-    TEST("setuid(1000) succeeds");
-    EXPECT_TRUE(raw_syscall1(__NR_setuid, 1000) == 0, "setuid(1000) failed");
+    /* setuid: can set euid to current ruid, no-op but must succeed */
+    TEST("setuid(expected) succeeds");
+    EXPECT_TRUE(raw_syscall1(__NR_setuid, expected_id) == 0, "setuid failed");
 
     /* setuid: setting to arbitrary value must fail with -EPERM */
-    TEST("setuid(0) returns -EPERM");
+    TEST("setuid(other) returns -EPERM");
     {
-        long rc = raw_syscall1(__NR_setuid, 0);
+        long rc = raw_syscall1(__NR_setuid, expected_id == 0 ? 1000 : 0);
         if (rc == -1) /* -EPERM */
             PASS();
         else
             FAIL("expected -EPERM");
     }
 
-    /* setresuid: swap euid to 1000 (already 1000, but tests the path) */
+    /* setresuid: swap euid (no-op but must succeed) */
     TEST("setresuid(-1,-1,-1) no-op");
     {
         long rc = raw_syscall3(__NR_setresuid, (long) (unsigned) -1,
@@ -78,10 +82,11 @@ int main(void)
     }
 
     /* setresuid: set euid to a value not in {ruid, euid, suid} */
-    TEST("setresuid(-1,42,-1) returns -EPERM");
+    TEST("setresuid(-1,other,-1) returns -EPERM");
     {
-        long rc = raw_syscall3(__NR_setresuid, (long) (unsigned) -1, 42,
-                               (long) (unsigned) -1);
+        long rc =
+            raw_syscall3(__NR_setresuid, (long) (unsigned) -1,
+                         expected_id == 0 ? 1000 : 42, (long) (unsigned) -1);
         if (rc == -1) /* -EPERM */
             PASS();
         else
@@ -89,15 +94,17 @@ int main(void)
     }
 
     /* setreuid: ruid can only be set to current ruid or euid */
-    TEST("setreuid(1000,-1) succeeds");
+    TEST("setreuid(expected,-1) succeeds");
     {
-        long rc = raw_syscall2(__NR_setreuid, 1000, (long) (unsigned) -1);
+        long rc =
+            raw_syscall2(__NR_setreuid, expected_id, (long) (unsigned) -1);
         EXPECT_TRUE(rc == 0, "setreuid(ruid,-1) failed");
     }
 
-    TEST("setreuid(42,-1) returns -EPERM");
+    TEST("setreuid(other,-1) returns -EPERM");
     {
-        long rc = raw_syscall2(__NR_setreuid, 42, (long) (unsigned) -1);
+        long rc = raw_syscall2(__NR_setreuid, expected_id == 0 ? 1000 : 42,
+                               (long) (unsigned) -1);
         if (rc == -1) /* -EPERM */
             PASS();
         else
@@ -110,49 +117,53 @@ int main(void)
         unsigned int rgid = 0, egid = 0, sgid = 0;
         long rc = raw_syscall3(__NR_getresgid, (long) &rgid, (long) &egid,
                                (long) &sgid);
-        EXPECT_TRUE(rc == 0 && rgid == 1000 && egid == 1000 && sgid == 1000,
+        EXPECT_TRUE(rc == 0 && rgid == expected_id && egid == expected_id &&
+                        sgid == expected_id,
                     "getresgid mismatch");
     }
 
     /* setgid: same constraints as setuid */
-    TEST("setgid(1000) succeeds");
-    EXPECT_TRUE(raw_syscall1(__NR_setgid, 1000) == 0, "setgid(1000) failed");
+    TEST("setgid(expected) succeeds");
+    EXPECT_TRUE(raw_syscall1(__NR_setgid, expected_id) == 0, "setgid failed");
 
-    TEST("setgid(0) returns -EPERM");
-    EXPECT_TRUE(raw_syscall1(__NR_setgid, 0) == -1, "expected -EPERM");
+    TEST("setgid(other) returns -EPERM");
+    EXPECT_TRUE(raw_syscall1(__NR_setgid, expected_id == 0 ? 1000 : 0) == -1,
+                "expected -EPERM");
 
     /* setfsuid / setfsgid: Linux contract is to return the previous fsuid /
-     * fsgid. elfuse reports the current euid / egid (1000) on every call, with
-     * no state mutation, which is what procps relies on when it brackets /proc
-     * reads with setfsuid(uid) / setfsuid(0).
+     * fsgid.
      */
-    TEST("setfsuid(0) returns 1000");
-    EXPECT_TRUE(raw_syscall1(__NR_setfsuid, 0) == 1000,
-                "setfsuid(0) did not return current euid");
+    TEST("setfsuid(other) returns expected_id");
+    EXPECT_TRUE(
+        raw_syscall1(__NR_setfsuid, expected_id == 0 ? 1000 : 0) == expected_id,
+        "setfsuid did not return current euid");
 
-    TEST("setfsuid(1000) returns 1000");
-    EXPECT_TRUE(raw_syscall1(__NR_setfsuid, 1000) == 1000,
-                "setfsuid(1000) did not return current euid");
+    TEST("setfsuid(expected_id) returns expected_id");
+    EXPECT_TRUE(raw_syscall1(__NR_setfsuid, expected_id) == expected_id,
+                "setfsuid did not return current euid");
 
-    TEST("setfsgid(0) returns 1000");
-    EXPECT_TRUE(raw_syscall1(__NR_setfsgid, 0) == 1000,
-                "setfsgid(0) did not return current egid");
+    TEST("setfsgid(other) returns expected_id");
+    EXPECT_TRUE(
+        raw_syscall1(__NR_setfsgid, expected_id == 0 ? 1000 : 0) == expected_id,
+        "setfsgid did not return current egid");
 
-    TEST("setfsgid(1000) returns 1000");
-    EXPECT_TRUE(raw_syscall1(__NR_setfsgid, 1000) == 1000,
-                "setfsgid(1000) did not return current egid");
+    TEST("setfsgid(expected_id) returns expected_id");
+    EXPECT_TRUE(raw_syscall1(__NR_setfsgid, expected_id) == expected_id,
+                "setfsgid did not return current egid");
 
     /* setfsuid(-1) / setfsgid(-1) is the canonical glibc "read fsuid without
      * changing it" idiom: -1 is never a valid uid, so the kernel only reports
      * the current fsuid.
      */
     TEST("setfsuid(-1) reports current fsuid");
-    EXPECT_TRUE(raw_syscall1(__NR_setfsuid, (long) (unsigned) -1) == 1000,
-                "setfsuid(-1) did not report current euid");
+    EXPECT_TRUE(
+        raw_syscall1(__NR_setfsuid, (long) (unsigned) -1) == expected_id,
+        "setfsuid(-1) did not report current euid");
 
     TEST("setfsgid(-1) reports current fsgid");
-    EXPECT_TRUE(raw_syscall1(__NR_setfsgid, (long) (unsigned) -1) == 1000,
-                "setfsgid(-1) did not report current egid");
+    EXPECT_TRUE(
+        raw_syscall1(__NR_setfsgid, (long) (unsigned) -1) == expected_id,
+        "setfsgid(-1) did not report current egid");
 
     /* capset: unprivileged process cannot set capabilities */
     TEST("capset returns -EPERM");
@@ -165,6 +176,19 @@ int main(void)
             PASS();
         else
             FAIL("expected -EPERM");
+    }
+
+    /* getgroups supplementary groups check */
+    TEST("getgroups returns expected groups");
+    {
+        gid_t list[64];
+        int ngroups = getgroups(64, list);
+        if (expected_id == 0) {
+            EXPECT_TRUE(ngroups == 1 && list[0] == 0,
+                        "fakeroot getgroups mismatch");
+        } else {
+            EXPECT_TRUE(ngroups >= 0, "getgroups failed");
+        }
     }
 
     /* setpriority/getpriority coherence */

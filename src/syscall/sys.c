@@ -487,6 +487,15 @@ int64_t sys_sched_rr_get_interval(guest_t *g, int pid, uint64_t ts_gva)
 
 int64_t sys_getgroups(guest_t *g, int size, uint64_t list_gva)
 {
+    if (proc_fakeroot_enabled() && proc_get_euid() == 0) {
+        if (size == 0)
+            return 1;
+        uint32_t zero_group = 0;
+        if (guest_write_small(g, list_gva, &zero_group, sizeof(zero_group)) < 0)
+            return -LINUX_EFAULT;
+        return 1;
+    }
+
     int ngroups = get_cached_linux_groups();
     if (ngroups < 0)
         return linux_errno();

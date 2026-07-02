@@ -2547,17 +2547,18 @@ int proc_intercept_open(const guest_t *g,
             "Tgid:\t%lld\n"
             "Pid:\t%lld\n"
             "PPid:\t%lld\n"
-            "Uid:\t%d\t%d\t%d\t%d\n"
-            "Gid:\t%d\t%d\t%d\t%d\n"
+            "Uid:\t%u\t%u\t%u\t%u\n"
+            "Gid:\t%u\t%u\t%u\t%u\n"
             "VmPeak:\t%llu kB\n"
             "VmSize:\t%llu kB\n"
             "VmRSS:\t%llu kB\n"
             "Threads:\t%d\n",
             name, (long long) proc_get_pid(), (long long) proc_get_pid(),
-            (long long) proc_get_ppid(), GUEST_UID, GUEST_UID, GUEST_UID,
-            GUEST_UID, GUEST_GID, GUEST_GID, GUEST_GID, GUEST_GID,
-            (unsigned long long) vm_size_kb, (unsigned long long) vm_size_kb,
-            (unsigned long long) vm_rss_kb, threads);
+            (long long) proc_get_ppid(), proc_get_uid(), proc_get_euid(),
+            proc_get_suid(), proc_get_euid(), proc_get_gid(), proc_get_egid(),
+            proc_get_sgid(), proc_get_egid(), (unsigned long long) vm_size_kb,
+            (unsigned long long) vm_size_kb, (unsigned long long) vm_rss_kb,
+            threads);
     }
 
     /* /proc/self/limits -> resource limits from prlimit64 cache */
@@ -2656,12 +2657,13 @@ int proc_intercept_open(const guest_t *g,
                 "Tgid:\t%lld\n"
                 "Pid:\t%ld\n"
                 "PPid:\t%lld\n"
-                "Uid:\t%d\t%d\t%d\t%d\n"
-                "Gid:\t%d\t%d\t%d\t%d\n"
+                "Uid:\t%u\t%u\t%u\t%u\n"
+                "Gid:\t%u\t%u\t%u\t%u\n"
                 "Threads:\t%d\n",
                 proc_comm_name(), (long long) proc_get_pid(), tid,
-                (long long) proc_get_ppid(), GUEST_UID, GUEST_UID, GUEST_UID,
-                GUEST_UID, GUEST_GID, GUEST_GID, GUEST_GID, GUEST_GID,
+                (long long) proc_get_ppid(), proc_get_uid(), proc_get_euid(),
+                proc_get_suid(), proc_get_euid(), proc_get_gid(),
+                proc_get_egid(), proc_get_sgid(), proc_get_egid(),
                 thread_active_count());
         }
 

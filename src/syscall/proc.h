@@ -98,6 +98,10 @@ bool proc_rosetta_enabled(void);
 void proc_set_rosetta_active(bool active);
 bool proc_rosetta_active(void);
 
+/* Process-wide feature gate for fakeroot mode. */
+void proc_set_fakeroot_enabled(bool enabled);
+bool proc_fakeroot_enabled(void);
+
 /* Store the guest command line for /proc/self/cmdline emulation. argv is a
  * NULL-terminated array of strings.
  */
