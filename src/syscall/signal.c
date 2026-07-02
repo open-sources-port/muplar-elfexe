@@ -1380,14 +1380,35 @@ int signal_deliver(hv_vcpu_t vcpu, guest_t *g, int *exit_code)
 
     /* Deliver to user handler: build rt_sigframe on guest stack */
 
-    /* 1. Save current vCPU state */
+    /* 1. Save current vCPU state.
+     *
+     * ELR_EL1/SPSR_EL1 hold the interrupted EL0 return state only while the
+     * guest is unwinding a syscall (it is at EL1 in the shim, about to ERET).
+     * When the vCPU was preempted while executing EL0 code -- a tight compute
+     * loop interrupted by SIGALRM, or the cross-process guest-signal transport
+     * (SIGUSR2) firing mid-execution -- the live interrupted state is in
+     * HV_REG_PC / HV_REG_CPSR and ELR_EL1 is stale from the previous syscall.
+     * Redirecting via ELR_EL1 alone is then a no-op because the resume uses
+     * HV_REG_PC, so the handler never runs and the X0..X2 writes below clobber
+     * the interrupted registers instead. Detect the EL0-preemption case from
+     * the live PSTATE (M[3:0]==0 => EL0t) and use PC for both save and
+     * redirect.
+     */
     uint64_t saved_regs[31];
     uint64_t saved_sp, saved_pc, saved_pstate;
+    uint64_t cur_cpsr = 0;
+    hv_vcpu_get_reg(vcpu, HV_REG_CPSR, &cur_cpsr);
+    bool el0_preempt = (cur_cpsr & 0xfULL) == 0;
 
     vcpu_snapshot_gprs(vcpu, saved_regs);
     saved_sp = vcpu_get_sysreg(vcpu, HV_SYS_REG_SP_EL0);
-    saved_pc = vcpu_get_sysreg(vcpu, HV_SYS_REG_ELR_EL1);
-    saved_pstate = vcpu_get_sysreg(vcpu, HV_SYS_REG_SPSR_EL1);
+    if (el0_preempt) {
+        hv_vcpu_get_reg(vcpu, HV_REG_PC, &saved_pc);
+        saved_pstate = cur_cpsr;
+    } else {
+        saved_pc = vcpu_get_sysreg(vcpu, HV_SYS_REG_ELR_EL1);
+        saved_pstate = vcpu_get_sysreg(vcpu, HV_SYS_REG_SPSR_EL1);
+    }
 
     /* 1b. rseq abort: if the thread is in a restartable sequence critical
      * section, abort it. Linux does this on every signal delivery.
@@ -1542,6 +1563,16 @@ int signal_deliver(hv_vcpu_t vcpu, guest_t *g, int *exit_code)
     /* SPSR_EL1: EL0t (user mode) */
     hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SPSR_EL1, 0);
 
+    /* EL0-preemption delivery: the resume runs from HV_REG_PC, not via an
+     * ERET that consumes ELR_EL1, so redirect the live PC/PSTATE directly.
+     * The ELR_EL1/SPSR_EL1 writes above still cover the rt_sigreturn path,
+     * which unwinds back to EL0 through the shim ERET.
+     */
+    if (el0_preempt) {
+        hv_vcpu_set_reg(vcpu, HV_REG_PC, act->sa_handler);
+        hv_vcpu_set_reg(vcpu, HV_REG_CPSR, 0); /* EL0t */
+    }
+
     /* X0 = signal number */
     hv_vcpu_set_reg(vcpu, HV_REG_X0, (uint64_t) signum);
 
@@ -1583,8 +1614,11 @@ int signal_deliver(hv_vcpu_t vcpu, guest_t *g, int *exit_code)
      * still has the interrupted syscall frame on its EL1 stack. Tell it to drop
      * that frame so the handler PC/SP/LR/args installed above are not
      * overwritten before ERET. Fault/BRK delivery paths ignore this marker.
+     * The EL0-preemption path resumes straight into the handler at EL0 with
+     * no shim frame to drop, so the marker is neither needed nor consulted.
      */
-    hv_vcpu_set_reg(vcpu, HV_REG_X8, 2);
+    if (!el0_preempt)
+        hv_vcpu_set_reg(vcpu, HV_REG_X8, 2);
 
     pthread_mutex_unlock(&sig_lock);
     return 1;

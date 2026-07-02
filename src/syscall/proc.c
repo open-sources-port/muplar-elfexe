@@ -1936,11 +1936,31 @@ int vcpu_run_loop(hv_vcpu_t vcpu,
                 exit_code = 128;
                 running = false;
             }
-        } else if (vexit->reason == HV_EXIT_REASON_CANCELED) {
-            /* Canceled by hv_vcpus_exit(). Can be: alarm timeout, exit_group
-             * from another thread, or signal preemption (signal_queue called
-             * hv_vcpus_exit to deliver a signal while the guest was in a tight
-             * loop).
+        } else if (vexit->reason == HV_EXIT_REASON_CANCELED ||
+                   (vexit->reason == HV_EXIT_REASON_UNKNOWN &&
+                    (signal_pending() || proc_exit_group_requested() ||
+                     (is_main && g_timed_out)))) {
+            /* Canceled by hv_vcpus_exit(). Can be: alarm timeout,
+             * exit_group from another thread, or signal preemption
+             * (signal_queue called hv_vcpus_exit to deliver a signal
+             * while the guest was in a tight loop).
+             *
+             * HV_EXIT_REASON_UNKNOWN is the same event seen from the other
+             * side of a race: when a host signal (e.g. the SIGUSR2 used by the
+             * cross-process guest-signal transport) is delivered to this thread
+             * while it is actively executing guest code inside hv_vcpu_run, the
+             * run aborts with UNKNOWN instead of the clean CANCELED that
+             * hv_vcpus_exit() produces for a vCPU caught between runs. The
+             * pending guest signal has already been drained and queued, so it
+             * is fully deliverable -- fall through to the same handling and
+             * resume rather than treating it as a fatal unexpected exit.
+             *
+             * Gate UNKNOWN on an actionable event actually being present (a
+             * queued signal, a pending exit_group, or a fired timeout) so it is
+             * only absorbed when there is real work to do. If HVF ever reports
+             * UNKNOWN for a genuine fault with nothing pending, fall through to
+             * the "unexpected exit reason" crash path at the end of the switch
+             * rather than silently retrying the run.
              */
             if (is_main && g_timed_out) {
                 /* Timeout already handled above the exception switch -- loop
@@ -1986,13 +2006,32 @@ int vcpu_run_loop(hv_vcpu_t vcpu,
              * switch.
              */
             if (current_thread->rseq_gva != 0) {
-                uint64_t cur_pc;
-                hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, &cur_pc);
+                /* Same EL0-preemption hazard as signal delivery: when the vCPU
+                 * was preempted while executing EL0 code, ELR_EL1 is stale from
+                 * the previous syscall return and the resume runs from
+                 * HV_REG_PC. Read the interrupted PC -- and write the abort_ip
+                 * back -- through whichever register the resume actually
+                 * consumes, selected from the live PSTATE (M[3:0]==0 => EL0t).
+                 * Otherwise a critical section interrupted at EL0 with no
+                 * queued signal (fork-barrier/ptrace wakeups) would never
+                 * abort.
+                 */
+                uint64_t cur_pc, cur_cpsr = 0;
+                hv_vcpu_get_reg(vcpu, HV_REG_CPSR, &cur_cpsr);
+                bool el0_preempt = (cur_cpsr & 0xfULL) == 0;
+                if (el0_preempt)
+                    hv_vcpu_get_reg(vcpu, HV_REG_PC, &cur_pc);
+                else
+                    hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, &cur_pc);
                 int rseq_rc =
                     rseq_try_abort(g, current_thread->rseq_gva,
                                    current_thread->rseq_signature, &cur_pc);
-                if (rseq_rc == 1)
-                    hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, cur_pc);
+                if (rseq_rc == 1) {
+                    if (el0_preempt)
+                        hv_vcpu_set_reg(vcpu, HV_REG_PC, cur_pc);
+                    else
+                        hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, cur_pc);
+                }
                 if (rseq_rc == -1) {
                     exit_code = 128 + 11;
                     running = false;
