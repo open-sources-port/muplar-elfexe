@@ -1,4 +1,5 @@
-/* Linux inotify emulation via kqueue EVFILT_VNODE for elfuse
+/*
+ * Linux inotify emulation via kqueue EVFILT_VNODE for elfuse
  *
  * Copyright 2026 elfuse contributors
  * Copyright 2025 Moritz Angermann, zw3rk pte. ltd.
@@ -234,44 +235,31 @@ static uint32_t notes_to_in_mask(uint32_t fflags,
     return mask & subscribed;
 }
 
-/* Queue a single inotify event into the instance's buffer. name may be NULL (no
- * filename).
+/* Queue a single inotify event into the instance's buffer. elfuse derives
+ * events from kqueue EVFILT_VNODE, which reports the watched node but never a
+ * child filename, so every event carries a zero-length name.
  *
  * Returns 0 on success, -1 if full.
  */
 static int queue_event(inotify_instance_t *inst,
                        int wd,
                        uint32_t mask,
-                       uint32_t cookie,
-                       const char *name)
+                       uint32_t cookie)
 {
-    /* Calculate event size: header + name length (NUL + padding to 4) */
-    uint32_t name_len = 0;
-    if (name && name[0]) {
-        size_t raw = strlen(name) + 1;           /* Include NUL */
-        name_len = (uint32_t) ((raw + 3) & ~3U); /* Pad to 4-byte boundary */
-    }
-    size_t event_size = INOTIFY_EVENT_HEADER_SIZE + name_len;
-
-    if (inst->event_used + event_size > INOTIFY_BUFSIZE)
+    if (inst->event_used + INOTIFY_EVENT_HEADER_SIZE > INOTIFY_BUFSIZE)
         return -1; /* Drop event when the fixed inotify queue is full. */
 
     uint8_t *p = inst->event_buf + inst->event_used;
 
-    /* Write header fields (little-endian, matching aarch64) */
+    /* Write header fields (little-endian, matching aarch64). name_len is 0. */
     int32_t wd32 = (int32_t) wd;
+    uint32_t name_len = 0;
     memcpy(p + 0, &wd32, 4);
     memcpy(p + 4, &mask, 4);
     memcpy(p + 8, &cookie, 4);
     memcpy(p + 12, &name_len, 4);
 
-    /* Write name if present (zero-padded) */
-    if (name_len > 0) {
-        memset(p + INOTIFY_EVENT_HEADER_SIZE, 0, name_len);
-        memcpy(p + INOTIFY_EVENT_HEADER_SIZE, name, strlen(name));
-    }
-
-    inst->event_used += event_size;
+    inst->event_used += INOTIFY_EVENT_HEADER_SIZE;
     return 0;
 }
 
@@ -328,13 +316,13 @@ static int collect_events(inotify_instance_t *inst)
          * watches, inotify emulation also omits the filename since kqueue
          * EVFILT_VNODE does not report which child changed.
          */
-        if (queue_event(inst, w->wd, in_mask, 0, NULL) == 0) {
+        if (queue_event(inst, w->wd, in_mask, 0) == 0) {
             collected++;
         } else {
             /* Fixed inotify queue is full; queue IN_Q_OVERFLOW and stop.
              * IN_Q_OVERFLOW (0x4000) uses wd=-1 per Linux semantics.
              */
-            queue_event(inst, -1, 0x4000, 0, NULL);
+            queue_event(inst, -1, 0x4000, 0);
             break;
         }
     }
@@ -627,7 +615,7 @@ int64_t inotify_read(int guest_fd, guest_t *g, uint64_t buf_gva, uint64_t count)
                 uint32_t in_mask =
                     notes_to_in_mask((uint32_t) kev.fflags, w->mask, w->is_dir);
                 if (in_mask != 0) {
-                    queue_event(inst, w->wd, in_mask, 0, NULL);
+                    queue_event(inst, w->wd, in_mask, 0);
                     pipe_signal(inst);
                 }
             }

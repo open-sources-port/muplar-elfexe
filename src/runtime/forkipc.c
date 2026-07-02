@@ -1,4 +1,5 @@
-/* Fork/clone IPC
+/*
+ * Fork/clone IPC
  *
  * Copyright 2026 elfuse contributors
  * Copyright 2025 Moritz Angermann, zw3rk pte. ltd.
@@ -299,8 +300,8 @@ int fork_child_main(int ipc_fd,
     memset(sig.rt_info, 0, sizeof(sig.rt_info));
 
     /* execve in the child needs the shim bytes after guest_reset clears memory.
+     * Close IPC socket
      */
-    /* Close IPC socket */
     close(ipc_fd);
 
     /* Create the child vCPU only after all inherited state is available. */
@@ -528,6 +529,92 @@ static void resolve_clone_stack_range(const guest_t *g,
 /* Forward declaration: worker entry runs after sys_clone_thread */
 static void *thread_create_and_run(void *arg);
 
+/* Snapshot the parent vCPU's EL1 sysregs, GPRs, and SIMD into the child's
+ * create-args. HVF binds a vCPU to its creating thread, so the worker calls
+ * hv_vcpu_create itself and replays this state. The caller fills the remaining
+ * fields (thread, guest, flags, tls, child_stack, sp_el1, startup).
+ */
+static void tca_capture_parent_regs(thread_create_args_t *tca,
+                                    hv_vcpu_t parent_vcpu)
+{
+    tca->elr = vcpu_get_sysreg(parent_vcpu, HV_SYS_REG_ELR_EL1);
+    tca->spsr = vcpu_get_sysreg(parent_vcpu, HV_SYS_REG_SPSR_EL1);
+    tca->vbar = vcpu_get_sysreg(parent_vcpu, HV_SYS_REG_VBAR_EL1);
+    tca->ttbr0 = vcpu_get_sysreg(parent_vcpu, HV_SYS_REG_TTBR0_EL1);
+    tca->sctlr = vcpu_get_sysreg(parent_vcpu, HV_SYS_REG_SCTLR_EL1);
+    tca->tcr = vcpu_get_sysreg(parent_vcpu, HV_SYS_REG_TCR_EL1);
+    tca->mair = vcpu_get_sysreg(parent_vcpu, HV_SYS_REG_MAIR_EL1);
+    tca->cpacr = vcpu_get_sysreg(parent_vcpu, HV_SYS_REG_CPACR_EL1);
+    tca->tpidr = vcpu_get_sysreg(parent_vcpu, HV_SYS_REG_TPIDR_EL0);
+    vcpu_snapshot_gprs(parent_vcpu, tca->gprs);
+    vcpu_snapshot_simd(parent_vcpu, &tca->simd_state);
+}
+
+typedef struct {
+    bool parent_written;
+    bool child_written;
+    uint64_t parent_gva;
+    uint64_t child_gva;
+    int32_t parent_old;
+    int32_t child_old;
+} clone_tid_rollback_t;
+
+static void clone_rollback_tid_flags(guest_t *g,
+                                     const clone_tid_rollback_t *rollback)
+{
+    if (rollback->parent_written)
+        (void) guest_write_small(g, rollback->parent_gva, &rollback->parent_old,
+                                 sizeof(rollback->parent_old));
+    if (rollback->child_written)
+        (void) guest_write_small(g, rollback->child_gva, &rollback->child_old,
+                                 sizeof(rollback->child_old));
+}
+
+/* Apply the CLONE_*_SETTID / CLONE_CHILD_CLEARTID side effects for a new child.
+ * Returns true on success, false if a guest TID write faulted so the caller can
+ * unwind its own way (the clone-thread and clone-vm paths differ in cleanup).
+ * Order matches the kernel: parent ptid, then record ctid for clear-on-exit,
+ * then child ctid.
+ */
+static bool clone_apply_tid_flags(guest_t *g,
+                                  thread_entry_t *t,
+                                  uint64_t flags,
+                                  int64_t child_tid,
+                                  uint64_t ptid_gva,
+                                  uint64_t ctid_gva,
+                                  clone_tid_rollback_t *rollback)
+{
+    int32_t tid32 = (int32_t) child_tid;
+    *rollback = (clone_tid_rollback_t) {0};
+    if (flags & LINUX_CLONE_PARENT_SETTID) {
+        if (guest_read_small(g, ptid_gva, &rollback->parent_old,
+                             sizeof(rollback->parent_old)) < 0)
+            return false;
+        rollback->parent_gva = ptid_gva;
+    }
+    if (flags & LINUX_CLONE_CHILD_SETTID) {
+        if (guest_read_small(g, ctid_gva, &rollback->child_old,
+                             sizeof(rollback->child_old)) < 0)
+            return false;
+        rollback->child_gva = ctid_gva;
+    }
+    if (flags & LINUX_CLONE_PARENT_SETTID) {
+        if (guest_write_small(g, ptid_gva, &tid32, sizeof(tid32)) < 0)
+            return false;
+        rollback->parent_written = true;
+    }
+    if (flags & LINUX_CLONE_CHILD_CLEARTID)
+        t->clear_child_tid = ctid_gva;
+    if (flags & LINUX_CLONE_CHILD_SETTID) {
+        if (guest_write_small(g, ctid_gva, &tid32, sizeof(tid32)) < 0) {
+            clone_rollback_tid_flags(g, rollback);
+            return false;
+        }
+        rollback->child_written = true;
+    }
+    return true;
+}
+
 static int64_t sys_clone_thread(hv_vcpu_t parent_vcpu,
                                 guest_t *g,
                                 uint64_t flags,
@@ -569,26 +656,6 @@ static int64_t sys_clone_thread(hv_vcpu_t parent_vcpu,
         return -LINUX_ENOMEM;
     }
 
-    /* Capture parent register state before spawning worker. HVF binds vCPU to
-     * the creating thread, so the worker must call hv_vcpu_create itself. The
-     * parent passes all parent state via the args.
-     */
-    uint64_t parent_elr, parent_spsr, parent_vbar, parent_ttbr0;
-    uint64_t parent_sctlr, parent_tcr, parent_mair, parent_cpacr;
-    uint64_t parent_tpidr;
-    parent_elr = vcpu_get_sysreg(parent_vcpu, HV_SYS_REG_ELR_EL1);
-    parent_spsr = vcpu_get_sysreg(parent_vcpu, HV_SYS_REG_SPSR_EL1);
-    parent_vbar = vcpu_get_sysreg(parent_vcpu, HV_SYS_REG_VBAR_EL1);
-    parent_ttbr0 = vcpu_get_sysreg(parent_vcpu, HV_SYS_REG_TTBR0_EL1);
-    parent_sctlr = vcpu_get_sysreg(parent_vcpu, HV_SYS_REG_SCTLR_EL1);
-    parent_tcr = vcpu_get_sysreg(parent_vcpu, HV_SYS_REG_TCR_EL1);
-    parent_mair = vcpu_get_sysreg(parent_vcpu, HV_SYS_REG_MAIR_EL1);
-    parent_cpacr = vcpu_get_sysreg(parent_vcpu, HV_SYS_REG_CPACR_EL1);
-    parent_tpidr = vcpu_get_sysreg(parent_vcpu, HV_SYS_REG_TPIDR_EL0);
-
-    uint64_t parent_gprs[31];
-    vcpu_snapshot_gprs(parent_vcpu, parent_gprs);
-
     thread_create_args_t *tca = calloc(1, sizeof(thread_create_args_t));
     if (!tca) {
         thread_deactivate(t);
@@ -604,48 +671,20 @@ static int64_t sys_clone_thread(hv_vcpu_t parent_vcpu,
     tca->child_stack = child_stack;
     tca->flags = flags;
     tca->tls = tls;
-    tca->elr = parent_elr;
-    tca->spsr = parent_spsr;
-    tca->vbar = parent_vbar;
-    tca->ttbr0 = parent_ttbr0;
-    tca->sctlr = parent_sctlr;
-    tca->tcr = parent_tcr;
-    tca->mair = parent_mair;
-    tca->cpacr = parent_cpacr;
-    tca->tpidr = parent_tpidr;
-    memcpy(tca->gprs, parent_gprs, sizeof(parent_gprs));
     tca->sp_el1 = child_sp_el1;
-    vcpu_snapshot_simd(parent_vcpu, &tca->simd_state);
+    tca_capture_parent_regs(tca, parent_vcpu);
 
-    /* CLONE_PARENT_SETTID: write child TID to parent's ptid address */
-    if (flags & LINUX_CLONE_PARENT_SETTID) {
-        int32_t tid32 = (int32_t) child_tid;
-        if (guest_write_small(g, ptid_gva, &tid32, sizeof(tid32)) < 0) {
-            free(tca);
-            thread_deactivate(t);
-            pthread_cond_destroy(&startup.cond);
-            pthread_mutex_destroy(&startup.lock);
-            return -LINUX_EFAULT;
-        }
-    }
-
-    /* CLONE_CHILD_CLEARTID: store the address for cleanup on exit */
-    if (flags & LINUX_CLONE_CHILD_CLEARTID) {
-        t->clear_child_tid = ctid_gva;
-    }
-
-    /* CLONE_CHILD_SETTID: write child TID to the child's ctid address. This
-     * writes into shared guest memory (visible to child thread).
+    /* CLONE_*_SETTID / CLONE_CHILD_CLEARTID side effects. CHILD_SETTID writes
+     * shared guest memory visible to the child thread.
      */
-    if (flags & LINUX_CLONE_CHILD_SETTID) {
-        int32_t tid32 = (int32_t) child_tid;
-        if (guest_write_small(g, ctid_gva, &tid32, sizeof(tid32)) < 0) {
-            free(tca);
-            thread_deactivate(t);
-            pthread_cond_destroy(&startup.cond);
-            pthread_mutex_destroy(&startup.lock);
-            return -LINUX_EFAULT;
-        }
+    clone_tid_rollback_t tid_rollback;
+    if (!clone_apply_tid_flags(g, t, flags, child_tid, ptid_gva, ctid_gva,
+                               &tid_rollback)) {
+        free(tca);
+        thread_deactivate(t);
+        pthread_cond_destroy(&startup.cond);
+        pthread_mutex_destroy(&startup.lock);
+        return -LINUX_EFAULT;
     }
 
     /* Create the host pthread (joinable; exit_group joins all workers via
@@ -669,14 +708,7 @@ static int64_t sys_clone_thread(hv_vcpu_t parent_vcpu,
          * rationale as the post-handshake failure path: clone(2) does not leave
          * live-looking TIDs behind for a thread that never started.
          */
-        if (flags & LINUX_CLONE_PARENT_SETTID) {
-            int32_t zero = 0;
-            (void) guest_write_small(g, ptid_gva, &zero, sizeof(zero));
-        }
-        if (flags & LINUX_CLONE_CHILD_SETTID) {
-            int32_t zero = 0;
-            (void) guest_write_small(g, ctid_gva, &zero, sizeof(zero));
-        }
+        clone_rollback_tid_flags(g, &tid_rollback);
         return -LINUX_EAGAIN;
     }
 
@@ -691,18 +723,11 @@ static int64_t sys_clone_thread(hv_vcpu_t parent_vcpu,
     if (startup.startup_rc < 0) {
         /* Worker failed during HVF bring-up after the SETTID writes had already
          * populated the guest TID slots. Linux clone(2) does not leave a
-         * live-looking TID behind for a thread that never started, so zero the
-         * slots before the parent sees the error.
+         * live-looking TID behind for a thread that never started, so restore
+         * the slots before the parent sees the error.
          */
         pthread_join(host_thread, NULL);
-        if (flags & LINUX_CLONE_PARENT_SETTID) {
-            int32_t zero = 0;
-            (void) guest_write_small(g, ptid_gva, &zero, sizeof(zero));
-        }
-        if (flags & LINUX_CLONE_CHILD_SETTID) {
-            int32_t zero = 0;
-            (void) guest_write_small(g, ctid_gva, &zero, sizeof(zero));
-        }
+        clone_rollback_tid_flags(g, &tid_rollback);
         return startup.startup_rc;
     }
 
@@ -959,20 +984,6 @@ static int64_t sys_clone_vm(hv_vcpu_t parent_vcpu,
         return -LINUX_ENOMEM;
     }
 
-    /* Capture parent register state */
-    uint64_t parent_elr = vcpu_get_sysreg(parent_vcpu, HV_SYS_REG_ELR_EL1);
-    uint64_t parent_spsr = vcpu_get_sysreg(parent_vcpu, HV_SYS_REG_SPSR_EL1);
-    uint64_t parent_vbar = vcpu_get_sysreg(parent_vcpu, HV_SYS_REG_VBAR_EL1);
-    uint64_t parent_ttbr0 = vcpu_get_sysreg(parent_vcpu, HV_SYS_REG_TTBR0_EL1);
-    uint64_t parent_sctlr = vcpu_get_sysreg(parent_vcpu, HV_SYS_REG_SCTLR_EL1);
-    uint64_t parent_tcr = vcpu_get_sysreg(parent_vcpu, HV_SYS_REG_TCR_EL1);
-    uint64_t parent_mair = vcpu_get_sysreg(parent_vcpu, HV_SYS_REG_MAIR_EL1);
-    uint64_t parent_cpacr = vcpu_get_sysreg(parent_vcpu, HV_SYS_REG_CPACR_EL1);
-    uint64_t parent_tpidr = vcpu_get_sysreg(parent_vcpu, HV_SYS_REG_TPIDR_EL0);
-
-    uint64_t parent_gprs[31];
-    vcpu_snapshot_gprs(parent_vcpu, parent_gprs);
-
     thread_create_args_t *tca = calloc(1, sizeof(thread_create_args_t));
     if (!tca) {
         thread_deactivate(t);
@@ -987,41 +998,15 @@ static int64_t sys_clone_vm(hv_vcpu_t parent_vcpu,
                            : vcpu_get_sysreg(parent_vcpu, HV_SYS_REG_SP_EL0);
     tca->flags = flags;
     tca->tls = tls;
-    tca->elr = parent_elr;
-    tca->spsr = parent_spsr;
-    tca->vbar = parent_vbar;
-    tca->ttbr0 = parent_ttbr0;
-    tca->sctlr = parent_sctlr;
-    tca->tcr = parent_tcr;
-    tca->mair = parent_mair;
-    tca->cpacr = parent_cpacr;
-    tca->tpidr = parent_tpidr;
-    memcpy(tca->gprs, parent_gprs, sizeof(parent_gprs));
     tca->sp_el1 = child_sp_el1;
-    vcpu_snapshot_simd(parent_vcpu, &tca->simd_state);
+    tca_capture_parent_regs(tca, parent_vcpu);
 
-    /* CLONE_PARENT_SETTID: write child TID to parent's ptid address */
-    if (flags & LINUX_CLONE_PARENT_SETTID) {
-        int32_t tid32 = (int32_t) child_tid;
-        if (guest_write_small(g, ptid_gva, &tid32, sizeof(tid32)) < 0) {
-            free(tca);
-            thread_deactivate(t);
-            return -LINUX_EFAULT;
-        }
-    }
-
-    /* CLONE_CHILD_CLEARTID: store the address for cleanup on exit */
-    if (flags & LINUX_CLONE_CHILD_CLEARTID)
-        t->clear_child_tid = ctid_gva;
-
-    /* CLONE_CHILD_SETTID: write child TID to child's ctid address */
-    if (flags & LINUX_CLONE_CHILD_SETTID) {
-        int32_t tid32 = (int32_t) child_tid;
-        if (guest_write_small(g, ctid_gva, &tid32, sizeof(tid32)) < 0) {
-            free(tca);
-            thread_deactivate(t);
-            return -LINUX_EFAULT;
-        }
+    clone_tid_rollback_t tid_rollback;
+    if (!clone_apply_tid_flags(g, t, flags, child_tid, ptid_gva, ctid_gva,
+                               &tid_rollback)) {
+        free(tca);
+        thread_deactivate(t);
+        return -LINUX_EFAULT;
     }
 
     /* Create the host pthread */
@@ -1037,6 +1022,10 @@ static int64_t sys_clone_vm(hv_vcpu_t parent_vcpu,
         log_error("clone_vm: pthread_create failed: %s", strerror(err));
         free(tca);
         thread_deactivate(t);
+        /* Roll back the SETTID writes clone_apply_tid_flags made: no child
+         * thread was created, so clone(2) must not leave live-looking TIDs.
+         */
+        clone_rollback_tid_flags(g, &tid_rollback);
         return -LINUX_EAGAIN;
     }
 
@@ -1049,6 +1038,30 @@ static int64_t sys_clone_vm(hv_vcpu_t parent_vcpu,
         (unsigned long long) flags);
 
     return child_tid;
+}
+
+/* Report a vm-clone worker that failed HVF bring-up as an exited child so the
+ * parent's wait4 can reap it. sys_clone_vm already returned the child tid, so
+ * dropping the slot with thread_deactivate (which clears active) would make
+ * wait4 skip it and leave the parent unable to collect a status. Publish the
+ * exit status and clear t->vcpu under the thread lock, so thread_interrupt_all
+ * and thread_destroy_all_vcpus (both skip a null handle) cannot hand the
+ * torn-down vCPU to HVF, then destroy the handle outside the lock. Keep the
+ * slot active for wait4. Reports SIGKILL because the child never ran a guest
+ * instruction. Does not trigger exit_group: only the child failed.
+ */
+static void vm_clone_report_bringup_failure(thread_entry_t *t)
+{
+    pthread_mutex_t *lock = thread_get_lock();
+    pthread_mutex_lock(lock);
+    hv_vcpu_t dying = t->vcpu;
+    t->vcpu = 0;
+    t->vm_exited = true;
+    t->vm_exit_status = LINUX_SIGKILL; /* WIFSIGNALED, WTERMSIG == SIGKILL */
+    pthread_cond_broadcast(&t->ptrace_cond);
+    pthread_mutex_unlock(lock);
+    if (dying)
+        hv_vcpu_destroy(dying);
 }
 
 /* Worker entry for vm-clone children. Sets up vCPU, runs guest code, then marks
@@ -1068,7 +1081,7 @@ static void *vm_clone_thread_run(void *arg)
         log_error("vm_clone tid=%lld: hv_vcpu_create failed: %d",
                   (long long) t->guest_tid, (int) r);
         free(tca);
-        thread_deactivate(t);
+        vm_clone_report_bringup_failure(t);
         return NULL;
     }
 
@@ -1085,8 +1098,8 @@ static void *vm_clone_thread_run(void *arg)
     HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SP_EL1, tca->sp_el1));
     HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SP_EL0, tca->child_stack));
     if (shim_globals_install_per_vcpu(vcpu, tca->guest, t->guest_tid) < 0) {
-        thread_deactivate(t);
         free(tca);
+        vm_clone_report_bringup_failure(t);
         return NULL;
     }
 
@@ -1517,9 +1530,8 @@ int64_t sys_clone(hv_vcpu_t vcpu,
 
     /* Snapshot of the semantic region array, populated after the memory dump
      * but before sibling vCPUs resume. Declared up front so all goto paths to
-     * fail_snapshot can free it unconditionally.
+     * fail_snapshot can free it unconditionally. Header
      */
-    /* Header */
     ipc_header_t hdr = {
         .magic = IPC_MAGIC_HEADER,
         .ipa_bits = g->ipa_bits,
@@ -1832,10 +1844,9 @@ int64_t sys_clone3(hv_vcpu_t vcpu,
 
     /* Merge exit_signal into flags for sys_clone compatibility. clone3 moved
      * exit_signal out of the flags field; sys_clone expects it in the low byte.
-     * Safe because validation confirmed ca.flags low byte is zero.
-     */
-    /* Strip CLONE_PIDFD before passing to sys_clone (which does not understand
-     * it). Pidfd creation happens after the clone returns.
+     * Safe because validation confirmed ca.flags low byte is zero. Strip
+     * CLONE_PIDFD before passing to sys_clone (which does not understand it).
+     * Pidfd creation happens after the clone returns.
      */
     bool want_pidfd = (ca.flags & LINUX_CLONE_PIDFD) != 0;
     uint64_t flags =

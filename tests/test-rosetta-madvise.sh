@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# test-rosetta-madvise.sh - madvise(MADV_DONTNEED) on high-VA regions via Rosetta
+# test-rosetta-madvise.sh - madvise(MADV_DONTNEED) on high-VA regions via
+# Rosetta
 #
 # Copyright 2026 elfuse contributors
 # SPDX-License-Identifier: Apache-2.0
@@ -55,8 +56,8 @@ set +e
 madv_out="$("$TIMEOUT" 30 "$ELFUSE" "$MADV_BIN" 2>&1)"
 madv_rc=$?
 set -e
-if [ "$madv_rc" -eq 0 ] &&
-    printf '%s\n' "$madv_out" | grep -q 'madvise high-VA: all subtests passed'; then
+if [ "$madv_rc" -eq 0 ] \
+    && printf '%s\n' "$madv_out" | grep -q 'madvise high-VA: all subtests passed'; then
     report_pass "madvise-high-va-dontneed"
 else
     report_fail "madvise-high-va-dontneed: rc=$madv_rc"

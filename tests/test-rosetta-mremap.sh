@@ -55,8 +55,8 @@ set +e
 mremap_out="$("$TIMEOUT" 30 "$ELFUSE" "$MREMAP_BIN" 2>&1)"
 mremap_rc=$?
 set -e
-if [ "$mremap_rc" -eq 0 ] &&
-    printf '%s\n' "$mremap_out" | grep -q 'mremap high-VA: all subtests passed'; then
+if [ "$mremap_rc" -eq 0 ] \
+    && printf '%s\n' "$mremap_out" | grep -q 'mremap high-VA: all subtests passed'; then
     report_pass "mremap-high-va"
 else
     report_fail "mremap-high-va: rc=$mremap_rc"

@@ -1,4 +1,5 @@
-/* Sysroot capability probing and provisioning
+/*
+ * Sysroot capability probing and provisioning
  *
  * Copyright 2026 elfuse contributors
  * SPDX-License-Identifier: Apache-2.0
@@ -30,6 +31,29 @@ typedef struct {
     uint32_t length;
     vol_capabilities_attr_t caps;
 } volume_caps_buf_t;
+
+/* Validate that path names an existing directory, not a symlink.
+ *
+ * Returns 0 if so, else -1 with errno set: ELOOP for a symlink, ENOTDIR for a
+ * non-directory, or the lstat errno (ENOENT when the component does not exist).
+ * Shared by the symlink-rejecting sysroot dir walkers; ensure_dir_exists_follow
+ * deliberately follows symlinks and does not use it.
+ */
+static int validate_existing_dir(const char *path)
+{
+    struct stat st;
+    if (lstat(path, &st) < 0)
+        return -1;
+    if (S_ISLNK(st.st_mode)) {
+        errno = ELOOP;
+        return -1;
+    }
+    if (!S_ISDIR(st.st_mode)) {
+        errno = ENOTDIR;
+        return -1;
+    }
+    return 0;
+}
 
 static int ensure_dir_exists_follow(const char *path)
 {
@@ -80,18 +104,8 @@ int sysroot_ensure_dir_exists(const char *path)
         if (mkdir(buf, 0755) < 0) {
             if (errno != EEXIST)
                 return -1;
-
-            struct stat st;
-            if (lstat(buf, &st) < 0)
+            if (validate_existing_dir(buf) < 0)
                 return -1;
-            if (S_ISLNK(st.st_mode)) {
-                errno = ELOOP;
-                return -1;
-            }
-            if (!S_ISDIR(st.st_mode)) {
-                errno = ENOTDIR;
-                return -1;
-            }
         }
         *p = '/';
     }
@@ -99,18 +113,8 @@ int sysroot_ensure_dir_exists(const char *path)
     if (mkdir(buf, 0755) < 0) {
         if (errno != EEXIST)
             return -1;
-
-        struct stat st;
-        if (lstat(buf, &st) < 0)
+        if (validate_existing_dir(buf) < 0)
             return -1;
-        if (S_ISLNK(st.st_mode)) {
-            errno = ELOOP;
-            return -1;
-        }
-        if (!S_ISDIR(st.st_mode)) {
-            errno = ENOTDIR;
-            return -1;
-        }
     }
     return 0;
 }
@@ -134,37 +138,20 @@ int sysroot_validate_dir_prefix(const char *path)
             continue;
         *p = '\0';
 
-        struct stat st;
-        if (lstat(buf, &st) < 0) {
+        if (validate_existing_dir(buf) < 0) {
+            /* A not-yet-existing component means the prefix is valid so far. */
             if (errno == ENOENT) {
                 *p = '/';
                 return 0;
             }
             return -1;
         }
-        if (S_ISLNK(st.st_mode)) {
-            errno = ELOOP;
-            return -1;
-        }
-        if (!S_ISDIR(st.st_mode)) {
-            errno = ENOTDIR;
-            return -1;
-        }
         *p = '/';
     }
 
-    struct stat st;
-    if (lstat(buf, &st) < 0) {
+    if (validate_existing_dir(buf) < 0) {
         if (errno == ENOENT)
             return 0;
-        return -1;
-    }
-    if (S_ISLNK(st.st_mode)) {
-        errno = ELOOP;
-        return -1;
-    }
-    if (!S_ISDIR(st.st_mode)) {
-        errno = ENOTDIR;
         return -1;
     }
 
@@ -512,14 +499,21 @@ int sysroot_create_mount(const char *mount_path, sysroot_mount_t *mount)
         }
     }
 
-    char plist[32768];
+    /* hdiutil attach -plist emits a property list that can run to tens of KiB;
+     * keep it off the stack.
+     */
+    const size_t plistsz = 32768;
+    char *plist = malloc(plistsz);
+    if (!plist)
+        return -1;
     int status = 0;
     char *const attach_argv[] = {
         "hdiutil", "attach",          "-mountpoint", mount->mount_path,
         "-plist",  mount->image_path, NULL};
-    if (spawn_capture_stdout(attach_argv, plist, sizeof(plist), &status) < 0 ||
+    if (spawn_capture_stdout(attach_argv, plist, plistsz, &status) < 0 ||
         !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
         log_error("sysroot: hdiutil attach failed for %s", mount->image_path);
+        free(plist);
         return -1;
     }
 
@@ -531,8 +525,10 @@ int sysroot_create_mount(const char *mount_path, sysroot_mount_t *mount)
             "plist for %s",
             mount->image_path);
         sysroot_detach_mountpoint_force(mount->mount_path, true);
+        free(plist);
         return -1;
     }
+    free(plist);
 
     str_copy_trunc(mount->mount_path, attached_mount,
                    sizeof(mount->mount_path));

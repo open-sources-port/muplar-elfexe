@@ -1,4 +1,5 @@
-/* AF_NETLINK emulation
+/*
+ * AF_NETLINK emulation
  *
  * Copyright 2026 elfuse contributors
  * Copyright 2025 Moritz Angermann, zw3rk pte. ltd.
@@ -217,8 +218,8 @@ static size_t nl_put_attr(uint8_t *buf,
     return aligned;
 }
 
-/* Build RTM_GETLINK response from host getifaddrs(). A non-empty name_filter
- * or non-zero index_filter restricts the reply to one matching link.
+/* Build RTM_GETLINK response from host getifaddrs(). A non-empty name_filter or
+ * non-zero index_filter restricts the reply to one matching link.
  */
 static int nl_build_getlink(netlink_state_t *ns,
                             const char *name_filter,
@@ -544,9 +545,11 @@ static void nl_parse_link_filter(const uint8_t *req,
 }
 
 /* Build the reply for one rtnetlink request (already copied into req). Mutates
- * ns->buf/seq. Returns 0 on success (including a built NLMSG_ERROR reply for
- * unsupported types), or a negative LINUX_E* on a build failure. Caller holds
- * nl_lock. req is guaranteed to be at least NLMSG_HDRLEN bytes.
+ * ns->buf/seq.
+ *
+ * Returns 0 on success (including a built NLMSG_ERROR reply for unsupported
+ * types), or a negative LINUX_E* on a build failure. Caller holds nl_lock. req
+ * is guaranteed to be at least NLMSG_HDRLEN bytes.
  */
 static int nl_process_request(netlink_state_t *ns,
                               const uint8_t *req,
@@ -687,6 +690,82 @@ out:
     return result;
 }
 
+/* Block until the netlink receive buffer has data. Called with nl_lock held.
+ *
+ * On success returns 0 with nl_lock still held and ns valid. On EAGAIN, EINTR,
+ * EIO, or if the socket was closed underneath the poll, releases nl_lock and
+ * returns the negative Linux errno. flags carries MSG_DONTWAIT; pass 0 for
+ * read(2), which only honors O_NONBLOCK.
+ */
+static int64_t nl_wait_readable_locked(netlink_state_t *ns,
+                                       int guest_fd,
+                                       int flags)
+{
+    while (ns->buf_pos >= ns->buf_len) {
+        bool nonblock = (flags & LINUX_MSG_DONTWAIT) ||
+                        (fd_table[guest_fd].linux_flags & LINUX_O_NONBLOCK);
+        if (nonblock) {
+            pthread_mutex_unlock(&nl_lock);
+            return -LINUX_EAGAIN;
+        }
+
+        int rd_fd = ns->pipe_rd;
+        pthread_mutex_unlock(&nl_lock);
+
+        struct pollfd pfd = {
+            .fd = rd_fd,
+            .events = POLLIN,
+        };
+        int ret = poll(&pfd, 1, -1);
+        if (ret < 0)
+            return (errno == EINTR) ? -LINUX_EINTR : -LINUX_EIO;
+
+        pthread_mutex_lock(&nl_lock);
+        netlink_state_t *current_ns = nl_find(guest_fd);
+        if (!current_ns || current_ns != ns) {
+            pthread_mutex_unlock(&nl_lock);
+            return -LINUX_EBADF;
+        }
+    }
+    return 0;
+}
+
+/* Return the byte length of the longest run of complete netlink messages that
+ * starts at ns->buf_pos and fits within to_copy. Falls back to to_copy when not
+ * even one whole message fits (MSG_TRUNC semantics). Called with nl_lock held.
+ */
+static size_t nl_complete_span(const netlink_state_t *ns, size_t to_copy)
+{
+    size_t msg_end = 0, pos = ns->buf_pos;
+    while (pos < ns->buf_len && (pos - ns->buf_pos + NLMSG_HDRLEN) <= to_copy) {
+        const nlmsghdr_t *hdr = (const nlmsghdr_t *) (ns->buf + pos);
+        if (hdr->nlmsg_len < NLMSG_HDRLEN)
+            break;
+        size_t msg_bytes = pos - ns->buf_pos + NLMSG_ALIGN(hdr->nlmsg_len);
+        if (msg_bytes > to_copy)
+            break;
+        pos += NLMSG_ALIGN(hdr->nlmsg_len);
+        msg_end = pos - ns->buf_pos;
+    }
+    return msg_end == 0 ? to_copy : msg_end;
+}
+
+/* Write the kernel-side sockaddr_nl (nl_pid 0) and its length to the guest at
+ * the given addresses. Called with nl_lock held.
+ */
+static void nl_write_kernel_src(guest_t *g,
+                                uint64_t addr_gva,
+                                uint64_t namelen_gva)
+{
+    sockaddr_nl_t snl = {
+        .nl_family = LINUX_AF_NETLINK,
+        .nl_pid = 0, /* from kernel */
+    };
+    guest_write_small(g, addr_gva, &snl, sizeof(snl));
+    uint32_t namelen = sizeof(sockaddr_nl_t);
+    guest_write_small(g, namelen_gva, &namelen, sizeof(namelen));
+}
+
 /* recvfrom(2) on a netlink socket: drain whole messages; write back a kernel
  * sockaddr_nl (nl_pid 0) when src is requested.
  */
@@ -710,56 +789,16 @@ int64_t netlink_recv(int guest_fd,
         return 0;
     }
 
-    /* Wait for data to become available. If the buffer is empty, block
-     * on the host pipe read end. Honor MSG_DONTWAIT and O_NONBLOCK flags.
+    /* Wait for data to become available, blocking on the host pipe read end
+     * unless MSG_DONTWAIT or O_NONBLOCK is set.
      */
-    while (ns->buf_pos >= ns->buf_len) {
-        bool nonblock = (flags & LINUX_MSG_DONTWAIT) ||
-                        (fd_table[guest_fd].linux_flags & LINUX_O_NONBLOCK);
-        if (nonblock) {
-            pthread_mutex_unlock(&nl_lock);
-            return -LINUX_EAGAIN;
-        }
-
-        int rd_fd = ns->pipe_rd;
-        pthread_mutex_unlock(&nl_lock);
-
-        struct pollfd pfd = {
-            .fd = rd_fd,
-            .events = POLLIN,
-        };
-        int ret = poll(&pfd, 1, -1);
-        if (ret < 0) {
-            if (errno == EINTR)
-                return -LINUX_EINTR;
-            return -LINUX_EIO;
-        }
-
-        pthread_mutex_lock(&nl_lock);
-        netlink_state_t *current_ns = nl_find(guest_fd);
-        if (!current_ns || current_ns != ns) {
-            pthread_mutex_unlock(&nl_lock);
-            return -LINUX_EBADF;
-        }
-    }
+    int64_t werr = nl_wait_readable_locked(ns, guest_fd, flags);
+    if (werr < 0)
+        return werr;
 
     size_t avail = ns->buf_len - ns->buf_pos;
     size_t to_copy = (avail < len) ? avail : len;
-
-    /* Return complete netlink messages only (same walk as netlink_recvmsg). */
-    size_t msg_end = 0, pos = ns->buf_pos;
-    while (pos < ns->buf_len && (pos - ns->buf_pos + NLMSG_HDRLEN) <= to_copy) {
-        nlmsghdr_t *hdr = (nlmsghdr_t *) (ns->buf + pos);
-        if (hdr->nlmsg_len < NLMSG_HDRLEN)
-            break;
-        size_t msg_bytes = pos - ns->buf_pos + NLMSG_ALIGN(hdr->nlmsg_len);
-        if (msg_bytes > to_copy)
-            break;
-        pos += NLMSG_ALIGN(hdr->nlmsg_len);
-        msg_end = pos - ns->buf_pos;
-    }
-    if (msg_end == 0)
-        msg_end = to_copy;
+    size_t msg_end = nl_complete_span(ns, to_copy);
 
     if (guest_write(g, buf_gva, ns->buf + ns->buf_pos, msg_end) < 0) {
         pthread_mutex_unlock(&nl_lock);
@@ -770,15 +809,8 @@ int64_t netlink_recv(int guest_fd,
     if (ns->buf_pos >= ns->buf_len)
         netlink_clear_readable(ns);
 
-    if (src_gva && addrlen_gva) {
-        sockaddr_nl_t snl = {
-            .nl_family = LINUX_AF_NETLINK,
-            .nl_pid = 0, /* From kernel */
-        };
-        guest_write_small(g, src_gva, &snl, sizeof(snl));
-        uint32_t namelen = sizeof(sockaddr_nl_t);
-        guest_write_small(g, addrlen_gva, &namelen, sizeof(namelen));
-    }
+    if (src_gva && addrlen_gva)
+        nl_write_kernel_src(g, src_gva, addrlen_gva);
 
     pthread_mutex_unlock(&nl_lock);
     return (int64_t) msg_end;
@@ -851,64 +883,16 @@ int64_t netlink_recvmsg(int guest_fd, guest_t *g, uint64_t msg_gva, int flags)
         return 0;
     }
 
-    /* Wait for data to become available. If the buffer is empty, block
-     * on the host pipe read end. Honor MSG_DONTWAIT and O_NONBLOCK flags.
+    /* Wait for data to become available, blocking on the host pipe read end
+     * unless MSG_DONTWAIT or O_NONBLOCK is set.
      */
-    while (ns->buf_pos >= ns->buf_len) {
-        bool nonblock = (flags & LINUX_MSG_DONTWAIT) ||
-                        (fd_table[guest_fd].linux_flags & LINUX_O_NONBLOCK);
-        if (nonblock) {
-            pthread_mutex_unlock(&nl_lock);
-            return -LINUX_EAGAIN;
-        }
-
-        int rd_fd = ns->pipe_rd;
-        pthread_mutex_unlock(&nl_lock);
-
-        struct pollfd pfd = {
-            .fd = rd_fd,
-            .events = POLLIN,
-        };
-        int ret = poll(&pfd, 1, -1);
-        if (ret < 0) {
-            if (errno == EINTR)
-                return -LINUX_EINTR;
-            return -LINUX_EIO;
-        }
-
-        pthread_mutex_lock(&nl_lock);
-        netlink_state_t *current_ns = nl_find(guest_fd);
-        if (!current_ns || current_ns != ns) {
-            pthread_mutex_unlock(&nl_lock);
-            return -LINUX_EBADF;
-        }
-    }
+    int64_t werr = nl_wait_readable_locked(ns, guest_fd, flags);
+    if (werr < 0)
+        return werr;
 
     size_t avail = ns->buf_len - ns->buf_pos;
     size_t to_copy = (avail < iov.iov_len) ? avail : iov.iov_len;
-
-    /* Return complete netlink messages only. Walk from buf_pos to find the last
-     * complete message that fits in the buffer.
-     */
-    size_t msg_end = 0, pos = ns->buf_pos;
-    while (pos < ns->buf_len && (pos - ns->buf_pos + NLMSG_HDRLEN) <= to_copy) {
-        nlmsghdr_t *hdr = (nlmsghdr_t *) (ns->buf + pos);
-        if (hdr->nlmsg_len < NLMSG_HDRLEN)
-            break;
-        size_t msg_bytes = pos - ns->buf_pos + NLMSG_ALIGN(hdr->nlmsg_len);
-        if (msg_bytes > to_copy)
-            break;
-        pos += NLMSG_ALIGN(hdr->nlmsg_len);
-        msg_end = pos - ns->buf_pos;
-    }
-
-    if (msg_end == 0) {
-        /* Buffer too small for even one message.
-         *
-         * Return what fits with MSG_TRUNC semantics
-         */
-        msg_end = to_copy;
-    }
+    size_t msg_end = nl_complete_span(ns, to_copy);
 
     if (guest_write(g, iov.iov_base, ns->buf + ns->buf_pos, msg_end) < 0) {
         pthread_mutex_unlock(&nl_lock);
@@ -920,17 +904,11 @@ int64_t netlink_recvmsg(int guest_fd, guest_t *g, uint64_t msg_gva, int flags)
     if (ns->buf_pos >= ns->buf_len)
         netlink_clear_readable(ns);
 
-    /* Write back sockaddr_nl if caller provided msg_name */
-    if (mhdr.msg_name && mhdr.msg_namelen >= sizeof(sockaddr_nl_t)) {
-        sockaddr_nl_t snl = {
-            .nl_family = LINUX_AF_NETLINK,
-            .nl_pid = 0, /* From kernel */
-        };
-        guest_write_small(g, mhdr.msg_name, &snl, sizeof(snl));
-        uint32_t namelen = sizeof(sockaddr_nl_t);
-        /* msg_namelen is at offset 4 in the msghdr (after msg_name pointer) */
-        guest_write_small(g, msg_gva + 8, &namelen, sizeof(namelen));
-    }
+    /* Write back sockaddr_nl if caller provided msg_name. msg_namelen sits at
+     * offset 8 in the msghdr (after the 8-byte msg_name pointer).
+     */
+    if (mhdr.msg_name && mhdr.msg_namelen >= sizeof(sockaddr_nl_t))
+        nl_write_kernel_src(g, mhdr.msg_name, msg_gva + 8);
 
     /* Clear msg_flags and msg_controllen */
     int32_t zero_flags = 0;
@@ -958,38 +936,12 @@ int64_t netlink_read(int guest_fd, guest_t *g, uint64_t buf_gva, uint64_t count)
         return 0;
     }
 
-    /* Wait for data to become available. If the buffer is empty, block
-     * on the host pipe read end. Honor O_NONBLOCK flag.
+    /* Wait for data to become available, blocking on the host pipe read end
+     * unless O_NONBLOCK is set. read(2) has no per-call MSG_DONTWAIT.
      */
-    while (ns->buf_pos >= ns->buf_len) {
-        bool nonblock =
-            (fd_table[guest_fd].linux_flags & LINUX_O_NONBLOCK) != 0;
-        if (nonblock) {
-            pthread_mutex_unlock(&nl_lock);
-            return -LINUX_EAGAIN;
-        }
-
-        int rd_fd = ns->pipe_rd;
-        pthread_mutex_unlock(&nl_lock);
-
-        struct pollfd pfd = {
-            .fd = rd_fd,
-            .events = POLLIN,
-        };
-        int ret = poll(&pfd, 1, -1);
-        if (ret < 0) {
-            if (errno == EINTR)
-                return -LINUX_EINTR;
-            return -LINUX_EIO;
-        }
-
-        pthread_mutex_lock(&nl_lock);
-        netlink_state_t *current_ns = nl_find(guest_fd);
-        if (!current_ns || current_ns != ns) {
-            pthread_mutex_unlock(&nl_lock);
-            return -LINUX_EBADF;
-        }
-    }
+    int64_t werr = nl_wait_readable_locked(ns, guest_fd, 0);
+    if (werr < 0)
+        return werr;
 
     size_t avail = ns->buf_len - ns->buf_pos;
     size_t to_copy = (avail < count) ? avail : count;

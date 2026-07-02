@@ -56,8 +56,8 @@ set +e
 msync_out="$("$TIMEOUT" 30 "$ELFUSE" "$MSYNC_BIN" 2>&1)"
 msync_rc=$?
 set -e
-if [ "$msync_rc" -eq 0 ] &&
-    printf '%s\n' "$msync_out" | grep -q 'msync high-VA: all subtests passed'; then
+if [ "$msync_rc" -eq 0 ] \
+    && printf '%s\n' "$msync_out" | grep -q 'msync high-VA: all subtests passed'; then
     report_pass "msync-high-va-writeback"
 else
     report_fail "msync-high-va-writeback: rc=$msync_rc"

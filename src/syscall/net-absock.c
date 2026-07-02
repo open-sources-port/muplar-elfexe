@@ -1,4 +1,5 @@
-/* Abstract AF_UNIX emulation helpers
+/*
+ * Abstract AF_UNIX emulation helpers
  *
  * Copyright 2026 elfuse contributors
  * SPDX-License-Identifier: Apache-2.0
@@ -17,6 +18,8 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+
+#include "utils.h"
 
 #include "syscall/net.h"
 #include "syscall/net-absock.h"
@@ -52,8 +55,12 @@ static int absock_ensure_dir_locked(void)
     }
     snprintf(absock_dir, sizeof(absock_dir), "/tmp/elfuse-absock-%llu",
              (unsigned long long) namespace_id);
-    if (mkdir(absock_dir, 0700) < 0 && errno != EEXIST)
+    /* The namespace-id path is guessable; create_private_dir rejects a
+     * pre-planted symlink or foreign-owned directory in world-writable /tmp.
+     */
+    if (create_private_dir(absock_dir) < 0)
         return -1;
+
     absock_dir_created = true;
     return 0;
 }

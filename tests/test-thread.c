@@ -13,6 +13,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <unistd.h>
+#include <errno.h>
 #include <sys/mman.h>
 
 #include "test-harness.h"
@@ -139,6 +140,27 @@ static void test_parent_settid(void)
      * woke the parent. The original value was > 0 (written by PARENT_SETTID).
      */
     PASS();
+}
+
+static void test_settid_failure_preserves_slots(void)
+{
+    TEST("failed SETTID preserves slots");
+
+    int parent_tid = 12345;
+    unsigned long flags = 0x7d0f00 | 0x01000000; /* + CLONE_CHILD_SETTID */
+    void *stack_top = child_stack_buf + sizeof(child_stack_buf);
+
+    long ret = raw_clone(flags, stack_top, &parent_tid, 0, (int *) 1);
+    if (ret == 0) {
+        raw_exit(1);
+        __builtin_unreachable();
+    }
+
+    if (ret == -EFAULT && parent_tid == 12345) {
+        PASS();
+    } else {
+        FAIL("failed clone changed parent TID slot");
+    }
 }
 
 /* Test 3: Multiple concurrent threads */
@@ -278,6 +300,7 @@ int main(void)
 
     test_clone_thread();
     test_parent_settid();
+    test_settid_failure_preserves_slots();
     test_multi_thread();
     test_clone_stack_unmap_reuse();
 
