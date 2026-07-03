@@ -563,8 +563,85 @@ SC_STUB(sc_munlockall,          0)
 SC_STUB(sc_set_mempolicy,       0)
 SC_STUB(sc_io_destroy,          -LINUX_EINVAL)
 SC_STUB(sc_sethostname,         -LINUX_EPERM)
-SC_STUB(sc_mincore,             -LINUX_ENOSYS)
 /* clang-format on */
+
+/* mincore: report page residency over [addr, addr+length). elfuse tracks guest
+ * mappings itself, so no host syscall is needed. Linux contract:
+ * - addr must be page-aligned (EINVAL otherwise);
+ * - vec must be writable, one byte per page (EFAULT otherwise);
+ * - any unmapped page in the range yields ENOMEM;
+ * - the LSB of each vec byte is set when the page maps to a tracked region.
+ * jemalloc, Go, and Rust's page recyclers probe this on startup.
+ */
+static int64_t sc_mincore(guest_t *g,
+                          uint64_t x0,
+                          uint64_t x1,
+                          uint64_t x2,
+                          uint64_t x3,
+                          uint64_t x4,
+                          uint64_t x5,
+                          bool verbose)
+{
+    (void) x3;
+    (void) x4;
+    (void) x5;
+    (void) verbose;
+    uint64_t addr = x0, length = x1, vec = x2;
+
+    if (addr & (GUEST_PAGE_SIZE - 1))
+        return -LINUX_EINVAL;
+    if (addr + length < addr) /* range wraps the address space */
+        return -LINUX_ENOMEM;
+    if (length == 0)
+        return 0;
+
+    uint64_t npages = length / GUEST_PAGE_SIZE;
+    if (length % GUEST_PAGE_SIZE)
+        npages++;
+    if (vec > UINT64_MAX - npages)
+        return -LINUX_EFAULT;
+    bool has_hole = false;
+
+    /* Pages are visited in ascending order and regions[] is start-sorted,
+     * non-overlapping, with monotonic ends, so a single cursor sweeps both in
+     * lockstep: skip the untouched prefix once via first_end_above, then only
+     * advance the cursor when a page passes the current region's end. O(npages
+     * + regions) instead of a binary search per page.
+     *
+     * mmap_lock (order 1) is held across the whole sweep so a sibling vCPU's
+     * munmap cannot memmove regions[] out from under the cursor. guest_write
+     * takes no locks, so nesting the vec flush inside the lock introduces no
+     * inversion. Flush in bounded chunks so a huge length never triggers a
+     * large host allocation. EFAULT (bad vec) takes precedence over ENOMEM
+     * (hole), matching the kernel's upfront access_ok() check, so the sweep
+     * never early-returns on a hole.
+     */
+    uint8_t chunk[512];
+    pthread_mutex_lock(&mmap_lock);
+    int ri = guest_region_first_end_above(g, addr);
+    for (uint64_t done = 0; done < npages;) {
+        uint64_t batch = npages - done;
+        if (batch > sizeof(chunk))
+            batch = sizeof(chunk);
+        for (uint64_t i = 0; i < batch; i++) {
+            uint64_t page = addr + (done + i) * GUEST_PAGE_SIZE;
+            while (ri < g->nregions && g->regions[ri].end <= page)
+                ri++;
+            bool mapped = ri < g->nregions && page >= g->regions[ri].start;
+            chunk[i] = mapped ? 1 : 0;
+            if (!mapped)
+                has_hole = true;
+        }
+        if (guest_write(g, vec + done, chunk, batch) < 0) {
+            pthread_mutex_unlock(&mmap_lock);
+            return -LINUX_EFAULT;
+        }
+        done += batch;
+    }
+    pthread_mutex_unlock(&mmap_lock);
+
+    return has_hole ? -LINUX_ENOMEM : 0;
+}
 
 SC_FORWARD(sc_setpriority, proc_sys_setpriority((int) x0, (int) x1, (int) x2))
 SC_FORWARD(sc_getpriority, proc_sys_getpriority((int) x0, (int) x1))
@@ -1941,9 +2018,6 @@ static int fast_scalar_syscall_result(int nr, uint64_t x0, int64_t *result)
         return 1;
     case SYS_sethostname:
         *result = -LINUX_EPERM;
-        return 1;
-    case SYS_mincore:
-        *result = -LINUX_ENOSYS;
         return 1;
     default:
         return 0;

@@ -533,12 +533,30 @@ static void test_stub_errnos(void)
     EXPECT_ERRNO(syscall(SYS_io_destroy, 1), EINVAL,
                  "io_destroy should fail with EINVAL");
 
-    TEST("mincore returns ENOSYS");
-    char page[4096];
-    unsigned char vec = 0xff;
+    TEST("mincore reports residency");
+    void *mc = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (mc == MAP_FAILED) {
+        FAIL("mincore mmap");
+        return;
+    }
+    *(volatile char *) mc = 1; /* fault the page in */
+    unsigned char vec = 0;
     errno = 0;
-    EXPECT_ERRNO(syscall(SYS_mincore, page, sizeof(page), &vec), ENOSYS,
-                 "mincore should fail with ENOSYS");
+    long mr = syscall(SYS_mincore, mc, 4096, &vec);
+    /* Mapped page: success with the residency LSB set. Unaligned addr: EINVAL.
+     * A hole in the range: ENOMEM. Here the whole page is mapped.
+     */
+    bool mapped_ok = (mr == 0 && (vec & 1));
+    long mr_einval = syscall(SYS_mincore, (char *) mc + 1, 4096, &vec);
+    bool einval_ok = (mr_einval == -1 && errno == EINVAL);
+    long mr_huge = syscall(SYS_mincore, 0, UINT64_MAX, 0);
+    bool huge_ok = (mr_huge == -1);
+    munmap(mc, 4096);
+    if (mapped_ok && einval_ok && huge_ok)
+        PASS();
+    else
+        FAIL("mincore should report residency and reject invalid ranges");
 }
 
 static void test_memory_stubs(void)
