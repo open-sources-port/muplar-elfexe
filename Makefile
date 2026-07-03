@@ -207,6 +207,12 @@ $(BUILD_DIR)/test-scm-creds: tests/test-scm-creds.c | $(BUILD_DIR)
 	@echo "  CROSS   $< (with -lpthread)"
 	$(Q)$(CROSS_COMPILE)gcc -D_GNU_SOURCE -static -O2 -o $@ $< -lpthread
 
+# test-fault-signal-mt spawns pthreads that each take recoverable SIGSEGVs to
+# stress synchronous-fault delivery routing in a multi-threaded guest.
+$(BUILD_DIR)/test-fault-signal-mt: tests/test-fault-signal-mt.c | $(BUILD_DIR)
+	@echo "  CROSS   $< (with -lpthread)"
+	$(Q)$(CROSS_COMPILE)gcc -D_GNU_SOURCE -static -O2 -o $@ $< -lpthread
+
 # test-shim-cred-race spawns a pthread reader while the main thread
 # toggles setresuid; the reader spins on the identity fast path.
 $(BUILD_DIR)/test-shim-cred-race: tests/test-shim-cred-race.c | $(BUILD_DIR)

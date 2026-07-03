@@ -1465,8 +1465,8 @@ int vcpu_run_loop(hv_vcpu_t vcpu,
                             uint64_t esr;
                             hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ESR_EL1, &esr);
                             signal_set_fault_info(LINUX_SEGV_ACCERR, far, esr);
-                            signal_queue(LINUX_SIGSEGV);
-                            int sig_ret = signal_deliver(vcpu, g, &exit_code);
+                            int sig_ret = signal_deliver_fault(
+                                vcpu, g, LINUX_SIGSEGV, &exit_code);
                             if (sig_ret < 0)
                                 running = false;
                             break;
@@ -1549,7 +1549,6 @@ int vcpu_run_loop(hv_vcpu_t vcpu,
                         hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ESR_EL1, &brk_esr);
                         signal_set_fault_info(LINUX_TRAP_BRKPT, brk_pc,
                                               brk_esr);
-                        signal_queue(LINUX_SIGTRAP);
                         if (verbose) {
                             uint64_t thread_blocked =
                                 current_thread ? current_thread->blocked
@@ -1561,7 +1560,8 @@ int vcpu_run_loop(hv_vcpu_t vcpu,
                                 (unsigned long long) signal_get_state()
                                     ->pending);
                         }
-                        int sig_ret = signal_deliver(vcpu, g, &exit_code);
+                        int sig_ret = signal_deliver_fault(
+                            vcpu, g, LINUX_SIGTRAP, &exit_code);
                         if (verbose)
                             log_debug("%s: signal_deliver returned %d", prefix,
                                       sig_ret);
@@ -1621,8 +1621,8 @@ int vcpu_run_loop(hv_vcpu_t vcpu,
                                 prefix, (unsigned long long) elr_addr,
                                 (unsigned long long) esr, fault_ec);
                         signal_set_fault_info(LINUX_ILL_ILLOPC, elr_addr, esr);
-                        signal_queue(LINUX_SIGILL);
-                        int sig_ret = signal_deliver(vcpu, g, &exit_code);
+                        int sig_ret = signal_deliver_fault(
+                            vcpu, g, LINUX_SIGILL, &exit_code);
                         /* HVC #11 consumes X8 as the post-fault TLBI opcode.
                          * signal_deliver() may leave it unchanged when no
                          * handler is materialized, or set the syscall-path
@@ -1799,8 +1799,8 @@ int vcpu_run_loop(hv_vcpu_t vcpu,
                             (unsigned long long) esr, fsc, code_name);
                     }
                     signal_set_fault_info(si_code, far_addr, esr);
-                    signal_queue(LINUX_SIGSEGV);
-                    int sig_ret = signal_deliver(vcpu, g, &exit_code);
+                    int sig_ret = signal_deliver_fault(vcpu, g, LINUX_SIGSEGV,
+                                                       &exit_code);
                     /* HVC #11 consumes X8 as the post-fault TLBI opcode.
                      * signal_deliver() may leave it unchanged when no handler
                      * is materialized, or set the syscall-path frame-drop

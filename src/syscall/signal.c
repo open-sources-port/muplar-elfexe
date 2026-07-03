@@ -1311,37 +1311,27 @@ static void build_sigcontext_reserved(uint8_t *reserved,
     memset(reserved + off, 0, 8);
 }
 
-int signal_deliver(hv_vcpu_t vcpu, guest_t *g, int *exit_code)
+/* Build and install the rt_sigframe for `signum` on the current thread, with
+ * sig_lock held on entry and released on every return path. Shared by
+ * signal_deliver() (signal selected from the process-wide pending set) and
+ * signal_deliver_fault() (synchronous fault forced onto the faulting thread).
+ * rt_info supplies si_code/si_pid/sigval when no thread-local pending_fault is
+ * set; the pending_fault is consumed (one-shot) when valid. Returns 1 if a
+ * handler frame was installed, 0 if the signal was ignored, and -1 (with
+ * *exit_code set) when the default disposition terminates the guest.
+ */
+static int deliver_signal_locked(hv_vcpu_t vcpu,
+                                 guest_t *g,
+                                 int signum,
+                                 signal_rt_info_t rt_info,
+                                 int *exit_code)
 {
-    pthread_mutex_lock(&sig_lock);
     uint64_t *blocked = thread_blocked_ptr();
     uint64_t *saved_ptr = thread_saved_blocked_ptr();
     bool *valid_ptr = thread_saved_valid_ptr();
-    uint64_t deliverable = sig_state.pending & ~*blocked;
-    if (deliverable == 0) {
-        pthread_mutex_unlock(&sig_lock);
-        return 0;
-    }
 
-    /* Find lowest pending unblocked signal */
-    int signum = bit_ctz64(deliverable) + 1;
-    signal_rt_info_t rt_info = signal_default_info(signum);
-
-    /* Dequeue: for RT signals, decrement count and only clear the pending bit
-     * when the queue is empty. Standard signals are always cleared (single
-     * instance, bitmask semantics).
-     */
-    if (signum >= LINUX_SIGRTMIN) {
-        signal_rt_dequeue_locked(signum, &rt_info);
-    } else {
-        rt_info = signal_standard_peek_locked(signum);
-        sig_state.std_info_valid[signum - 1] = false;
-        sig_state.pending &= ~sig_bit(signum);
-    }
-
-    /* signum is bit_ctz64(deliverable) + 1, bounded 1..64 by the 64-bit pending
-     * mask. The static analyzer cannot see the bound, so gate the array access
-     * defensively.
+    /* signum is 1..64 from the caller; the static analyzer cannot see the
+     * bound, so gate the array access defensively.
      */
     int idx = signum - 1;
     if (!RANGE_CHECK(idx, 0, LINUX_NSIG)) {
@@ -1622,6 +1612,71 @@ int signal_deliver(hv_vcpu_t vcpu, guest_t *g, int *exit_code)
 
     pthread_mutex_unlock(&sig_lock);
     return 1;
+}
+
+int signal_deliver(hv_vcpu_t vcpu, guest_t *g, int *exit_code)
+{
+    pthread_mutex_lock(&sig_lock);
+    uint64_t *blocked = thread_blocked_ptr();
+    uint64_t deliverable = sig_state.pending & ~*blocked;
+    if (deliverable == 0) {
+        pthread_mutex_unlock(&sig_lock);
+        return 0;
+    }
+
+    /* Find lowest pending unblocked signal */
+    int signum = bit_ctz64(deliverable) + 1;
+    signal_rt_info_t rt_info = signal_default_info(signum);
+
+    /* Dequeue: for RT signals, decrement count and only clear the
+     * pending bit when the queue is empty. Standard signals are
+     * always cleared (single instance, bitmask semantics).
+     */
+    if (signum >= LINUX_SIGRTMIN) {
+        signal_rt_dequeue_locked(signum, &rt_info);
+    } else {
+        rt_info = signal_standard_peek_locked(signum);
+        sig_state.std_info_valid[signum - 1] = false;
+        sig_state.pending &= ~sig_bit(signum);
+    }
+
+    return deliver_signal_locked(vcpu, g, signum, rt_info, exit_code);
+}
+
+int signal_deliver_fault(hv_vcpu_t vcpu, guest_t *g, int signum, int *exit_code)
+{
+    /* Synchronous faults (SIGSEGV/SIGBUS/SIGILL/SIGFPE/SIGTRAP) are specific to
+     * the thread that triggered them and must be delivered to that thread with
+     * the thread-local fault info set by signal_set_fault_info(). Routing them
+     * through the process-wide pending bitmask (signal_queue + signal_deliver)
+     * is racy: another vCPU thread can dequeue the bit and deliver it with no
+     * fault info (si_code becomes SI_USER, which makes a JVM treat a
+     * recoverable implicit null-check as a fatal external signal), and two
+     * threads faulting on the same signal collapse into one bit so one fault is
+     * lost. Deliver directly here, never touching sig_state.pending.
+     */
+    pthread_mutex_lock(&sig_lock);
+
+    /* Linux force_sig_info_to_task(): a forced synchronous fault cannot be
+     * postponed or ignored. If the disposition is SIG_IGN or the signum is
+     * blocked, reset to SIG_DFL and unblock before delivery, so the default
+     * disposition terminates the process instead of resuming at the faulting
+     * PC (SIG_IGN would re-fault forever) or running a handler the guest
+     * asked to block.
+     */
+    int idx = signum - 1;
+    if (RANGE_CHECK(idx, 0, LINUX_NSIG)) {
+        uint64_t *blocked = thread_blocked_ptr();
+        linux_sigaction_t *act = &sig_state.actions[idx];
+        if (act->sa_handler == LINUX_SIG_IGN || (*blocked & sig_bit(signum))) {
+            act->sa_handler = LINUX_SIG_DFL;
+            act->sa_flags &= ~LINUX_SA_SIGINFO;
+            *blocked &= ~sig_bit(signum);
+        }
+    }
+
+    signal_rt_info_t rt_info = signal_default_info(signum);
+    return deliver_signal_locked(vcpu, g, signum, rt_info, exit_code);
 }
 
 /* rt_sigreturn. */

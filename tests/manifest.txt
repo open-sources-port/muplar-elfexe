@@ -94,6 +94,7 @@ test-negative                  # diff=skip
 
 [section] Signal + thread tests
 test-signal-thread
+test-fault-signal-mt           # diff=skip
 
 [section] Fork edge cases
 test-clone3                    # diff=skip

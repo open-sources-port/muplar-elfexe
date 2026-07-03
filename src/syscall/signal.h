@@ -274,6 +274,24 @@ void signal_set_shim_globals_guest(guest_t *g);
  */
 int signal_deliver(hv_vcpu_t vcpu, guest_t *g, int *exit_code);
 
+/* Deliver a synchronous fault signal directly to the faulting (current) thread,
+ * bypassing the process-wide pending set. The caller must have set the fault
+ * info via signal_set_fault_info() immediately before. Same return convention
+ * as signal_deliver(). Use this for SIGSEGV/SIGBUS/SIGILL/SIGFPE/SIGTRAP raised
+ * from a guest exception, never signal_queue()+signal_deliver(): a queued fault
+ * can be stolen by another vCPU thread (delivered as SI_USER, no si_addr) or
+ * coalesced with another thread's fault into one bitmask bit.
+ *
+ * Follows Linux force_sig_info_to_task() semantics: a SIG_IGN or blocked
+ * disposition is reset to SIG_DFL and unblocked before delivery, so an
+ * unhandleable fault terminates the process rather than re-faulting forever
+ * or invoking a handler the guest asked to block.
+ */
+int signal_deliver_fault(hv_vcpu_t vcpu,
+                         guest_t *g,
+                         int signum,
+                         int *exit_code);
+
 /* Handle rt_sigreturn (SYS 139): restore registers from rt_sigframe on the
  * guest stack.
  *
