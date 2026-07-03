@@ -408,7 +408,7 @@ int rosetta_finalize(guest_t *g,
      * failure before commit goes through the fail label and tears down only the
      * host-local resources allocated so far.
      */
-    int bin_host_fd = -1;
+    int bin_host_fd;
     const char **rosetta_argv = NULL;
     int rosetta_argc = 0;
 
@@ -718,65 +718,43 @@ static ssize_t rosettad_recv_fd(int sock, void *buf, size_t buflen, int *out_fd)
     if (n <= 0)
         return n;
 
-    /* Walk every cmsg first, closing kernel-allocated fds in malformed or extra
-     * payloads. Defer the MSG_CTRUNC bailout until after the walk so fds that
-     * fit in cmsg_buf are closed instead of leaked into the elfuse process.
-     * cmsg_len is validated against CMSG_LEN(0) before any payload arithmetic
-     * to keep a hostile peer from underflowing the size_t.
+    /* Take ownership of every fd the kernel delivered so none leak, then accept
+     * only the exact single-fd case. cmsg_buf is CMSG_SPACE(sizeof(int)): one
+     * fd on macOS, but CMSG alignment lets an LP64 kernel pack two into the
+     * same space, so read into distinct slots and close any surplus on reject.
      */
-    int n_rights = 0;
-    bool malformed = false;
-    for (struct cmsghdr *c = CMSG_FIRSTHDR(&msg); c; c = CMSG_NXTHDR(&msg, c)) {
-        if (c->cmsg_level != SOL_SOCKET || c->cmsg_type != SCM_RIGHTS) {
-            malformed = true;
-            continue;
-        }
-        /* cmsg_len must cover at least the cmsghdr header; the macro captures
-         * any alignment padding the platform inserts. Anything smaller is
-         * structurally invalid and the payload arithmetic below would underflow
-         * into a huge size_t.
+    int fds[sizeof(cmsg_buf) / sizeof(int)];
+    size_t nfd = 0;
+    struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+    if (cmsg && cmsg->cmsg_level == SOL_SOCKET &&
+        cmsg->cmsg_type == SCM_RIGHTS && cmsg->cmsg_len >= CMSG_LEN(0)) {
+        size_t payload = cmsg->cmsg_len - CMSG_LEN(0);
+        /* Cap by the fds that actually fit after the header so a corrupt
+         * cmsg_len cannot drive the memcpy source past the end of cmsg_buf.
          */
-        if (c->cmsg_len < CMSG_LEN(0)) {
-            malformed = true;
-            continue;
-        }
-        size_t payload = c->cmsg_len - CMSG_LEN(0);
-        if (payload % sizeof(int) != 0) {
-            malformed = true;
-            continue;
-        }
-        size_t nfd = payload / sizeof(int);
-        for (size_t i = 0; i < nfd; i++) {
-            int fd;
-            memcpy(&fd, (uint8_t *) CMSG_DATA(c) + i * sizeof(int), sizeof(fd));
-            /* Canonical case: exactly one fd in exactly one SCM_RIGHTS cmsg.
-             * Anything else (extra cmsgs, extra fds per cmsg) is malformed;
-             * close every fd that does not fit the canonical slot so none leak.
-             */
-            if (n_rights == 0 && nfd == 1) {
-                *out_fd = fd;
-            } else {
-                close(fd);
-                malformed = true;
-            }
-            n_rights++;
+        size_t cap = (sizeof(cmsg_buf) - CMSG_LEN(0)) / sizeof(int);
+        if (payload % sizeof(int) == 0) {
+            nfd = payload / sizeof(int);
+            if (nfd > cap)
+                nfd = cap;
+            memcpy(fds, CMSG_DATA(cmsg), nfd * sizeof(int));
         }
     }
 
-    /* MSG_CTRUNC means the kernel discarded part of the ancillary data because
-     * cmsg_buf was too small. fds in the discarded portion were dropped by the
-     * kernel without ever entering this process; fds in the surviving cmsgs
-     * were walked above. Treat as a hard protocol error because the message
-     * framing is no longer reliable.
+    /* Well-formed means exactly one fd, no truncation, no extra cmsg.
+     * MSG_CTRUNC means the peer sent more ancillary data than cmsg_buf could
+     * hold; a trailing cmsg means more than the one expected fd. nfd == 1
+     * short-circuits before CMSG_NXTHDR so a NULL cmsg is never dereferenced.
      */
-    if ((msg.msg_flags & MSG_CTRUNC) || malformed || n_rights != 1) {
-        if (*out_fd >= 0) {
-            close(*out_fd);
-            *out_fd = -1;
-        }
+    bool accept = nfd == 1 && !(msg.msg_flags & MSG_CTRUNC) &&
+                  CMSG_NXTHDR(&msg, cmsg) == NULL;
+    if (!accept) {
+        for (size_t i = 0; i < nfd; i++)
+            close(fds[i]);
         errno = EPROTO;
         return -1;
     }
+    *out_fd = fds[0];
     return n;
 }
 

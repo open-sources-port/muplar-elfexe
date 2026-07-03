@@ -527,7 +527,7 @@ int64_t sys_getitimer(guest_t *g, int which, uint64_t val_gva)
     /* ITIMER_REAL/VIRTUAL/PROF are all emulated internally (see sys_setitimer
      * comment).
      */
-    struct timeval val, itv;
+    struct timeval val = {0}, itv = {0};
     if (which == 0)
         signal_get_itimer(&val, &itv);
     else if (which == 1 || which == 2)

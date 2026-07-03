@@ -265,9 +265,10 @@ jobs:
   # Silicon because the build needs Hypervisor.framework and -arch arm64;
   # Infer captures the real clang invocations, so it sees every TU.
   #
-  # Advisory, matching tidy-macos/scan-macos: findings land in the uploaded
-  # report but do not gate the job. To make Infer gate, add --fail-on-issue
-  # to the `infer run` invocation below.
+  # Gating (unlike tidy-macos/scan-macos): a separate step turns Infer's
+  # report.json into inline ::error:: annotations plus a job summary, then
+  # fails the job. Findings surface on the PR instead of a silent exit code,
+  # so bugs are pruned at PR time instead of merged.
   infer-macos:
     name: Infer (macOS Apple Silicon)
     runs-on: macos-15
@@ -295,8 +296,8 @@ jobs:
           "$GNU_OBJCOPY" --version | head -1
 
       - name: Setup Infer
-        # Pinned to a full commit SHA so the third-party action cannot run
-        # different code over time; v1.3.0 pins the Infer binary itself.
+        # infer_version pins the Infer binary; the action itself tracks the v1
+        # tag.
         uses: srz-zumix/setup-infer@v1
         with:
           infer_version: v1.3.0
@@ -304,10 +305,11 @@ jobs:
       - name: Infer capture + analyze (make -B elfuse)
         # -B forces a clean rebuild so Infer captures every translation unit.
         # Non-C build steps (shim.S assembly, objcopy) pass through untouched.
-        # --keep-going tolerates a frontend failure on an odd TU, but that
-        # can also mask a total capture miss (wrapper never intercepts clang,
-        # 0 files analyzed, job passes vacuously). Assert the captured count
-        # is non-zero so a silent no-op fails the job instead.
+        # No --fail-on-issue here: `infer run` must exit 0 so the reporting
+        # step below runs and surfaces findings before the job fails.
+        # --keep-going tolerates a frontend failure on an odd TU, but that can
+        # also mask a total capture miss (wrapper never intercepts clang, 0
+        # files analyzed). The count guard fails the job on that silent no-op.
         run: |
           set -euo pipefail
           infer run --keep-going -- make -B elfuse 2>&1 | tee infer-run.log
@@ -315,6 +317,13 @@ jobs:
               | grep -oE '[0-9]+' | tail -1 || true)
           echo "Infer captured ${n:-0} source files"
           test "${n:-0}" -gt 0
+
+      - name: Report Infer findings
+        # Emit GitHub annotations + a job summary from report.json, then exit
+        # non-zero if any finding exists. Runs even when a prior step failed so
+        # a partial report is still surfaced.
+        if: ${{ !cancelled() }}
+        run: python3 scripts/infer-annotate.py infer-out/report.json
 
       - name: Upload Infer report
         if: ${{ !cancelled() }}

@@ -796,15 +796,17 @@ static int64_t proc_try_writev_intercept(int fd,
     size_t total = 0;
     char stack_buf[256];
     char *buf = stack_buf;
+    char *heap = NULL;
     ssize_t written = 0;
     int handled;
 
     for (int i = 0; i < iovcnt; i++)
         total += iov[i].iov_len;
     if (total > sizeof(stack_buf)) {
-        buf = malloc(total);
-        if (!buf)
+        heap = malloc(total);
+        if (!heap)
             return -LINUX_ENOMEM;
+        buf = heap;
     }
 
     size_t off = 0;
@@ -815,8 +817,7 @@ static int64_t proc_try_writev_intercept(int fd,
 
     handled = proc_intercept_write(fd, host_fd, buf, total, offset, use_pwrite,
                                    &written);
-    if (buf != stack_buf)
-        free(buf);
+    free(heap);
     if (handled < 0)
         return linux_errno();
     if (handled > 0)
@@ -1044,15 +1045,16 @@ static int64_t build_host_iov(guest_t *g,
 {
     linux_iovec_t stack_giov[SYSCALL_IOV_STACK_MAX];
     linux_iovec_t *guest_iov = stack_giov;
+    linux_iovec_t *heap = NULL;
     if (iovcnt > SYSCALL_IOV_STACK_MAX) {
-        guest_iov = malloc((size_t) iovcnt * sizeof(*guest_iov));
-        if (!guest_iov)
+        heap = malloc((size_t) iovcnt * sizeof(*guest_iov));
+        if (!heap)
             return -LINUX_ENOMEM;
+        guest_iov = heap;
     }
     if (guest_read(g, iov_gva, guest_iov,
                    (size_t) iovcnt * sizeof(*guest_iov)) < 0) {
-        if (guest_iov != stack_giov)
-            free(guest_iov);
+        free(heap);
         return -LINUX_EFAULT;
     }
     for (int i = 0; i < iovcnt; i++) {
@@ -1065,8 +1067,7 @@ static int64_t build_host_iov(guest_t *g,
         void *base = guest_ptr_bound(g, guest_iov[i].iov_base, &avail,
                                      required_perms, guest_iov[i].iov_len);
         if (!base) {
-            if (guest_iov != stack_giov)
-                free(guest_iov);
+            free(heap);
             return -LINUX_EFAULT;
         }
         /* Cap to contiguous permitted bytes. When the guest iov entry spans a
@@ -1088,8 +1089,7 @@ static int64_t build_host_iov(guest_t *g,
         }
         host_iov[i].iov_len = len;
     }
-    if (guest_iov != stack_giov)
-        free(guest_iov);
+    free(heap);
     return 0;
 }
 
@@ -1099,21 +1099,23 @@ int64_t host_iov_prepare(guest_t *g,
                          int required_perms,
                          host_iov_buf_t *buf)
 {
+    buf->iov = buf->stack;
+    buf->heap = NULL;
+
     if (iovcnt <= 0 || iovcnt > SYSCALL_IOV_MAX)
         return -LINUX_EINVAL;
 
-    buf->iov = buf->stack;
-
     if (iovcnt > SYSCALL_IOV_STACK_MAX) {
-        buf->iov = malloc((size_t) iovcnt * sizeof(*buf->iov));
-        if (!buf->iov)
+        buf->heap = malloc((size_t) iovcnt * sizeof(*buf->iov));
+        if (!buf->heap)
             return -LINUX_ENOMEM;
+        buf->iov = buf->heap;
     }
 
     int64_t err = build_host_iov(g, iov_gva, iovcnt, buf->iov, required_perms);
     if (err < 0) {
-        if (buf->iov != buf->stack)
-            free(buf->iov);
+        free(buf->heap);
+        buf->heap = NULL;
         buf->iov = NULL;
         return err;
     }
@@ -1129,6 +1131,7 @@ int64_t host_iov_prepare_msg(guest_t *g,
 {
     if (iovcnt == 0) {
         buf->iov = buf->stack;
+        buf->heap = NULL;
         return 0;
     }
     return host_iov_prepare(g, iov_gva, iovcnt, required_perms, buf);
@@ -1136,8 +1139,8 @@ int64_t host_iov_prepare_msg(guest_t *g,
 
 void host_iov_free(host_iov_buf_t *buf)
 {
-    if (buf->iov != buf->stack)
-        free(buf->iov);
+    free(buf->heap);
+    buf->heap = NULL;
     buf->iov = NULL;
 }
 

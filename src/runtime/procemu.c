@@ -1767,7 +1767,7 @@ uint32_t proc_pty_master_adopt(int guest_fd)
      */
     char slave_path[PTY_SLAVE_PATH_MAX];
     uint32_t pts_num = UINT32_MAX;
-    int slave = -1;
+    int slave;
     if (ptsname_r(probe, slave_path, sizeof(slave_path)) != 0)
         goto out;
     pts_num = pty_extract_pts_num(slave_path);
@@ -1891,7 +1891,7 @@ static int pty_open_slave(uint32_t linux_pts_num, int linux_flags)
     int stale_hit = -1;
     int retained_slaves[PTY_KEEPALIVE_MAX];
     int nretained = 0;
-    int fd = -1;
+    int fd;
 
     pty_keepalive_lock_acquire();
     for (int i = 0; i < PTY_KEEPALIVE_MAX; i++) {

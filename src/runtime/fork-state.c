@@ -100,6 +100,14 @@ int fork_ipc_send_fds(int sock, const int *fds, int count)
         msg.msg_controllen = cmsg_size;
 
         struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+        /* cmsg_buf is sized via CMSG_SPACE for chunk >= 1, so this never
+         * returns NULL; the guard keeps the deref provably safe.
+         */
+        if (!cmsg) {
+            free(cmsg_buf);
+            errno = EINVAL;
+            return -1;
+        }
         cmsg->cmsg_level = SOL_SOCKET;
         cmsg->cmsg_type = SCM_RIGHTS;
         cmsg->cmsg_len = CMSG_LEN((size_t) chunk * sizeof(int));
@@ -216,7 +224,7 @@ int fork_ipc_recv_memory_regions(int ipc_fd, guest_t *g)
         log_debug("fork-child: receiving %u memory regions", num_regions);
 
     for (uint32_t i = 0; i < num_regions; i++) {
-        ipc_region_header_t rhdr;
+        ipc_region_header_t rhdr = {0};
         if (fork_ipc_read_all(ipc_fd, &rhdr, sizeof(rhdr)) < 0) {
             log_error("fork-child: failed to read region header");
             return -1;

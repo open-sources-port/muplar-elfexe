@@ -106,7 +106,7 @@ int fork_child_main(int ipc_fd,
     /* The header magic identifies the fork IPC protocol before any
      * variable-length state is trusted.
      */
-    ipc_header_t hdr;
+    ipc_header_t hdr = {0};
     if (fork_ipc_read_all(ipc_fd, &hdr, sizeof(hdr)) < 0) {
         log_error("fork-child: failed to read header");
         return 1;

@@ -576,9 +576,14 @@ int64_t sys_msgsnd(guest_t *g,
 
     size_t total = sizeof(long) + (size_t) msgsz;
     char stack_buf[MSG_STACK_THRESHOLD + sizeof(long)];
-    char *buf = (total <= sizeof(stack_buf)) ? stack_buf : malloc(total);
-    if (!buf)
-        return -LINUX_ENOMEM;
+    char *heap = NULL;
+    char *buf = stack_buf;
+    if (total > sizeof(stack_buf)) {
+        heap = malloc(total);
+        if (!heap)
+            return -LINUX_ENOMEM;
+        buf = heap;
+    }
 
     int64_t result;
     if (guest_read(g, msgp_gva, buf, total) < 0) {
@@ -596,8 +601,7 @@ int64_t sys_msgsnd(guest_t *g,
     result =
         (msgsnd(msqid, buf, (size_t) msgsz, flags) < 0) ? linux_errno() : 0;
 out:
-    if (buf != stack_buf)
-        free(buf);
+    free(heap);
     return result;
 }
 
@@ -625,9 +629,14 @@ int64_t sys_msgrcv(guest_t *g,
 
     size_t total = sizeof(long) + (size_t) msgsz;
     char stack_buf[MSG_STACK_THRESHOLD + sizeof(long)];
-    char *buf = (total <= sizeof(stack_buf)) ? stack_buf : malloc(total);
-    if (!buf)
-        return -LINUX_ENOMEM;
+    char *heap = NULL;
+    char *buf = stack_buf;
+    if (total > sizeof(stack_buf)) {
+        heap = malloc(total);
+        if (!heap)
+            return -LINUX_ENOMEM;
+        buf = heap;
+    }
 
     int64_t result;
     ssize_t ret = msgrcv(msqid, buf, (size_t) msgsz, (long) msgtyp, flags);
@@ -644,8 +653,7 @@ int64_t sys_msgrcv(guest_t *g,
         result = ret;
 
 out:
-    if (buf != stack_buf)
-        free(buf);
+    free(heap);
     return result;
 }
 

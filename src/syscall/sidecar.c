@@ -1186,7 +1186,12 @@ static int sidecar_serialize_index(const sidecar_index_t *index,
             size_t new_cap = cap;
             while (new_cap < len + row_len)
                 new_cap *= 2;
-            char *nb = (char *) realloc(buf, new_cap);
+            /* Grow via malloc + copy rather than realloc: on realloc failure
+             * the original block stays valid and must be freed, but static
+             * analyzers model realloc as freeing its argument and flag that
+             * free as a use-after-free. An explicit copy keeps ownership clear.
+             */
+            char *nb = (char *) malloc(new_cap);
             if (!nb) {
                 int saved_errno = errno;
                 free(enc);
@@ -1194,6 +1199,8 @@ static int sidecar_serialize_index(const sidecar_index_t *index,
                 errno = saved_errno;
                 return -1;
             }
+            memcpy(nb, buf, len);
+            free(buf);
             buf = nb;
             cap = new_cap;
         }

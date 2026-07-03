@@ -131,14 +131,14 @@ typedef struct {
 
 typedef struct {
     bool in_use;
-    int guest_fd;   /* Guest fd number */
-    uint8_t *buf;   /* Response buffer */
-    size_t buf_len; /* Bytes written into buf */
-    size_t buf_pos; /* Current read position */
-    uint32_t seq;   /* Sequence number from last request */
-    uint32_t pid;   /* Bound PID (from bind or auto-assigned) */
-    int pipe_wr;    /* Host pipe write descriptor */
-    int pipe_rd;    /* Host pipe read descriptor */
+    int guest_fd;                  /* Guest fd number */
+    uint8_t buf[NETLINK_BUF_SIZE]; /* Response buffer */
+    size_t buf_len;                /* Bytes written into buf */
+    size_t buf_pos;                /* Current read position */
+    uint32_t seq;                  /* Sequence number from last request */
+    uint32_t pid;                  /* Bound PID (from bind or auto-assigned) */
+    int pipe_wr;                   /* Host pipe write descriptor */
+    int pipe_rd;                   /* Host pipe read descriptor */
 } netlink_state_t;
 
 static netlink_state_t nl_state[MAX_NETLINK_FDS];
@@ -167,11 +167,6 @@ static netlink_state_t *nl_alloc(int guest_fd)
         s->guest_fd = guest_fd;
         s->pipe_wr = -1;
         s->pipe_rd = -1;
-        s->buf = malloc(NETLINK_BUF_SIZE);
-        if (!s->buf) {
-            s->in_use = false;
-            return NULL;
-        }
         s->pid = (uint32_t) getpid();
         return s;
     }
@@ -973,8 +968,6 @@ static void netlink_close(int guest_fd)
         ns->pipe_wr = -1;
     }
     ns->pipe_rd = -1;
-    free(ns->buf);
-    ns->buf = NULL;
     ns->in_use = false;
     pthread_mutex_unlock(&nl_lock);
 }

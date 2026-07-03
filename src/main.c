@@ -47,7 +47,10 @@
 
 static int parse_int_arg(const char *s, int min, int max, int *out)
 {
-    char *end = NULL;
+    /* Seed end with s (strtol's no-conversion result) so the end == s guard
+     * below catches a failed parse without a separate NULL check.
+     */
+    char *end = (char *) s;
     errno = 0;
     long value = strtol(s, &end, 10);
     if (errno != 0 || end == s || *end != '\0' || value < min || value > max)

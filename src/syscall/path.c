@@ -309,7 +309,7 @@ int sys_path_has_symlink(guest_fd_t dirfd, const char *path)
     if (!path || path[0] == '\0')
         return 0;
 
-    host_fd_t base_fd = -1;
+    host_fd_t base_fd;
     bool owned_base_fd = false;
     const char *scan = path;
     char sysroot_buf[LINUX_PATH_MAX];
@@ -660,8 +660,19 @@ static int path_openat2_dirfd_host_path(guest_fd_t dirfd,
                                         size_t outsz)
 {
     if (dirfd == LINUX_AT_FDCWD) {
-        if (!getcwd(out, outsz))
+        /* getcwd into a provably non-NULL local buffer, then copy. Writing
+         * straight into the caller pointer trips a false-positive leak in
+         * static analyzers that model getcwd(NULL, ...) as allocating.
+         */
+        char cwd[LINUX_PATH_MAX];
+        if (!getcwd(cwd, sizeof(cwd)))
             return -1;
+        size_t n = strlen(cwd) + 1;
+        if (n > outsz) {
+            errno = ERANGE;
+            return -1;
+        }
+        memcpy(out, cwd, n);
         return 0;
     }
 

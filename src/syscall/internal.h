@@ -346,6 +346,7 @@ static inline int64_t host_fd_ref_open_io(guest_fd_t guest_fd,
 typedef struct {
     struct iovec stack[SYSCALL_IOV_STACK_MAX];
     struct iovec *iov;
+    struct iovec *heap; /* non-NULL only when iov was heap-allocated */
 } host_iov_buf_t;
 
 /* Translate a guest iovec array at iov_gva (iovcnt entries) into the host iovec

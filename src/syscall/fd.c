@@ -1140,6 +1140,7 @@ retry:
 
     signal_rt_info_t pending_stack[LINUX_NSIG];
     signal_rt_info_t *pending = pending_stack;
+    signal_rt_info_t *heap = NULL;
     size_t total = 0;
     const signal_state_t *sig = signal_get_state();
     /* Match pending signals against the signalfd mask. Do NOT filter by
@@ -1149,9 +1150,10 @@ retry:
     uint64_t deliverable = sig->pending & mask;
 
     if (max_signals > LINUX_NSIG) {
-        pending = malloc(max_signals * sizeof(*pending));
-        if (!pending)
+        heap = malloc(max_signals * sizeof(*pending));
+        if (!heap)
             return -LINUX_ENOMEM;
+        pending = heap;
     }
 
     if (deliverable == 0) {
@@ -1175,8 +1177,7 @@ retry:
         int still_valid = (signalfd_state[slot].guest_fd == guest_fd);
         pthread_mutex_unlock(&sfd_lock);
         if (!still_valid) {
-            if (pending != pending_stack)
-                free(pending);
+            free(heap);
             return -LINUX_EBADF;
         }
 
@@ -1218,8 +1219,7 @@ retry:
                  * promise locked in by tests/test-fd-family's
                  * test_signalfd_efault_preserves_pending.
                  */
-                if (pending != pending_stack)
-                    free(pending);
+                free(heap);
                 return -LINUX_EFAULT;
             }
 
@@ -1236,8 +1236,7 @@ retry:
     if (total == 0) {
         if (written == 0)
             goto no_pending;
-        if (pending != pending_stack)
-            free(pending);
+        free(heap);
         goto retry;
     }
 
@@ -1252,13 +1251,11 @@ retry:
             break;
     }
 
-    if (pending != pending_stack)
-        free(pending);
+    free(heap);
     return (int64_t) total * (int64_t) sizeof(linux_signalfd_siginfo_t);
 
 no_pending:
-    if (pending != pending_stack)
-        free(pending);
+    free(heap);
     return -LINUX_EAGAIN;
 }
 
