@@ -295,7 +295,8 @@ jobs:
           "$GNU_OBJCOPY" --version | head -1
 
       - name: Setup Infer
-        # Pinned so a new upstream release cannot silently change findings.
+        # Pinned to a full commit SHA so the third-party action cannot run
+        # different code over time; v1.3.0 pins the Infer binary itself.
         uses: srz-zumix/setup-infer@v1
         with:
           infer_version: v1.3.0
@@ -303,7 +304,17 @@ jobs:
       - name: Infer capture + analyze (make -B elfuse)
         # -B forces a clean rebuild so Infer captures every translation unit.
         # Non-C build steps (shim.S assembly, objcopy) pass through untouched.
-        run: infer run --keep-going -- make -B elfuse
+        # --keep-going tolerates a frontend failure on an odd TU, but that
+        # can also mask a total capture miss (wrapper never intercepts clang,
+        # 0 files analyzed, job passes vacuously). Assert the captured count
+        # is non-zero so a silent no-op fails the job instead.
+        run: |
+          set -euo pipefail
+          infer run --keep-going -- make -B elfuse 2>&1 | tee infer-run.log
+          n=$(grep -oE 'Found [0-9]+ source file' infer-run.log \
+              | grep -oE '[0-9]+' | tail -1 || true)
+          echo "Infer captured ${n:-0} source files"
+          test "${n:-0}" -gt 0
 
       - name: Upload Infer report
         if: ${{ !cancelled() }}
