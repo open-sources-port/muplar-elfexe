@@ -1,10 +1,11 @@
 # Build elfuse and run the lint + analysis suites.
 #
-# Four jobs run in parallel:
+# Five jobs run in parallel:
 #   lint        : format/newline/security/cppcheck/dispatch on Linux
 #   build-macos : compile + entitlement check on macOS Apple Silicon
 #   tidy-macos  : clang-tidy via `make lint`
 #   scan-macos  : LLVM scan-build via `make analyze`
+#   infer-macos : Facebook Infer capture + analyze over the full build
 #
 # Runtime tests (test-hello, make check, test-multi-vcpu) require
 # Hypervisor.framework, which GitHub-hosted macOS runners do not expose
@@ -52,7 +53,7 @@ jobs:
       LINT_PKGS: clang-format-22 cppcheck shellcheck
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Cache apt packages
         uses: actions/cache@v5
@@ -125,7 +126,7 @@ jobs:
       BREW_PKGS: binutils
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Cache Homebrew downloads
         # No restore-keys: a partial match would mask upstream regressions.
@@ -185,7 +186,7 @@ jobs:
       CLANG_TIDY: /opt/homebrew/opt/llvm/bin/clang-tidy
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Cache Homebrew downloads
         uses: actions/cache@v5
@@ -224,7 +225,7 @@ jobs:
       LLVM_BIN: /opt/homebrew/opt/llvm/bin
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Cache Homebrew downloads
         uses: actions/cache@v5
@@ -259,3 +260,56 @@ jobs:
           path: build/scan-build
           retention-days: 7
           if-no-files-found: ignore
+
+  # Facebook Infer over the full elfuse build. Must run on macOS Apple
+  # Silicon because the build needs Hypervisor.framework and -arch arm64;
+  # Infer captures the real clang invocations, so it sees every TU.
+  #
+  # Advisory, matching tidy-macos/scan-macos: findings land in the uploaded
+  # report but do not gate the job. To make Infer gate, add --fail-on-issue
+  # to the `infer run` invocation below.
+  infer-macos:
+    name: Infer (macOS Apple Silicon)
+    runs-on: macos-15
+    timeout-minutes: 25
+    env:
+      GNU_OBJCOPY: /opt/homebrew/opt/binutils/bin/objcopy
+      HOMEBREW_NO_INSTALL_CLEANUP: 1
+      HOMEBREW_NO_AUTO_UPDATE: 1
+      BREW_PKGS: binutils
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Cache Homebrew downloads
+        uses: actions/cache@v5
+        with:
+          path: ~/Library/Caches/Homebrew/downloads
+          key: brew-${{ runner.os }}-${{ runner.arch }}-${{ env.BREW_PKGS }}
+
+      - name: Install GNU objcopy
+        # shellcheck disable=SC2086 -- BREW_PKGS is a space-separated list.
+        run: |
+          set -euo pipefail
+          brew install --quiet $BREW_PKGS
+          "$GNU_OBJCOPY" --version | head -1
+
+      - name: Setup Infer
+        # Pinned so a new upstream release cannot silently change findings.
+        uses: srz-zumix/setup-infer@v1
+        with:
+          infer_version: v1.3.0
+
+      - name: Infer capture + analyze (make -B elfuse)
+        # -B forces a clean rebuild so Infer captures every translation unit.
+        # Non-C build steps (shim.S assembly, objcopy) pass through untouched.
+        run: infer run --keep-going -- make -B elfuse
+
+      - name: Upload Infer report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: infer-${{ runner.os }}-${{ runner.arch }}
+          path: infer-out/report.txt
+          retention-days: 7
+          if-no-files-found: warn
