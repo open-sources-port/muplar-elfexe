@@ -169,7 +169,39 @@ static void test_zero_length_iovec(void)
                 "zero-length iovec handling wrong");
 }
 
-/* Test 5: Large writev (many iovecs) */
+/* Test 5: all-empty iovecs still validate descriptor access */
+
+static void test_empty_iovec_access_checks(void)
+{
+    TEST("empty readv/writev access checks");
+
+    struct iovec zv[2] = {{0}};
+    int rfd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    int wfd = open("/dev/null", O_WRONLY | O_CLOEXEC);
+    if (rfd < 0 || wfd < 0) {
+        if (rfd >= 0)
+            close(rfd);
+        if (wfd >= 0)
+            close(wfd);
+        FAIL("open");
+        return;
+    }
+
+    errno = 0;
+    ssize_t wr = writev(rfd, zv, 2);
+    int write_errno = errno;
+    errno = 0;
+    ssize_t rr = readv(wfd, zv, 2);
+    int read_errno = errno;
+    close(rfd);
+    close(wfd);
+
+    EXPECT_TRUE(
+        wr == -1 && write_errno == EBADF && rr == -1 && read_errno == EBADF,
+        "empty iovec access check skipped");
+}
+
+/* Test 6: Large writev (many iovecs) */
 
 static void test_many_iovecs(void)
 {
@@ -196,7 +228,7 @@ static void test_many_iovecs(void)
                 "10-iovec writev failed");
 }
 
-/* Test 6: pwritev2 RWF_APPEND semantics */
+/* Test 7: pwritev2 RWF_APPEND semantics */
 
 static void test_pwritev2_append(void)
 {
@@ -249,7 +281,7 @@ static void test_pwritev2_append(void)
     EXPECT_TRUE(nr == 6 && !memcmp(buf, "baseXY", 6), "append data mismatch");
 }
 
-/* Test 7: zero iovcnt must not move the append file offset */
+/* Test 8: zero iovcnt must not move the append file offset */
 
 static void test_pwritev2_append_zero_iovcnt(void)
 {
@@ -289,6 +321,7 @@ int main(void)
     test_file_roundtrip();
     test_single_iovec();
     test_zero_length_iovec();
+    test_empty_iovec_access_checks();
     test_many_iovecs();
     test_pwritev2_append();
     test_pwritev2_append_zero_iovcnt();

@@ -30,6 +30,17 @@ void urandom_fd_reset_cache(int guest_fd);
  * alongside the other subsystem init hooks.
  */
 void io_init(void);
+
+/* Wait until host_fd is ready for events (POLLIN and/or POLLOUT) or a
+ * guest-visible signal/exit is pending.
+ *
+ * Returns 0 when ready, -LINUX_EINTR when interrupted, or a negative Linux
+ * errno on poll failure. Shared by the read, write, recv, accept, connect, and
+ * send paths so a guest thread parked in a blocking host call stays reachable
+ * by hv_vcpus_exit + the wakeup pipe.
+ */
+int64_t io_wait_fd_or_interrupted(int host_fd, short events);
+
 int64_t sys_pread64(guest_t *g,
                     int fd,
                     uint64_t buf_gva,

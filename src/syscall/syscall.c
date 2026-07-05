@@ -2086,6 +2086,16 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, bool verbose)
             if (tp != FD_REGULAR && tp != FD_STDIO && tp != FD_PIPE &&
                 tp != FD_SOCKET)
                 goto slow_path;
+            /* Same racy-but-benign read as tp above, and no worse than the
+             * shipped tp-based divert: a concurrent close+reopen (only possible
+             * with a live sibling thread; a single active thread has no
+             * mutator) that flips this slot to a blocking fd could skip the
+             * divert for one call. The guest is already reading an fd it is
+             * concurrently reopening, so the pinned fd it gets is undefined
+             * regardless; the slow path carries the identical window. Not worth
+             * a lock on the hot regular-file read.
+             */
+            bool can_block = fd_table[fd].can_block;
 
             /* Proc-backed fds may need synthetic read/write handling (for
              * example, oom_* rereads recompute content on each read and proc
@@ -2121,17 +2131,19 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, bool verbose)
                 goto slow_path;
             }
 
-            /* A blocking read on a pipe/stdio fd would park this vCPU thread in
-             * an uninterruptible host read(), where the preempt thread's
-             * hv_vcpus_exit cannot reach it. Probe non-blocking: if nothing is
-             * ready the read would block, so divert to the slow path where
-             * sys_read waits interruptibly (poll + wakeup pipe). Regular files
-             * never block and stay on the fast path.
+            /* A blocking read/write on a pipe, socket, fifo, or char device
+             * would park this vCPU thread in an uninterruptible host call where
+             * the preempt thread's hv_vcpus_exit cannot reach it. Probe
+             * non-blocking: read waits for POLLIN, write for POLLOUT; if the fd
+             * would block, divert to the slow path where sys_read/sys_write
+             * wait interruptibly (poll + wakeup pipe). Regular files never
+             * block (can_block is false) and stay on the fast path.
              */
-            if (nr == SYS_read && (tp == FD_PIPE || tp == FD_STDIO)) {
-                struct pollfd pfd = {.fd = host_ref.fd, .events = POLLIN};
+            if (can_block) {
+                short ev = (nr == SYS_read) ? POLLIN : POLLOUT;
+                struct pollfd pfd = {.fd = host_ref.fd, .events = ev};
                 /* Divert on not-ready (0) or probe error (< 0, e.g. EINTR): a
-                 * blocking read here cannot be preempted, so let the
+                 * blocking call here cannot be preempted, so let the
                  * interruptible slow path handle both.
                  */
                 if (poll(&pfd, 1, 0) <= 0) {

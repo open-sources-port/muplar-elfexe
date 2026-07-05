@@ -150,7 +150,7 @@ static int64_t io_return_zero(host_fd_ref_t *host_ref)
     return 0;
 }
 
-static int64_t wait_readable_or_interrupted(int host_fd)
+int64_t io_wait_fd_or_interrupted(int host_fd, short events)
 {
     int wake_fd = wakeup_pipe_read_fd();
 
@@ -158,7 +158,7 @@ static int64_t wait_readable_or_interrupted(int host_fd)
      * drops the second slot.
      */
     struct pollfd fds[2] = {
-        {.fd = host_fd, .events = POLLIN},
+        {.fd = host_fd, .events = events},
         {.fd = wake_fd, .events = POLLIN},
     };
 
@@ -184,6 +184,42 @@ static int64_t wait_readable_or_interrupted(int host_fd)
         if (fds[0].revents)
             return 0;
     }
+}
+
+/* Route a blocking read/write on a fd that can block (pipe, socket, fifo,
+ * char/tty) through the interruptible wait so the vCPU thread stays reachable
+ * by hv_vcpus_exit + the wakeup pipe. No-op for regular files, nonblocking fds,
+ * and direction mismatches (a POLLIN wait on an O_WRONLY fd would hang; the
+ * read then fails EBADF like Linux).
+ *
+ * Returns 0 to proceed or a negative Linux errno (EINTR) to abort.
+ */
+static int64_t io_block_wait(int fd, int host_fd, short events)
+{
+    if (!fd_can_block(fd))
+        return 0;
+    int fl = fcntl(host_fd, F_GETFL);
+    if (fl < 0 || (fl & O_NONBLOCK))
+        return 0;
+    int acc = fl & O_ACCMODE;
+    if ((events & POLLIN) && acc == O_WRONLY)
+        return 0;
+    if ((events & POLLOUT) && acc == O_RDONLY)
+        return 0;
+    return io_wait_fd_or_interrupted(host_fd, events);
+}
+
+static int64_t io_check_access(int host_fd, short events)
+{
+    int fl = fcntl(host_fd, F_GETFL);
+    if (fl < 0)
+        return linux_errno();
+    int acc = fl & O_ACCMODE;
+    if ((events & POLLIN) && acc == O_WRONLY)
+        return -LINUX_EBADF;
+    if ((events & POLLOUT) && acc == O_RDONLY)
+        return -LINUX_EBADF;
+    return 0;
 }
 
 void urandom_fd_reset_cache(int guest_fd)
@@ -922,6 +958,19 @@ int64_t sys_write(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
         }
     }
 
+    /* A blocking write on a full pipe/socket buffer would park this vCPU thread
+     * in an uninterruptible host write() where the preempt thread's
+     * hv_vcpus_exit cannot reach it. Wait for POLLOUT (or a guest signal)
+     * first. Unlike the socket send paths there is no per-call nonblocking flag
+     * for write(), so the tiny window where the buffer refills between the wait
+     * and write() can still block; that matches sys_read and the receive paths.
+     */
+    int64_t wwait = io_block_wait(fd, host_ref.fd, POLLOUT);
+    if (wwait < 0) {
+        host_fd_ref_close(&host_ref);
+        return wwait;
+    }
+
     ssize_t ret = write(host_ref.fd, buf, count);
     host_fd_ref_close(&host_ref);
     return io_write_result(ret);
@@ -984,18 +1033,13 @@ int64_t sys_read(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
         }
     }
 
-    int flags = fcntl(host_ref.fd, F_GETFL);
-    /* Only wait when the fd can actually become readable. A write-only fd (e.g.
-     * the write end of a pipe) never signals POLLIN, so waiting would hang;
-     * fall straight through to read(), which returns EBADF like Linux.
+    /* Wait interruptibly when the fd can block on a read (pipe, socket, fifo,
+     * char/tty). Regular files never block and skip this.
      */
-    if ((type == FD_PIPE || type == FD_STDIO) && flags >= 0 &&
-        !(flags & O_NONBLOCK) && (flags & O_ACCMODE) != O_WRONLY) {
-        int64_t wait = wait_readable_or_interrupted(host_ref.fd);
-        if (wait < 0) {
-            host_fd_ref_close(&host_ref);
-            return wait;
-        }
+    int64_t rwait = io_block_wait(fd, host_ref.fd, POLLIN);
+    if (rwait < 0) {
+        host_fd_ref_close(&host_ref);
+        return rwait;
     }
 
     ssize_t ret = read(host_ref.fd, buf, count);
@@ -1275,6 +1319,12 @@ int64_t sys_readv(guest_t *g, int fd, uint64_t iov_gva, int iovcnt)
         host_fd_ref_close(&host_ref);
         return err;
     }
+    if (!host_iov_has_payload(&host_iov, iovcnt)) {
+        err = io_check_access(host_ref.fd, POLLIN);
+        host_iov_free(&host_iov);
+        host_fd_ref_close(&host_ref);
+        return err < 0 ? err : 0;
+    }
 
     off_t offset = lseek(host_ref.fd, 0, SEEK_CUR);
     if (offset >= 0) {
@@ -1285,6 +1335,13 @@ int64_t sys_readv(guest_t *g, int fd, uint64_t iov_gva, int iovcnt)
             host_fd_ref_close(&host_ref);
             return intercepted;
         }
+    }
+
+    int64_t rwait = io_block_wait(fd, host_ref.fd, POLLIN);
+    if (rwait < 0) {
+        host_iov_free(&host_iov);
+        host_fd_ref_close(&host_ref);
+        return rwait;
     }
 
     ssize_t ret = readv(host_ref.fd, host_iov.iov, iovcnt);
@@ -1329,6 +1386,12 @@ int64_t sys_writev(guest_t *g, int fd, uint64_t iov_gva, int iovcnt)
         host_fd_ref_close(&host_ref);
         return err;
     }
+    if (!host_iov_has_payload(&host_iov, iovcnt)) {
+        err = io_check_access(host_ref.fd, POLLOUT);
+        host_iov_free(&host_iov);
+        host_fd_ref_close(&host_ref);
+        return err < 0 ? err : 0;
+    }
 
     off_t offset = lseek(host_ref.fd, 0, SEEK_CUR);
     if (offset >= 0) {
@@ -1339,6 +1402,13 @@ int64_t sys_writev(guest_t *g, int fd, uint64_t iov_gva, int iovcnt)
             host_fd_ref_close(&host_ref);
             return intercepted;
         }
+    }
+
+    int64_t wwait = io_block_wait(fd, host_ref.fd, POLLOUT);
+    if (wwait < 0) {
+        host_iov_free(&host_iov);
+        host_fd_ref_close(&host_ref);
+        return wwait;
     }
 
     ssize_t ret = writev(host_ref.fd, host_iov.iov, iovcnt);

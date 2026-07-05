@@ -126,6 +126,12 @@ int fd_snapshot_and_dup(int guest_fd, fd_entry_t *out);
  */
 int fd_get_type(int guest_fd);
 
+/* True when a host read/write on this guest fd may block (pipe, socket, fifo,
+ * char/tty). Regular files and directories never block. Callers use this to
+ * decide whether to route a blocking I/O through the interruptible wait path.
+ */
+bool fd_can_block(int guest_fd);
+
 /* Publish linux_flags for a guest fd under fd_lock. Use after fd_alloc when the
  * creating syscall needs to set linux_flags atomically with respect to a
  * concurrent fcntl(F_SETFL/F_SETFD) on the same slot. The fd_alloc-then-
@@ -355,6 +361,15 @@ typedef struct {
     struct iovec *iov;
     struct iovec *heap; /* non-NULL only when iov was heap-allocated */
 } host_iov_buf_t;
+
+static inline bool host_iov_has_payload(const host_iov_buf_t *buf, int iovcnt)
+{
+    for (int i = 0; i < iovcnt; i++) {
+        if (buf->iov[i].iov_len > 0)
+            return true;
+    }
+    return false;
+}
 
 /* Translate a guest iovec array at iov_gva (iovcnt entries) into the host iovec
  * layout in buf->iov, resolving each guest_base to a contiguous host pointer

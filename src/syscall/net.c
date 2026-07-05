@@ -40,7 +40,97 @@
 #include "syscall/net-absock.h"
 #include "syscall/net-sockopt.h"
 #include "syscall/proc.h"
+#include "syscall/io.h"
 #include "syscall/signal.h"
+
+/* Linux MSG_DONTWAIT: recv/send skip the interruptible wait when set. */
+#define LINUX_MSG_DONTWAIT 0x40
+
+/* Wait for a blocking socket op (recv/accept/connect/send) to become ready or
+ * be interrupted by a guest signal, so a vCPU thread parked in the host call
+ * stays reachable by hv_vcpus_exit + the wakeup pipe. No-op for nonblocking fds
+ * and for MSG_DONTWAIT callers. Pass msg_flags = 0 for ops with no flags
+ * argument (accept, connect).
+ *
+ * Returns 0 to proceed or a negative Linux errno (EINTR) to abort.
+ */
+int64_t net_wait_or_interrupted(int host_fd, short events, int msg_flags)
+{
+    if (msg_flags & LINUX_MSG_DONTWAIT)
+        return 0;
+    int fl = fcntl(host_fd, F_GETFL);
+    if (fl < 0 || (fl & O_NONBLOCK))
+        return 0;
+    return io_wait_fd_or_interrupted(host_fd, events);
+}
+
+/* True when a socket send/recv should wait interruptibly and retry rather than
+ * surface EAGAIN: the guest asked for blocking semantics (no MSG_DONTWAIT, fd
+ * not O_NONBLOCK). The send/recv paths probe with a per-call MSG_DONTWAIT and
+ * loop on EAGAIN when this holds, so a post-readiness buffer-full/steal race
+ * retries instead of parking the vCPU in an uninterruptible host call. Using
+ * MSG_DONTWAIT rather than toggling the fd's O_NONBLOCK keeps the flag off the
+ * shared open file description, so a sibling thread on the same fd is never hit
+ * with a spurious EAGAIN.
+ */
+bool sock_op_should_block(int host_fd, int msg_flags)
+{
+    if (msg_flags & LINUX_MSG_DONTWAIT)
+        return false;
+    int fl = fcntl(host_fd, F_GETFL);
+    return fl >= 0 && !(fl & O_NONBLOCK);
+}
+
+/* Drive an already-nonblocking connect to completion or interruption: start it,
+ * wait for POLLOUT (or a guest signal), then read SO_ERROR.
+ *
+ * Returns 0 on success or a negative Linux errno. Assumes the caller set
+ * O_NONBLOCK and will restore the original flags.
+ */
+static int64_t connect_nonblock_wait(int host_fd,
+                                     const struct sockaddr *sa,
+                                     socklen_t len)
+{
+    if (connect(host_fd, sa, len) == 0)
+        return 0;
+    if (errno != EINPROGRESS && errno != EINTR)
+        return linux_errno();
+
+    int64_t waited = io_wait_fd_or_interrupted(host_fd, POLLOUT);
+    if (waited < 0)
+        return waited; /* EINTR: connect continues in the background per Linux
+                        */
+
+    int soerr = 0;
+    socklen_t slen = sizeof(soerr);
+    if (getsockopt(host_fd, SOL_SOCKET, SO_ERROR, &soerr, &slen) < 0)
+        soerr = errno;
+    if (soerr) {
+        errno = soerr;
+        return linux_errno();
+    }
+    return 0;
+}
+
+/* Blocking connect that stays interruptible by a guest signal. Flips the socket
+ * nonblocking, drives the connect via connect_nonblock_wait, and restores the
+ * guest's file-status flags exactly once. A socket already in nonblocking mode,
+ * or one that cannot be flipped, falls back to a plain connect (best-effort
+ * interruptibility, never a lost connect); its EINPROGRESS surfaces unchanged.
+ */
+static int64_t connect_or_interrupted(int host_fd,
+                                      const struct sockaddr *sa,
+                                      socklen_t len)
+{
+    int fl = fcntl(host_fd, F_GETFL);
+    bool blocking = fl >= 0 && !(fl & O_NONBLOCK);
+    if (!blocking || fcntl(host_fd, F_SETFL, fl | O_NONBLOCK) < 0)
+        return connect(host_fd, sa, len) < 0 ? linux_errno() : 0;
+
+    int64_t result = connect_nonblock_wait(host_fd, sa, len);
+    fcntl(host_fd, F_SETFL, fl);
+    return result;
+}
 
 /* Syscall implementations. */
 
@@ -342,6 +432,12 @@ static int64_t do_accept(guest_t *g,
         return -LINUX_ENOTSOCK;
     }
 
+    int64_t waited = net_wait_or_interrupted(host_ref.fd, POLLIN, 0);
+    if (waited < 0) {
+        host_fd_ref_close(&host_ref);
+        return waited;
+    }
+
     struct sockaddr_storage mac_sa;
     socklen_t mac_len = sizeof(mac_sa);
 
@@ -543,13 +639,10 @@ int64_t sys_connect(guest_t *g, int fd, uint64_t addr_gva, uint32_t addrlen)
         return -LINUX_EPROTOTYPE;
     }
 
-    if (connect(host_ref.fd, (struct sockaddr *) &mac_sa, (socklen_t) mac_len) <
-        0) {
-        host_fd_ref_close(&host_ref);
-        return linux_errno();
-    }
+    int64_t crc = connect_or_interrupted(
+        host_ref.fd, (struct sockaddr *) &mac_sa, (socklen_t) mac_len);
     host_fd_ref_close(&host_ref);
-    return 0;
+    return crc;
 }
 
 /* Convert a resolved macOS sockaddr to Linux form and write it, plus its actual
@@ -709,6 +802,10 @@ int64_t sys_sendto(guest_t *g,
      */
     int suppress_sigpipe = (linux_flags & 0x4000);
 
+    /* sendto with a NULL destination is send(); merge both forms. */
+    struct sockaddr_storage mac_sa;
+    struct sockaddr *dest = NULL;
+    socklen_t dest_len = 0;
     if (dest_gva && addrlen > 0) {
         uint8_t linux_sa[128];
         if (addrlen > sizeof(linux_sa)) {
@@ -719,33 +816,37 @@ int64_t sys_sendto(guest_t *g,
             host_fd_ref_close(&host_ref);
             return -LINUX_EFAULT;
         }
-
-        struct sockaddr_storage mac_sa;
         int mac_len = linux_to_mac_sockaddr(linux_sa, addrlen, &mac_sa);
         if (mac_len < 0) {
             host_fd_ref_close(&host_ref);
             return -LINUX_EINVAL;
         }
-
-        ssize_t ret = sendto(host_ref.fd, buf, len, mac_flags,
-                             (struct sockaddr *) &mac_sa, (socklen_t) mac_len);
-        host_fd_ref_close(&host_ref);
-        if (ret < 0) {
-            if (errno == EPIPE && !suppress_sigpipe)
-                signal_queue(LINUX_SIGPIPE);
-            return linux_errno();
-        }
-        return ret;
-    } else {
-        ssize_t ret = send(host_ref.fd, buf, len, mac_flags);
-        host_fd_ref_close(&host_ref);
-        if (ret < 0) {
-            if (errno == EPIPE && !suppress_sigpipe)
-                signal_queue(LINUX_SIGPIPE);
-            return linux_errno();
-        }
-        return ret;
+        dest = (struct sockaddr *) &mac_sa;
+        dest_len = (socklen_t) mac_len;
     }
+
+    bool blocking = len > 0 && sock_op_should_block(host_ref.fd, linux_flags);
+    int host_flags = mac_flags | (blocking ? MSG_DONTWAIT : 0);
+    ssize_t ret;
+    for (;;) {
+        if (blocking) {
+            int64_t waited = io_wait_fd_or_interrupted(host_ref.fd, POLLOUT);
+            if (waited < 0) {
+                host_fd_ref_close(&host_ref);
+                return waited;
+            }
+        }
+        ret = sendto(host_ref.fd, buf, len, host_flags, dest, dest_len);
+        if (!(blocking && ret < 0 && errno == EAGAIN))
+            break;
+    }
+    host_fd_ref_close(&host_ref);
+    if (ret < 0) {
+        if (errno == EPIPE && !suppress_sigpipe)
+            signal_queue(LINUX_SIGPIPE);
+        return linux_errno();
+    }
+    return ret;
 }
 
 int64_t sys_recvfrom(guest_t *g,
@@ -774,6 +875,19 @@ int64_t sys_recvfrom(guest_t *g,
         len = avail;
 
     int mac_flags = translate_msg_flags(flags);
+
+    /* A zero-length recv returns 0 without blocking on Linux; only wait when
+     * there is a buffer to fill. A single interruptible wait (not a
+     * MSG_DONTWAIT probe loop) preserves MSG_WAITALL semantics; the tiny
+     * ready-then-stolen window can still block, matching sys_read.
+     */
+    if (len > 0) {
+        int64_t waited = net_wait_or_interrupted(host_ref.fd, POLLIN, flags);
+        if (waited < 0) {
+            host_fd_ref_close(&host_ref);
+            return waited;
+        }
+    }
 
     struct sockaddr_storage mac_sa;
     socklen_t mac_len = sizeof(mac_sa);

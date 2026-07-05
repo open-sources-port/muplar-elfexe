@@ -16,6 +16,7 @@
 #include <signal.h>
 #include <sys/epoll.h>
 #include <sys/select.h>
+#include <sys/socket.h>
 #include <sys/wait.h>
 #include <time.h>
 
@@ -243,6 +244,59 @@ int main(void)
             }
             close(pipefd[0]);
             close(pipefd[1]);
+        }
+    }
+
+    /* A blocking recv on a socket must be reachable by a signal the same way a
+     * pipe read is: without the interruptible wait path, the vCPU thread parks
+     * in an uninterruptible host recv() and the handler never runs.
+     */
+    TEST("signal interrupts blocking recv");
+    {
+        int sv[2];
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
+            FAIL("socketpair failed");
+        } else {
+            restart_pipe_write = sv[1];
+            got_usr1 = 0;
+            sigset_t unblock;
+            sigemptyset(&unblock);
+            sigaddset(&unblock, SIGUSR1);
+            sigprocmask(SIG_UNBLOCK, &unblock, NULL);
+            struct sigaction sa;
+            memset(&sa, 0, sizeof(sa));
+            sa.sa_handler = restart_read_handler;
+            sa.sa_flags = SA_RESTART;
+            sigemptyset(&sa.sa_mask);
+            if (sigaction(SIGUSR1, &sa, NULL) != 0) {
+                FAIL("sigaction failed");
+            } else {
+                pthread_t sender;
+                restart_read_target = pthread_self();
+                if (pthread_create(&sender, NULL, restart_read_sender,
+                                   &sv[1]) != 0) {
+                    FAIL("pthread_create failed");
+                } else {
+                    char c = 0;
+                    ssize_t n = recv(sv[0], &c, 1, 0);
+                    int saved = errno;
+                    pthread_join(sender, NULL);
+                    errno = saved;
+                    /* got_usr1 is the hard requirement: it proves the signal
+                     * reached a thread blocked in a host recv(). The recv
+                     * outcome is accepted either way (restarted read returns
+                     * the handler's 'h', or elfuse surfaces EINTR), matching
+                     * the pipe-read test above.
+                     */
+                    if (((n == 1 && c == 'h') || (n < 0 && errno == EINTR)) &&
+                        got_usr1)
+                        PASS();
+                    else
+                        FAIL("signal did not unblock recv");
+                }
+            }
+            close(sv[0]);
+            close(sv[1]);
         }
     }
 

@@ -18,6 +18,7 @@
 #include <errno.h>
 #include <dirent.h>
 #include <pthread.h>
+#include <sys/stat.h>
 
 #include "utils.h"
 
@@ -72,6 +73,38 @@ static inline void fd_bitmap_set_used(int fd)
     fd_free_bitmap[fd / 64] &= ~BIT64(fd % 64);
 }
 
+/* A host read/write blocks only on non-regular, non-directory fds (pipe,
+ * socket, fifo, char/tty). Callers cache this so the interruptible wait path
+ * can skip fds that never block.
+ */
+static bool host_fd_may_block(int host_fd)
+{
+    struct stat st;
+    return host_fd >= 0 && fstat(host_fd, &st) == 0 && !S_ISREG(st.st_mode) &&
+           !S_ISDIR(st.st_mode);
+}
+
+/* Whether a read/write on a newly allocated fd of this type can block. Pipes
+ * and sockets always can; regular-file slots may actually be a fifo or char
+ * device (opened_fd_type does not split those out) and stdio may be a tty, so
+ * both need an fstat; everything else (dir, path, urandom, fuse, synthetic)
+ * never reaches the blocking wait path. Avoiding the fstat for the common
+ * pipe/socket/synthetic allocations keeps it off the fd-creation lock hold.
+ */
+static bool type_may_block(int type, int host_fd)
+{
+    switch (type) {
+    case FD_PIPE:
+    case FD_SOCKET:
+        return true;
+    case FD_STDIO:
+    case FD_REGULAR:
+        return host_fd_may_block(host_fd);
+    default:
+        return false;
+    }
+}
+
 static inline void fd_init_entry(int fd,
                                  int type,
                                  int host_fd,
@@ -85,6 +118,12 @@ static inline void fd_init_entry(int fd,
     fd_table[fd].dir = NULL;
     fd_table[fd].proc_path[0] = '\0';
     fd_table[fd].seals = 0;
+    /* Cache whether a host read/write can block so the fast-path and slow-path
+     * readers can decide whether to divert into the interruptible wait without
+     * re-stating on every call. Only regular-file and stdio slots pay an fstat
+     * here; pipes/sockets/synthetic fds resolve from the type alone.
+     */
+    fd_table[fd].can_block = type_may_block(type, host_fd);
     sock_opt_clear(&fd_table[fd]);
     fd_table[fd].cleanup = cleanup;
     /* Start conservative. Callers that set linux_flags after allocation
@@ -166,6 +205,12 @@ void fdtable_init(void)
     fd_table[2] = (fd_entry_t) {.type = FD_STDIO,
                                 .host_fd = STDERR_FILENO,
                                 .generation = fd_next_generation++};
+    /* The compound literals above zero can_block; recover the real value so a
+     * terminal stdin still routes reads through the interruptible wait.
+     */
+    fd_table[0].can_block = host_fd_may_block(STDIN_FILENO);
+    fd_table[1].can_block = host_fd_may_block(STDOUT_FILENO);
+    fd_table[2].can_block = host_fd_may_block(STDERR_FILENO);
     fd_bitmap_set_used(0);
     fd_bitmap_set_used(1);
     fd_bitmap_set_used(2);
@@ -239,8 +284,9 @@ int fd_alloc_from_relaxed(int minfd,
  * does not catch this first.
  *
  * A slot qualifies if it is free now, or if it is open but CLOEXEC (the sweep
- * closes it before rosetta_finalize allocates). Returns true if at least one
- * such slot exists within RLIMIT_NOFILE.
+ * closes it before rosetta_finalize allocates).
+ *
+ * Returns true if at least one such slot exists within RLIMIT_NOFILE.
  */
 bool fd_reexec_slot_available(int minfd)
 {
@@ -447,6 +493,16 @@ int fd_get_type(int guest_fd)
     int type = fd_table[guest_fd].type;
     pthread_mutex_unlock(&fd_lock);
     return type;
+}
+
+bool fd_can_block(int guest_fd)
+{
+    if (!RANGE_CHECK(guest_fd, 0, FD_TABLE_SIZE))
+        return false;
+    pthread_mutex_lock(&fd_lock);
+    bool can_block = fd_table[guest_fd].can_block;
+    pthread_mutex_unlock(&fd_lock);
+    return can_block;
 }
 
 void fd_publish_linux_flags(int guest_fd, int linux_flags)

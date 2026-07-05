@@ -155,6 +155,23 @@ int64_t sys_getsockopt(guest_t *g,
                        uint64_t optval_gva,
                        uint64_t optlen_gva);
 int64_t sys_shutdown(int fd, int how);
+
+/* Wait for a blocking socket op (recv/accept/connect/send) to become ready for
+ * events (POLLIN/POLLOUT) or be interrupted by a guest signal. No-op for
+ * nonblocking fds and MSG_DONTWAIT callers (pass msg_flags = 0 for ops without
+ * a flags argument).
+ *
+ * Returns 0 to proceed or a negative Linux errno (EINTR).
+ */
+int64_t net_wait_or_interrupted(int host_fd, short events, int msg_flags);
+
+/* True when a socket send/recv should wait interruptibly and retry on EAGAIN
+ * rather than surface it (guest wants blocking semantics: no MSG_DONTWAIT, fd
+ * not O_NONBLOCK). Send/recv paths pair this with a per-call MSG_DONTWAIT probe
+ * so the interruptible wait cannot be defeated by a post-readiness buffer-full
+ * or steal race, without toggling the fd's shared O_NONBLOCK flag.
+ */
+bool sock_op_should_block(int host_fd, int msg_flags);
 int64_t sys_sendmsg(guest_t *g, int fd, uint64_t msg_gva, int flags);
 int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags);
 int64_t sys_sendmmsg(guest_t *g,

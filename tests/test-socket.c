@@ -22,6 +22,8 @@
  * 11. shutdown(SHUT_WR) causes read to return 0 (EOF)
  * 12. socketpair(AF_UNIX, SOCK_SEQPACKET)
  * 13. socket(AF_UNIX, SOCK_SEQPACKET)
+ * 14. zero-length recvmsg returns immediately
+ * 15. invalid recvmsg iov returns EFAULT immediately
  */
 
 #include <stdio.h>
@@ -384,6 +386,61 @@ int main(void)
     } else {
         printf("FAIL (read after shutdown returned %zd)\n", n);
         failures++;
+    }
+
+    /* Test 14: zero-length recvmsg returns immediately */
+    printf("test-socket: 14. zero-length recvmsg returns immediately... ");
+    {
+        int zsv[2];
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, zsv) < 0) {
+            printf("FAIL (socketpair: %m)\n");
+            failures++;
+        } else {
+            char dummy = 0;
+            struct iovec ziov[2] = {
+                {.iov_base = &dummy, .iov_len = 0},
+                {.iov_base = &dummy, .iov_len = 0},
+            };
+            struct msghdr zmsg = {.msg_iov = ziov, .msg_iovlen = 2};
+            n = recvmsg(zsv[1], &zmsg, 0);
+            if (n == 0)
+                printf("PASS\n");
+            else {
+                printf("FAIL (recvmsg returned %zd errno=%d)\n", n, errno);
+                failures++;
+            }
+            close(zsv[0]);
+            close(zsv[1]);
+        }
+    }
+
+    /* Test 15: invalid recvmsg iov returns EFAULT immediately */
+    printf("test-socket: 15. invalid recvmsg iov returns EFAULT... ");
+    {
+        int isv[2];
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, isv) < 0) {
+            printf("FAIL (socketpair: %m)\n");
+            failures++;
+        } else {
+            struct msghdr imsg = {
+                .msg_iov = (struct iovec *) 1,
+                .msg_iovlen = 1,
+            };
+            errno = 0;
+            alarm(2);
+            n = recvmsg(isv[1], &imsg, 0);
+            int saved_errno = errno;
+            alarm(0);
+            if (n == -1 && saved_errno == EFAULT)
+                printf("PASS\n");
+            else {
+                printf("FAIL (recvmsg returned %zd errno=%d)\n", n,
+                       saved_errno);
+                failures++;
+            }
+            close(isv[0]);
+            close(isv[1]);
+        }
     }
 
     close(sv[0]);
