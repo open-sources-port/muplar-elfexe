@@ -29,6 +29,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <poll.h>
 #include <sys/stat.h>
 #include <sys/file.h> /* flock() */
 #include <dirent.h>
@@ -2085,6 +2086,16 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, bool verbose)
             if (tp != FD_REGULAR && tp != FD_STDIO && tp != FD_PIPE &&
                 tp != FD_SOCKET)
                 goto slow_path;
+            /* Same racy-but-benign read as tp above, and no worse than the
+             * shipped tp-based divert: a concurrent close+reopen (only possible
+             * with a live sibling thread; a single active thread has no
+             * mutator) that flips this slot to a blocking fd could skip the
+             * divert for one call. The guest is already reading an fd it is
+             * concurrently reopening, so the pinned fd it gets is undefined
+             * regardless; the slow path carries the identical window. Not worth
+             * a lock on the hot regular-file read.
+             */
+            bool can_block = fd_table[fd].can_block;
 
             /* Proc-backed fds may need synthetic read/write handling (for
              * example, oom_* rereads recompute content on each read and proc
@@ -2118,6 +2129,27 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, bool verbose)
             if (!buf || avail < count) {
                 host_fd_ref_close(&host_ref);
                 goto slow_path;
+            }
+
+            /* A blocking read/write on a pipe, socket, fifo, or char device
+             * would park this vCPU thread in an uninterruptible host call where
+             * the preempt thread's hv_vcpus_exit cannot reach it. Probe
+             * non-blocking: read waits for POLLIN, write for POLLOUT; if the fd
+             * would block, divert to the slow path where sys_read/sys_write
+             * wait interruptibly (poll + wakeup pipe). Regular files never
+             * block (can_block is false) and stay on the fast path.
+             */
+            if (can_block) {
+                short ev = (nr == SYS_read) ? POLLIN : POLLOUT;
+                struct pollfd pfd = {.fd = host_ref.fd, .events = ev};
+                /* Divert on not-ready (0) or probe error (< 0, e.g. EINTR): a
+                 * blocking call here cannot be preempted, so let the
+                 * interruptible slow path handle both.
+                 */
+                if (poll(&pfd, 1, 0) <= 0) {
+                    host_fd_ref_close(&host_ref);
+                    goto slow_path;
+                }
             }
 
             ssize_t ret = (nr == SYS_read) ? read(host_ref.fd, buf, count)

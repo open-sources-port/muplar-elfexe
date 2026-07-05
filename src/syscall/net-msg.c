@@ -20,6 +20,7 @@
 #include "utils.h"
 
 #include "syscall/internal.h"
+#include "syscall/io.h"
 #include "syscall/net.h"
 #include "syscall/net-sockopt.h"
 #include "syscall/net-abi.h"
@@ -182,7 +183,23 @@ int64_t sys_sendmsg(guest_t *g, int fd, uint64_t msg_gva, int linux_flags)
                 len = (size_t) avail;
         }
 
-        ssize_t ret = send(host_ref.fd, base, len, mac_flags);
+        bool blocking =
+            len > 0 && sock_op_should_block(host_ref.fd, linux_flags);
+        int host_flags = mac_flags | (blocking ? MSG_DONTWAIT : 0);
+        ssize_t ret;
+        for (;;) {
+            if (blocking) {
+                int64_t waited =
+                    io_wait_fd_or_interrupted(host_ref.fd, POLLOUT);
+                if (waited < 0) {
+                    host_fd_ref_close(&host_ref);
+                    return waited;
+                }
+            }
+            ret = send(host_ref.fd, base, len, host_flags);
+            if (!(blocking && ret < 0 && errno == EAGAIN))
+                break;
+        }
         host_fd_ref_close(&host_ref);
         if (ret < 0) {
             if (errno == EPIPE && !suppress_sigpipe)
@@ -350,7 +367,25 @@ int64_t sys_sendmsg(guest_t *g, int fd, uint64_t msg_gva, int linux_flags)
         .msg_flags = 0,
     };
 
-    ssize_t ret = sendmsg(host_ref.fd, &msg, mac_flags);
+    bool blocking = host_iov_has_payload(&host_iov, send_iovcnt) &&
+                    sock_op_should_block(host_ref.fd, linux_flags);
+    int host_flags = mac_flags | (blocking ? MSG_DONTWAIT : 0);
+    ssize_t ret;
+    for (;;) {
+        if (blocking) {
+            int64_t waited = io_wait_fd_or_interrupted(host_ref.fd, POLLOUT);
+            if (waited < 0) {
+                free(linux_ctrl_heap);
+                free(mac_ctrl_heap);
+                host_iov_free(&host_iov);
+                host_fd_ref_close(&host_ref);
+                return waited;
+            }
+        }
+        ret = sendmsg(host_ref.fd, &msg, host_flags);
+        if (!(blocking && ret < 0 && errno == EAGAIN))
+            break;
+    }
     free(linux_ctrl_heap);
     free(mac_ctrl_heap);
     host_iov_free(&host_iov);
@@ -407,6 +442,15 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags)
                 len = (size_t) avail;
         }
 
+        if (len > 0) {
+            int64_t waited =
+                net_wait_or_interrupted(host_ref.fd, POLLIN, flags);
+            if (waited < 0) {
+                host_fd_ref_close(&host_ref);
+                return waited;
+            }
+        }
+
         struct iovec host_iov = {
             .iov_base = base,
             .iov_len = len,
@@ -449,6 +493,14 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags)
     if (iov_err < 0) {
         host_fd_ref_close(&host_ref);
         return iov_err;
+    }
+    if (host_iov_has_payload(&host_iov, recv_iovcnt)) {
+        int64_t waited = net_wait_or_interrupted(host_ref.fd, POLLIN, flags);
+        if (waited < 0) {
+            host_iov_free(&host_iov);
+            host_fd_ref_close(&host_ref);
+            return waited;
+        }
     }
 
     struct sockaddr_storage mac_sa;
@@ -798,7 +850,22 @@ int64_t sys_sendmmsg(guest_t *g,
                     len = (size_t) avail;
             }
 
-            ssize_t ret = send(host_ref.fd, base, len, mac_flags);
+            bool blocking = len > 0 && sock_op_should_block(host_ref.fd, flags);
+            int host_flags = mac_flags | (blocking ? MSG_DONTWAIT : 0);
+            ssize_t ret;
+            for (;;) {
+                if (blocking) {
+                    int64_t waited =
+                        io_wait_fd_or_interrupted(host_ref.fd, POLLOUT);
+                    if (waited < 0) {
+                        host_fd_ref_close(&host_ref);
+                        return waited;
+                    }
+                }
+                ret = send(host_ref.fd, base, len, host_flags);
+                if (!(blocking && ret < 0 && errno == EAGAIN))
+                    break;
+            }
             host_fd_ref_close(&host_ref);
             if (ret < 0) {
                 if (errno == EPIPE && !suppress_sigpipe)
@@ -885,6 +952,14 @@ int64_t sys_recvmmsg(guest_t *g,
                 .msg_iov = &host_iov,
                 .msg_iovlen = 1,
             };
+            if (len > 0) {
+                int64_t waited =
+                    net_wait_or_interrupted(host_ref.fd, POLLIN, flags);
+                if (waited < 0) {
+                    host_fd_ref_close(&host_ref);
+                    return waited;
+                }
+            }
             ssize_t ret = recvmsg(host_ref.fd, &host_msg, mac_flags);
             if (ret < 0) {
                 host_fd_ref_close(&host_ref);

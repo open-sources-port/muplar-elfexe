@@ -740,7 +740,12 @@ typedef struct {
     int linux_flags;     /* Linux open flags (for CLOEXEC tracking) */
     void *dir;           /* DIR* for FD_DIR entries (NULL otherwise) */
     char proc_path[FD_VIRTUAL_PATH_MAX]; /* Virtual /proc dir root for *at */
-    int seals; /* F_SEAL_* bits (non-zero only for memfd_create fds) */
+    int seals;      /* F_SEAL_* bits (non-zero only for memfd_create fds) */
+    bool can_block; /* host read/write on this fd may block (pipe, socket, fifo,
+                     * char/tty); false for regular files and directories. Set
+                     * once at allocation via fstat so the interruptible wait
+                     * path can skip fds that never block.
+                     */
     sock_opt_cache_t sock; /* Socket option cache (zeroed for non-sockets) */
     void (*cleanup)(int guest_fd); /* Type-specific teardown (NULL if none) */
 } fd_entry_t;

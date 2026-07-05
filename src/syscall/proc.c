@@ -24,6 +24,7 @@
 #include <limits.h>
 #include <pthread.h>
 #include <signal.h>
+#include <sys/file.h> /* flock() */
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/wait.h>
@@ -45,6 +46,7 @@
 #include "syscall/proc.h"
 #include "syscall/proc-pidfd.h"
 #include "syscall/proc-state.h"
+#include "syscall/poll.h"
 #include "syscall/signal.h"
 
 #include "debug/crashreport.h"
@@ -372,13 +374,28 @@ int proc_send_guest_signal(pid_t host_pid, int signum)
         errno = EINVAL;
         return -1;
     }
-    if (proc_write_full(fd, line, (size_t) len) < 0) {
+
+    /* Serialize the append against the receiver's read+truncate drain via an
+     * exclusive lock. The receiver holds the same lock and never unlinks the
+     * file, so this append either lands before its read (and is consumed) or
+     * after its truncate (and the SIGUSR2 below triggers the next drain).
+     * Neither side can route this write to an orphaned inode or discard it.
+     */
+    if (flock(fd, LOCK_EX) < 0) {
         close(fd);
         return -1;
     }
-    if (close(fd) < 0)
+    int wrc = proc_write_full(fd, line, (size_t) len);
+    flock(fd, LOCK_UN);
+    if (wrc < 0) {
+        close(fd);
         return -1;
-
+    }
+    /* The line is durably appended under the lock, so ring the doorbell even if
+     * close() reports an error; suppressing the kill would leave the queued
+     * line waiting for some later unrelated signal.
+     */
+    close(fd);
     return kill(host_pid, SIGUSR2);
 }
 
@@ -952,79 +969,197 @@ void proc_request_hvc6_yield(void)
     hvc6_yield_requested = true;
 }
 
-/* Global vCPU handle for the SIGALRM handler (unavoidable global state --
- * signal handlers cannot receive context parameters). Written once by
- * vcpu_run_loop before signal(SIGALRM), then only read by alarm_handler /
- * guest_signal_transport_handler. The write happens-before the signal() call
- * that installs the handlers, so no volatile needed.
+/* Preemption signals: SIGUSR2 is the cross-process guest-signal doorbell
+ * (proc_send_guest_signal), SIGALRM is the main thread's per-iteration safety
+ * timeout (armed by alarm() in vcpu_run_loop). Both are consumed by a dedicated
+ * sigwait thread rather than a per-thread signal handler.
+ *
+ * The reason is Apple HVF: when either signal is delivered to a vCPU thread
+ * while it is inside hv_vcpu_run, the run aborts with HV_EXIT_REASON_UNKNOWN
+ * instead of the clean HV_EXIT_REASON_CANCELED that hv_vcpus_exit() produces
+ * for a vCPU caught between runs. Routing every self-directed hv_vcpus_exit
+ * through a thread that never runs a vCPU makes CANCELED the only outcome, so
+ * the run loop can treat any UNKNOWN as a hard hypervisor fault.
+ *
+ * The two flags are a genuine cross-thread handoff (the preempt thread writes,
+ * a vCPU thread reads and clears), so they are _Atomic with release/acquire
+ * ordering rather than the old volatile sig_atomic_t, which only covered
+ * same-thread async signal handlers.
  */
-static hv_vcpu_t g_timeout_vcpu;
-static volatile sig_atomic_t g_timed_out, g_external_guest_signal;
+static _Atomic int g_timed_out, g_external_guest_signal;
 
-static void alarm_handler(int sig)
+static pthread_t g_preempt_thread;
+static bool g_preempt_started;
+
+static void drain_external_guest_signal(void);
+
+/* Dedicated sigwait consumer. SIGUSR2/SIGALRM are blocked on every other thread
+ * (see proc_preempt_init), so they land here. thread_interrupt_all() kicks
+ * every live vCPU off-thread; the signal/queue machinery in the vCPU loop sorts
+ * out which guest thread actually receives the delivery.
+ */
+static void *preempt_thread_main(void *arg)
 {
-    (void) sig;
-    g_timed_out = 1;
-    hv_vcpus_exit(&g_timeout_vcpu, 1);
+    (void) arg;
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+
+    sigset_t wait_set;
+    sigemptyset(&wait_set);
+    sigaddset(&wait_set, SIGUSR2);
+    sigaddset(&wait_set, SIGALRM);
+
+    for (;;) {
+        int sig = 0;
+        if (sigwait(&wait_set, &sig) != 0)
+            continue;
+        if (sig == SIGUSR2) {
+            atomic_store_explicit(&g_external_guest_signal, 1,
+                                  memory_order_release);
+            drain_external_guest_signal();
+            wakeup_pipe_signal();
+        } else if (sig == SIGALRM) {
+            atomic_store_explicit(&g_timed_out, 1, memory_order_release);
+        }
+        thread_interrupt_all();
+    }
+    return NULL;
 }
 
-static void guest_signal_transport_handler(int sig, siginfo_t *info, void *ctx)
+/* Unlink this process's own (now empty) transport file on normal exit so the
+ * truncate-not-unlink drain does not leave a zero-length file per pid. Runs via
+ * atexit, so it covers main returning and exit()/exit_group's clean shutdown; a
+ * crash leaves the empty file for the OS temp-dir purge, same as before.
+ */
+static void unlink_own_transport(void)
 {
-    (void) sig;
-    (void) info;
-    (void) ctx;
-    g_external_guest_signal = 1;
-    hv_vcpus_exit(&g_timeout_vcpu, 1);
+    char path[PATH_MAX];
+    if (signal_transport_path(path, sizeof(path), getpid()))
+        unlink(path);
 }
 
-static void install_guest_signal_transport(void)
+/* Call once from the main thread before any vCPU thread is created; the
+ * fork-child re-runs it in its own process. Not safe against concurrent callers
+ * (the g_preempt_started guard is a plain bool), which is fine because every
+ * call site is single-threaded process bring-up.
+ *
+ * Returns 0 on success, -1 if the sigwait thread cannot be started (fatal for
+ * this process).
+ */
+int proc_preempt_init(void)
 {
-    static int installed;
-    if (installed)
-        return;
+    if (g_preempt_started)
+        return 0;
 
-    struct sigaction sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_sigaction = guest_signal_transport_handler;
-    sa.sa_flags = SA_SIGINFO;
-    sigemptyset(&sa.sa_mask);
-    sigaction(SIGUSR2, &sa, NULL);
-    installed = 1;
+    /* Block the preemption signals on the caller (the main thread) before any
+     * vCPU thread exists, so every thread created afterward -- CLONE_THREAD
+     * workers and posix_spawn fork-children -- inherits the block and only the
+     * sigwait thread ever consumes them. A missed site silently reintroduces
+     * HV_EXIT_REASON_UNKNOWN.
+     */
+    sigset_t block;
+    sigemptyset(&block);
+    sigaddset(&block, SIGUSR2);
+    sigaddset(&block, SIGALRM);
+    /* pthread_sigmask returns the error code directly. If the block fails, vCPU
+     * threads would inherit an unblocked mask and a signal landing mid-run
+     * could still produce HV_EXIT_REASON_UNKNOWN, so fail bring-up rather than
+     * proceed on a false invariant.
+     */
+    int merr = pthread_sigmask(SIG_BLOCK, &block, NULL);
+    if (merr != 0) {
+        log_error("elfuse: failed to block preemption signals: %s",
+                  strerror(merr));
+        return -1;
+    }
+
+    int err =
+        pthread_create(&g_preempt_thread, NULL, preempt_thread_main, NULL);
+    if (err != 0) {
+        /* pthread_create returns the error code directly; it does not set
+         * errno. Leave the signals blocked (pending, never default-terminate)
+         * and fail bring-up -- unblocking would restore the default SIGUSR2
+         * disposition and let a cross-process doorbell kill the process.
+         */
+        log_error("elfuse: failed to start preemption thread: %s",
+                  strerror(err));
+        return -1;
+    }
+    g_preempt_started = true;
+    atexit(unlink_own_transport);
+    return 0;
 }
 
 static void drain_external_guest_signal(void)
 {
-    if (!g_external_guest_signal)
+    if (!atomic_exchange_explicit(&g_external_guest_signal, 0,
+                                  memory_order_acquire))
         return;
-    g_external_guest_signal = 0;
 
     char path[PATH_MAX];
     if (!signal_transport_path(path, sizeof(path), getpid()))
         return;
-    int fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    /* O_RDWR (not O_RDONLY) so the drain can truncate under the lock. No
+     * O_CREAT: if no sender has written since the last drain, there is nothing
+     * to consume.
+     */
+    int fd = open(path, O_RDWR | O_NOFOLLOW | O_CLOEXEC);
     if (fd < 0)
         return;
 
-    char buf[256];
-    ssize_t n = read(fd, buf, sizeof(buf) - 1);
-    close(fd);
-    unlink(path);
-    if (n <= 0)
+    /* Hold the exclusive lock across the whole read+truncate so a sender's
+     * locked append is atomic with respect to the drain. The file is truncated
+     * to empty rather than unlinked (see proc_send_guest_signal), which avoids
+     * reintroducing the unlink-vs-append race; the process unlinks its own
+     * empty file at exit (unlink_own_transport) so the temp dir stays clean.
+     */
+    if (flock(fd, LOCK_EX) < 0) {
+        close(fd);
         return;
-    buf[n] = '\0';
+    }
 
-    char *p = buf;
-    while (*p) {
-        char *end;
-        long signum = strtol(p, &end, 10);
-        if (end == p)
+    /* Read the whole file in chunks, queuing each complete "signum\n" line and
+     * carrying any partial trailing token across chunk boundaries. Valid tokens
+     * are a few bytes, so the carry never fills the buffer; a lone oversized
+     * garbage token is dropped harmlessly (read returns 0 once the buffer is
+     * full with no newline).
+     */
+    char buf[256];
+    size_t used = 0;
+    for (;;) {
+        ssize_t n = read(fd, buf + used, sizeof(buf) - 1 - used);
+        if (n <= 0)
             break;
+        used += (size_t) n;
+        buf[used] = '\0';
+
+        char *start = buf, *nl;
+        while ((nl = memchr(start, '\n', (size_t) (buf + used - start))) !=
+               NULL) {
+            *nl = '\0';
+            long signum = strtol(start, NULL, 10);
+            if (RANGE_CHECK(signum, 1, LINUX_NSIG))
+                signal_queue((int) signum);
+            start = nl + 1;
+        }
+        size_t rem = (size_t) (buf + used - start);
+        memmove(buf, start, rem);
+        used = rem;
+    }
+
+    /* Senders write whole "signum\n" records under the same lock, so used is
+     * normally 0 here. Parse any unterminated trailing token defensively so a
+     * record left by a crashed sender is not silently dropped by the truncate.
+     */
+    if (used > 0) {
+        buf[used] = '\0';
+        long signum = strtol(buf, NULL, 10);
         if (RANGE_CHECK(signum, 1, LINUX_NSIG))
             signal_queue((int) signum);
-        p = end;
-        while (*p == '\n' || *p == ' ')
-            p++;
     }
+
+    ftruncate(fd, 0);
+    flock(fd, LOCK_UN);
+    close(fd);
 }
 
 /* HVC #4 (set sysreg) register index -> hv_sys_reg_t mapping. Index must match
@@ -1074,18 +1209,15 @@ int vcpu_run_loop(hv_vcpu_t vcpu,
      */
     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
 
-    install_guest_signal_transport();
-
-    /* Main thread: set up alarm-based per-iteration timeout. Guest ITIMER_REAL
-     * is emulated internally by signal_check_timer() rather than using host
-     * setitimer, because macOS shares alarm() and setitimer(ITIMER_REAL) as the
-     * same underlying timer.
+    /* Main thread: arm the alarm-based per-iteration timeout below. SIGALRM is
+     * blocked here and consumed by the preemption thread (proc_preempt_init),
+     * which sets g_timed_out and kicks the vCPU via hv_vcpus_exit. Guest
+     * ITIMER_REAL is emulated internally by signal_check_timer() rather than
+     * using host setitimer, because macOS shares alarm() and
+     * setitimer(ITIMER_REAL) as the same underlying timer.
      */
-    if (is_main) {
-        g_timeout_vcpu = vcpu;
-        g_timed_out = 0;
-        signal(SIGALRM, alarm_handler);
-    }
+    if (is_main)
+        atomic_store_explicit(&g_timed_out, 0, memory_order_relaxed);
 
     while (running) {
         /* Check if another thread called exit_group */
@@ -1121,7 +1253,8 @@ int vcpu_run_loop(hv_vcpu_t vcpu,
         }
 
         /* Main: check for alarm timeout */
-        if (is_main && g_timed_out) {
+        if (is_main &&
+            atomic_load_explicit(&g_timed_out, memory_order_acquire)) {
             log_error("%s: vCPU execution timed out after %ds", prefix,
                       timeout_sec);
 
@@ -2057,33 +2190,21 @@ int vcpu_run_loop(hv_vcpu_t vcpu,
                 exit_code = 128;
                 running = false;
             }
-        } else if (vexit->reason == HV_EXIT_REASON_CANCELED ||
-                   (vexit->reason == HV_EXIT_REASON_UNKNOWN &&
-                    (signal_pending() || proc_exit_group_requested() ||
-                     (is_main && g_timed_out)))) {
+        } else if (vexit->reason == HV_EXIT_REASON_CANCELED) {
             /* Canceled by hv_vcpus_exit(). Can be: alarm timeout, exit_group
-             * from another thread, or signal preemption (signal_queue called
-             * hv_vcpus_exit to deliver a signal while the guest was in a tight
-             * loop).
+             * from another thread, or signal preemption (a queued guest signal,
+             * a fork barrier, or a ptrace interrupt kicked the vCPU out of a
+             * tight loop).
              *
-             * HV_EXIT_REASON_UNKNOWN is the same event seen from the other side
-             * of a race: when a host signal (e.g. the SIGUSR2 used by the
-             * cross-process guest-signal transport) is delivered to this thread
-             * while it is actively executing guest code inside hv_vcpu_run, the
-             * run aborts with UNKNOWN instead of the clean CANCELED that
-             * hv_vcpus_exit() produces for a vCPU caught between runs. The
-             * pending guest signal has already been drained and queued, so it
-             * is fully deliverable -- fall through to the same handling and
-             * resume rather than treating it as a fatal unexpected exit.
-             *
-             * Gate UNKNOWN on an actionable event actually being present (a
-             * queued signal, a pending exit_group, or a fired timeout) so it is
-             * only absorbed when there is real work to do. If HVF ever reports
-             * UNKNOWN for a genuine fault with nothing pending, fall through to
-             * the "unexpected exit reason" crash path at the end of the switch
-             * rather than silently retrying the run.
+             * Every self-directed hv_vcpus_exit is now issued from the
+             * preemption thread (proc_preempt_init), never from a vCPU thread,
+             * so hv_vcpu_run always returns CANCELED here.
+             * HV_EXIT_REASON_UNKNOWN therefore no longer has a legitimate
+             * producer -- it falls through to the "unexpected exit reason"
+             * crash path below.
              */
-            if (is_main && g_timed_out) {
+            if (is_main &&
+                atomic_load_explicit(&g_timed_out, memory_order_acquire)) {
                 /* Timeout already handled above the exception switch -- loop
                  * back so the timeout check fires.
                  */
@@ -2206,10 +2327,8 @@ int vcpu_run_loop(hv_vcpu_t vcpu,
     }
 
     /* Clean up timeout if the run loop sets it up */
-    if (is_main) {
-        signal(SIGALRM, SIG_DFL);
+    if (is_main)
         alarm(0);
-    }
 
     return exit_code;
 }

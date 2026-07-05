@@ -324,6 +324,16 @@ pid_t proc_guest_to_host_pid(int64_t gpid);
  */
 int proc_send_guest_signal(pid_t host_pid, int signum);
 
+/* Block the vCPU-preemption signals (SIGUSR2 doorbell, SIGALRM timeout) on the
+ * calling thread and start the dedicated sigwait thread that consumes them.
+ * Call once from the main thread before any vCPU thread is created; the
+ * posix_spawn fork-child re-runs it in its own process.
+ *
+ * Returns 0 on success, -1 if the sigwait thread cannot be started (fatal for
+ * this process).
+ */
+int proc_preempt_init(void);
+
 /* Syscall handlers. */
 int64_t sys_pidfd_open(guest_t *g, int64_t pid, unsigned int flags);
 int64_t sys_pidfd_send_signal(guest_t *g,

@@ -362,6 +362,13 @@ int main(int argc, char **argv)
     }
     proc_set_fakeroot_enabled(fakeroot);
 
+    /* Block the vCPU-preemption signals and start the sigwait thread before any
+     * vCPU thread exists, so both the normal path and the fork-child path below
+     * inherit the block on every thread they spawn.
+     */
+    if (proc_preempt_init() < 0)
+        return 1;
+
     /* Fork-child mode: receive VM state over IPC and run */
     if (fork_child_fd >= 0)
         return fork_child_main(fork_child_fd, vfork_notify_fd, verbose,

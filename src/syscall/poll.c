@@ -32,14 +32,21 @@
 #include "syscall/proc.h" /* proc_exit_group_requested */
 #include "syscall/signal.h"
 
-/* Global wakeup pipe: write end signals exit_group/futex_interrupt to threads
- * blocked in host poll/select/kevent. The read end is added to every blocking
- * wait with infinite timeout.
+/* Global wakeup pipe: write end signals exit_group/futex_interrupt/guest
+ * signals to threads blocked in host poll/select/kevent. The read end is added
+ * to every blocking wait with infinite timeout.
  */
 static int wakeup_pipe_rd = -1, wakeup_pipe_wr = -1;
 
 void wakeup_pipe_init(void)
 {
+    /* Idempotent: syscall_init is reached twice on some paths (bootstrap and
+     * the fork-child's fork_ipc_recv_fd_table), and re-running the pipe(2) here
+     * would overwrite the fds and leak the first pair.
+     */
+    if (wakeup_pipe_rd >= 0)
+        return;
+
     int pipefd[2];
     if (pipe(pipefd) == 0) {
         fcntl(pipefd[0], F_SETFL, O_NONBLOCK);
@@ -55,6 +62,21 @@ void wakeup_pipe_signal(void)
         uint8_t byte = 1;
         write(wakeup_pipe_wr, &byte, 1);
     }
+}
+
+int wakeup_pipe_read_fd(void)
+{
+    return wakeup_pipe_rd;
+}
+
+void wakeup_pipe_drain(void)
+{
+    if (wakeup_pipe_rd < 0)
+        return;
+
+    uint8_t drain;
+    while (read(wakeup_pipe_rd, &drain, 1) > 0)
+        ;
 }
 
 /* polling/select. */
@@ -183,10 +205,10 @@ int64_t sys_ppoll(guest_t *g,
         mask_installed = true;
     }
 
-    /* For indefinite polls, add the wakeup pipe so exit_group can interrupt
-     * threads blocked in host poll(). Without this, threads in poll(timeout=-1)
-     * cannot be interrupted by hv_vcpus_exit() because they're not in
-     * hv_vcpu_run().
+    /* For indefinite polls, add the wakeup pipe so exit_group/futex/signal
+     * requests can interrupt threads blocked in host poll(). Without this,
+     * host-blocked threads cannot be interrupted by hv_vcpus_exit() because
+     * they're not in hv_vcpu_run().
      */
     bool added_wakeup = false;
     if (timeout_ms < 0 && wakeup_pipe_rd >= 0 && nfds < 256) {
@@ -211,8 +233,9 @@ ppoll_retry:
         ret = poll(host_fds, nfds + added_wakeup,
                    poll_timeout_ms < 0 ? 200 : poll_timeout_ms);
 
-        /* Check for exit_group / futex_interrupt after waking */
-        if (proc_exit_group_requested() || futex_interrupt_consume()) {
+        /* Check for process/thread interrupts after waking. */
+        if (proc_exit_group_requested() || futex_interrupt_consume() ||
+            signal_pending_interruption(NULL)) {
             ret = -1;
             errno = EINTR;
             break;
@@ -241,9 +264,7 @@ ppoll_retry:
      * wakeup pipe is not visible to the guest.
      */
     if (added_wakeup && (host_fds[nfds].revents & POLLIN)) {
-        uint8_t drain;
-        while (read(wakeup_pipe_rd, &drain, 1) > 0)
-            ;
+        wakeup_pipe_drain();
         if (ret > 0)
             ret--;
         if (ret == 0 && poll_timeout_ms < 0)
@@ -453,8 +474,8 @@ int64_t sys_pselect6(guest_t *g,
         }
     }
 
-    /* For indefinite selects, add the wakeup pipe and use a short timeout so
-     * exit_group can interrupt.
+    /* For indefinite selects, add the wakeup pipe so exit_group/futex/signal
+     * requests can interrupt.
      */
     bool added_wakeup = false;
     if (!has_timeout && wakeup_pipe_rd >= 0) {
@@ -556,7 +577,8 @@ pselect_retry:
                           has_timeout ? &ts : &poll_ts, NULL);
         }
 
-        if (proc_exit_group_requested() || futex_interrupt_consume()) {
+        if (proc_exit_group_requested() || futex_interrupt_consume() ||
+            signal_pending_interruption(NULL)) {
             ret = -1;
             errno = EINTR;
             break;
@@ -573,9 +595,7 @@ pselect_retry:
         (use_poll_fallback ? poll_wakeup_fired
                            : FD_ISSET(wakeup_pipe_rd, &read_set));
     if (wakeup_fired) {
-        uint8_t drain;
-        while (read(wakeup_pipe_rd, &drain, 1) > 0)
-            ;
+        wakeup_pipe_drain();
         if (!use_poll_fallback)
             FD_CLR(wakeup_pipe_rd, &read_set);
         if (ret > 0)
@@ -1011,7 +1031,8 @@ int64_t sys_epoll_pwait(guest_t *g,
 
 epoll_retry:;
     /* For indefinite waits, register the wakeup pipe with the kqueue so
-     * exit_group can interrupt threads blocked in kevent().
+     * exit_group/futex/signal requests can interrupt threads blocked in
+     * kevent().
      */
     bool added_wakeup = false;
     if (!has_timeout && wakeup_pipe_rd >= 0) {
@@ -1042,7 +1063,8 @@ epoll_retry:;
         nready = kevent(epoll_ref.fd, NULL, 0, kevents, cap,
                         has_timeout ? &ts : &poll_ts);
 
-        if (proc_exit_group_requested() || futex_interrupt_consume()) {
+        if (proc_exit_group_requested() || futex_interrupt_consume() ||
+            signal_pending_interruption(NULL)) {
             nready = -1;
             errno = EINTR;
             break;
@@ -1056,10 +1078,7 @@ epoll_retry:;
         struct kevent del_ev;
         EV_SET(&del_ev, wakeup_pipe_rd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
         kevent(epoll_ref.fd, &del_ev, 1, NULL, 0, NULL);
-        /* Drain the wakeup pipe */
-        uint8_t drain;
-        while (read(wakeup_pipe_rd, &drain, 1) > 0)
-            ;
+        wakeup_pipe_drain();
         /* Filter out wakeup pipe events from results */
         for (int i = 0; i < nready; i++) {
             if ((uintptr_t) kevents[i].udata == (uintptr_t) -1) {

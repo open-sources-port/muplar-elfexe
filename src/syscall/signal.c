@@ -36,6 +36,7 @@
 
 #include "syscall/abi.h"
 #include "syscall/fd.h"   /* signalfd_notify */
+#include "syscall/poll.h" /* wakeup_pipe_signal */
 #include "syscall/proc.h" /* proc_get_pid, proc_get_uid, SYSCALL_EXEC_HAPPENED */
 #include "syscall/signal.h"
 
@@ -303,6 +304,11 @@ void signal_set_shim_globals_guest(guest_t *g)
  * otherwise fall back to a bare vCPU interrupt. Both paths end up running
  * thread_interrupt_all (shim_globals_raise_attention issues it internally), so
  * callers only need this single helper.
+ *
+ * Also poke the wakeup pipe so a thread parked in a host poll/select/epoll/read
+ * wait -- which hv_vcpus_exit cannot reach because it is not inside
+ * hv_vcpu_run -- wakes and rechecks signal_pending(). Matches how exit_group
+ * and futex_interrupt already signal the pipe.
  */
 static inline void attention_raise(void)
 {
@@ -311,6 +317,7 @@ static inline void attention_raise(void)
         shim_globals_raise_attention(g);
     else
         thread_interrupt_all();
+    wakeup_pipe_signal();
 }
 
 /* Predicate matches the deliverability gate used by signal_queue and
@@ -504,54 +511,48 @@ bool signal_pending_interruption(bool *restart_out)
         return false;
     }
 
-    /* restart_out reports whether every deliverable signal is non-disruptive
-     * from the caller's point of view. A signal is non-disruptive if its
-     * effective delivery is either a no-op or an SA_RESTART handler:
-     *   - SIG_IGN: discarded by signal_deliver, no guest-visible effect.
-     *   - SIG_DFL with default-ignore disposition (SIGCHLD/SIGURG/SIGWINCH):
-     *     ditto.
-     *   - User handler with SA_RESTART: handler runs but the syscall is
-     *     expected to be retried transparently.
-     * Any other signal (default-TERM, default-CORE, non-restart handler) forces
-     * the wait to be treated as interrupted; otherwise a SIGTERM hiding behind
-     * an ignored SIGCHLD would never wake the caller.
+    /* Ignored/default-ignore signals are discarded by signal_deliver and must
+     * not interrupt waits. Any guest-visible delivery must escape the wait so
+     * the syscall epilogue can run the handler/default action; restart_out only
+     * tells FUSE whether all visible handlers are SA_RESTART.
      */
-    bool all_noninterrupt = true;
+    bool any_interrupt = false;
+    bool all_restart = true;
     uint64_t bits = deliverable;
     while (bits) {
         int idx = bit_ctz64(bits);
         bits &= bits - 1;
         if (!RANGE_CHECK(idx, 0, LINUX_NSIG)) {
-            all_noninterrupt = false;
+            any_interrupt = true;
+            all_restart = false;
             break;
         }
         linux_sigaction_t *act = &sig_state.actions[idx];
-        bool noninterrupt;
         if (act->sa_handler == LINUX_SIG_IGN) {
-            noninterrupt = true;
+            continue;
         } else if (act->sa_handler == LINUX_SIG_DFL) {
             /* Mirror signal_deliver's SIG_DFL switch: IGN, CONT, and STOP are
              * all discarded with no guest-visible effect on elfuse (STOP/CONT
              * are not meaningful here), so they cannot legitimately interrupt a
-             * FUSE wait. Treating CONT or STOP as disruptive would force a
-             * spurious EINTR that never corresponds to an actual delivery.
+             * wait.
              */
             sig_disposition_t disp = signal_default_disposition(idx + 1);
-            noninterrupt = disp == SIG_DISP_IGN || disp == SIG_DISP_CONT ||
-                           disp == SIG_DISP_STOP;
+            if (disp == SIG_DISP_IGN || disp == SIG_DISP_CONT ||
+                disp == SIG_DISP_STOP)
+                continue;
+            any_interrupt = true;
+            all_restart = false;
         } else {
-            noninterrupt = (act->sa_flags & LINUX_SA_RESTART) != 0;
-        }
-        if (!noninterrupt) {
-            all_noninterrupt = false;
-            break;
+            any_interrupt = true;
+            if ((act->sa_flags & LINUX_SA_RESTART) == 0)
+                all_restart = false;
         }
     }
 
     pthread_mutex_unlock(&sig_lock);
     if (restart_out)
-        *restart_out = all_noninterrupt;
-    return true;
+        *restart_out = any_interrupt && all_restart;
+    return any_interrupt;
 }
 
 const signal_state_t *signal_get_state(void)
