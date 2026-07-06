@@ -213,6 +213,45 @@ static uint64_t *pt_at(const guest_t *g, uint64_t gpa)
     return (uint64_t *) ((uint8_t *) g->host_base + gpa);
 }
 
+/* Host-side PTE accessors.
+ *
+ * gva_translate_perm() walks L0->L3 lock-free on every guest-pointer
+ * translation, from every vCPU thread, while the runtime mutators
+ * (guest_update_perms, guest_invalidate_ptes, split_l2_block, ...) rewrite
+ * descriptors under the caller's mmap lock. The lock serializes mutator
+ * against mutator only -- it provides no happens-before edge to the lock-free
+ * walker, so the descriptor accesses themselves must carry the ordering:
+ *
+ *   - pte_store_release publishes a descriptor so that everything written
+ *     before it -- most critically the 512 L3 fills of split_l2_block and the
+ *     entries of a freshly allocated L2 table -- is visible to a walker that
+ *     chases the new table pointer. Plain stores would let both the compiler
+ *     and the weakly-ordered CPU sink the fills past the flip, handing a
+ *     concurrent walker a pointer into not-yet-initialized descriptors.
+ *   - pte_load_acquire pairs with the release and doubles as the walker's
+ *     single-snapshot read: each level is loaded exactly once and decoded
+ *     from that one value, never re-read per field, so a concurrent rewrite
+ *     cannot make the walker mix two generations of the same entry.
+ *
+ * Table pages come from a bump allocator (pt_alloc_page) that is only reset
+ * on execve while all vCPU threads are quiesced, so a not-yet-published table
+ * can never be reached through a stale pointer; filling it with plain stores
+ * before the release-flip is sound. Boot-time construction also keeps plain
+ * stores -- guest_build_page_tables, guest_init_kbuf, and the rosetta kbuf
+ * user-alias install (guest_install_kbuf_user_alias /
+ * populate_kbuf_l2_blocks) all run single-threaded before any vCPU thread
+ * exists, and pthread_create provides the happens-before edge.
+ */
+static inline uint64_t pte_load_acquire(const uint64_t *entry)
+{
+    return __atomic_load_n(entry, __ATOMIC_ACQUIRE);
+}
+
+static inline void pte_store_release(uint64_t *entry, uint64_t desc)
+{
+    __atomic_store_n(entry, desc, __ATOMIC_RELEASE);
+}
+
 /* Public API */
 
 /* FEAT_TLBIRANGE probe -- runs exactly once via pthread_once. ARMv8.4
@@ -927,6 +966,11 @@ uint64_t guest_overflow_alloc(guest_t *g)
  * RW + UXN + PXN: the kbuf must stay data-only under both the kernel TTBR1
  * mirror and the user-VA TTBR0 alias to preserve the aliasing-proof W^X
  * invariant.
+ *
+ * Plain stores: both callers (guest_init_kbuf at boot,
+ * guest_install_kbuf_user_alias during rosetta bootstrap) run single-threaded
+ * before any vCPU thread exists -- see the boot-time exemption note at
+ * pte_store_release.
  */
 static void populate_kbuf_l2_blocks(uint64_t *l2, uint64_t kbuf_gpa)
 {
@@ -1049,7 +1093,8 @@ int guest_map_va_range(guest_t *g,
             uint64_t l1_gpa = pt_alloc_page(g);
             if (!l1_gpa)
                 return -1;
-            l0[l0_idx] = (base + l1_gpa) | PT_VALID | PT_TABLE;
+            pte_store_release(&l0[l0_idx],
+                              (base + l1_gpa) | PT_VALID | PT_TABLE);
         }
         uint64_t l1_ipa = l0[l0_idx] & 0xFFFFFFFFF000ULL;
         uint64_t *l1 = pt_at(g, l1_ipa - base);
@@ -1062,7 +1107,8 @@ int guest_map_va_range(guest_t *g,
             uint64_t l2_gpa = pt_alloc_page(g);
             if (!l2_gpa)
                 return -1;
-            l1[l1_idx] = (base + l2_gpa) | PT_VALID | PT_TABLE;
+            pte_store_release(&l1[l1_idx],
+                              (base + l2_gpa) | PT_VALID | PT_TABLE);
         } else if (!(l1[l1_idx] & PT_TABLE)) {
             log_error(
                 "guest_map_va_range: L1[%u] is a block, not a table; "
@@ -1083,7 +1129,7 @@ int guest_map_va_range(guest_t *g,
              */
             continue;
         }
-        l2[l2_idx] = make_block_desc(cur_gpa, perms);
+        pte_store_release(&l2[l2_idx], make_block_desc(cur_gpa, perms));
         if (!bcast) {
             if (va < changed_lo)
                 changed_lo = va;
@@ -1212,38 +1258,48 @@ static int gva_translate_perm(const guest_t *g,
 
     uint64_t base = g->ipa_base;
 
+    /* Lock-free walk: load each level's descriptor exactly once with acquire
+     * (see pte_load_acquire) and decode that snapshot. Concurrent mutators
+     * hold the mmap lock against each other but not against this walker.
+     */
     const uint64_t *l0 = pt_at(g, g->ttbr0 - base);
     unsigned l0_idx = (unsigned) (gva / (512ULL * BLOCK_1GIB));
-    if (l0_idx >= 512 || !(l0[l0_idx] & PT_VALID))
+    if (l0_idx >= 512)
+        return -1;
+    uint64_t l0e = pte_load_acquire(&l0[l0_idx]);
+    if (!(l0e & PT_VALID))
         return -1;
 
-    uint64_t l1_ipa = l0[l0_idx] & 0xFFFFFFFFF000ULL;
+    uint64_t l1_ipa = l0e & 0xFFFFFFFFF000ULL;
     if (l1_ipa < base || l1_ipa - base >= g->guest_size)
         return -1;
     const uint64_t *l1 = pt_at(g, l1_ipa - base);
     unsigned l1_idx = (unsigned) ((gva / BLOCK_1GIB) % 512);
-    if (!(l1[l1_idx] & PT_VALID))
+    uint64_t l1e = pte_load_acquire(&l1[l1_idx]);
+    if (!(l1e & PT_VALID))
         return -1;
 
-    uint64_t l2_ipa = l1[l1_idx] & 0xFFFFFFFFF000ULL;
+    uint64_t l2_ipa = l1e & 0xFFFFFFFFF000ULL;
     if (l2_ipa < base || l2_ipa - base >= g->guest_size)
         return -1;
     const uint64_t *l2 = pt_at(g, l2_ipa - base);
     unsigned l2_idx = (unsigned) ((gva / BLOCK_2MIB) % 512);
-    if (!(l2[l2_idx] & PT_VALID))
+    uint64_t l2e = pte_load_acquire(&l2[l2_idx]);
+    if (!(l2e & PT_VALID))
         return -1;
 
-    if (l2[l2_idx] & PT_TABLE) {
+    if (l2e & PT_TABLE) {
         /* L3 page descriptor: 4KiB granularity. */
-        uint64_t l3_ipa = l2[l2_idx] & 0xFFFFFFFFF000ULL;
+        uint64_t l3_ipa = l2e & 0xFFFFFFFFF000ULL;
         if (l3_ipa < base || l3_ipa - base >= g->guest_size)
             return -1;
         const uint64_t *l3 = pt_at(g, l3_ipa - base);
         unsigned l3_idx = (unsigned) ((gva / PAGE_SIZE) % 512);
-        if (!(l3[l3_idx] & PT_VALID))
+        uint64_t l3e = pte_load_acquire(&l3[l3_idx]);
+        if (!(l3e & PT_VALID))
             return -1;
 
-        int perms = desc_to_perms(l3[l3_idx]);
+        int perms = desc_to_perms(l3e);
         /* EL1-only pages (shim_data) are inaccessible to guest EL0 in the page
          * tables; the host accessors that act on a guest-supplied GVA must
          * refuse them too, otherwise a guest could pass a shim_data GVA as a
@@ -1256,7 +1312,7 @@ static int gva_translate_perm(const guest_t *g,
         if ((perms & required_perms) != required_perms)
             return -1;
 
-        uint64_t page_ipa = l3[l3_idx] & 0xFFFFFFFFF000ULL;
+        uint64_t page_ipa = l3e & 0xFFFFFFFFF000ULL;
         if (page_ipa < base)
             return -1;
         uint64_t gpa = (page_ipa - base) + (gva & (PAGE_SIZE - 1));
@@ -1282,7 +1338,7 @@ static int gva_translate_perm(const guest_t *g,
     }
 
     /* L2 block descriptor: 2MiB granularity. */
-    int perms = desc_to_perms(l2[l2_idx]);
+    int perms = desc_to_perms(l2e);
     /* See the L3 page-descriptor branch above: EL1-only blocks are inaccessible
      * to host-on-behalf-of-guest accesses for the same reason. shim_data is
      * mapped as a 2MiB EL1-only block at boot.
@@ -1292,7 +1348,7 @@ static int gva_translate_perm(const guest_t *g,
     if ((perms & required_perms) != required_perms)
         return -1;
 
-    uint64_t block_ipa = l2[l2_idx] & L2_BLOCK_ADDR_MASK;
+    uint64_t block_ipa = l2e & L2_BLOCK_ADDR_MASK;
     if (block_ipa < base)
         return -1;
     uint64_t gpa = (block_ipa - base) + (gva & (BLOCK_2MIB - 1));
@@ -2696,7 +2752,8 @@ int guest_extend_page_tables(guest_t *g,
             uint64_t l1_gpa = pt_alloc_page(g);
             if (!l1_gpa)
                 return -1;
-            l0[l0_idx] = (base + l1_gpa) | PT_VALID | PT_TABLE;
+            pte_store_release(&l0[l0_idx],
+                              (base + l1_gpa) | PT_VALID | PT_TABLE);
         }
 
         uint64_t l1_ipa = l0[l0_idx] & 0xFFFFFFFFF000ULL;
@@ -2715,7 +2772,8 @@ int guest_extend_page_tables(guest_t *g,
             uint64_t l2_gpa = pt_alloc_page(g);
             if (!l2_gpa)
                 return -1;
-            l1[l1_idx] = (base + l2_gpa) | PT_VALID | PT_TABLE;
+            pte_store_release(&l1[l1_idx],
+                              (base + l2_gpa) | PT_VALID | PT_TABLE);
         }
 
         /* Navigate to L2 table */
@@ -2738,7 +2796,7 @@ int guest_extend_page_tables(guest_t *g,
          */
         if (l2[l2_idx] & PT_VALID)
             continue;
-        l2[l2_idx] = make_block_desc(ipa, perms);
+        pte_store_release(&l2[l2_idx], make_block_desc(ipa, perms));
         if (!bcast) {
             if (addr < changed_lo)
                 changed_lo = addr;
@@ -2916,13 +2974,16 @@ static int split_l2_block(guest_t *g, uint64_t *l2_entry)
 
     /* Fill 512 L3 entries with 4KiB page descriptors inheriting the block's
      * permissions. Extract the output IPA from bits [47:21] of the existing
-     * descriptor (not from the caller's address).
+     * descriptor (not from the caller's address). Plain stores are fine here:
+     * the table is unreachable until the release-flip below publishes it, and
+     * the release orders the fills before the new L2 value for any walker
+     * that acquires it (see pte_store_release).
      */
     uint64_t block_ipa = *l2_entry & L2_BLOCK_ADDR_MASK;
     for (int i = 0; i < 512; i++)
         l3[i] = make_page_desc(block_ipa + (uint64_t) i * PAGE_SIZE, old_perms);
 
-    *l2_entry = (g->ipa_base + l3_gpa) | PT_VALID | PT_TABLE;
+    pte_store_release(l2_entry, (g->ipa_base + l3_gpa) | PT_VALID | PT_TABLE);
     return 0;
 }
 
@@ -2977,7 +3038,7 @@ int guest_invalidate_ptes(guest_t *g, uint64_t start, uint64_t end)
                  * MiB range exceeds the selective cap and upgrades to
                  * broadcast.
                  */
-                *l2_entry = 0;
+                pte_store_release(l2_entry, 0);
                 tlbi_request_range(base + block_start, base + block_end);
                 addr = block_end;
                 continue;
@@ -3008,7 +3069,7 @@ int guest_invalidate_ptes(guest_t *g, uint64_t start, uint64_t end)
             unsigned l3_idx =
                 (unsigned) (((base + pa) % BLOCK_2MIB) / PAGE_SIZE);
             if (l3[l3_idx] != 0) {
-                l3[l3_idx] = 0; /* Invalid descriptor */
+                pte_store_release(&l3[l3_idx], 0); /* Invalid descriptor */
                 if (!bcast) {
                     if (pa < changed_lo)
                         changed_lo = pa;
@@ -3096,7 +3157,7 @@ int guest_update_perms(guest_t *g, uint64_t start, uint64_t end, int perms)
             if (start <= block_start && end >= block_end) {
                 if (old_perms != perms) {
                     uint64_t ipa = *l2_entry & L2_BLOCK_ADDR_MASK;
-                    *l2_entry = make_block_desc(ipa, perms);
+                    pte_store_release(l2_entry, make_block_desc(ipa, perms));
                     tlbi_request_range(base + block_start, base + block_end);
                 }
                 addr = block_end;
@@ -3160,7 +3221,7 @@ int guest_update_perms(guest_t *g, uint64_t start, uint64_t end, int perms)
             }
             uint64_t new_desc = make_page_desc(page_ipa, perms);
             if (l3[l3_idx] != new_desc) {
-                l3[l3_idx] = new_desc;
+                pte_store_release(&l3[l3_idx], new_desc);
                 if (!bcast) {
                     if (pa < changed_lo)
                         changed_lo = pa;
@@ -3244,7 +3305,7 @@ int guest_install_va_pages(guest_t *g,
         unsigned l3_idx = (unsigned) (((base + v) % BLOCK_2MIB) / PAGE_SIZE);
         uint64_t new_desc = make_page_desc(base + p, perms);
         if (l3[l3_idx] != new_desc) {
-            l3[l3_idx] = new_desc;
+            pte_store_release(&l3[l3_idx], new_desc);
             if (!bcast) {
                 if (v < changed_lo)
                     changed_lo = v;
