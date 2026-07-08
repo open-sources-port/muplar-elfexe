@@ -1114,18 +1114,29 @@ static int64_t futex_lock_pi(guest_t *g, uint64_t uaddr, uint64_t timeout_gva)
         if ((expected & FUTEX_TID_MASK) == tid)
             return -LINUX_EDEADLK;
 
-        /* Check if the owner thread has exited without releasing the lock.
-         * Linux kernel handles this via PI futex cleanup on thread exit; futex
-         * emulation detects it lazily here since guest memory does not track PI
-         * ownership per-thread. Clear the futex word and retry acquisition.
+        /* Robust owner death: the robust-list walk sets FUTEX_OWNER_DIED and
+         * clears the TID field on thread exit (see robust_list_walk), so the
+         * word is nonzero (OWNER_DIED set) with an empty TID -- the CAS(0->TID)
+         * fast path above cannot acquire it. Recover by clearing the word and
+         * retrying. This must run before the nonzero-TID dead-owner test below,
+         * which never sees a robust-cleaned word (TID == 0) and would otherwise
+         * spin forever.
          */
-        uint32_t owner_tid = expected & FUTEX_TID_MASK;
-        if (owner_tid != 0 && !thread_find((int64_t) owner_tid)) {
+        if (expected & FUTEX_OWNER_DIED) {
             __atomic_compare_exchange_n(word, &expected, 0,
                                         /*weak=*/0, __ATOMIC_SEQ_CST,
                                         __ATOMIC_SEQ_CST);
             continue; /* Retry acquisition */
         }
+
+        /* Owner thread has exited without releasing the lock and without robust
+         * cleanup (no OWNER_DIED). Linux does not recover such a lock:
+         * FUTEX_LOCK_PI returns -ESRCH (attach_to_pi_owner ->
+         * handle_exit_race).
+         */
+        uint32_t owner_tid = expected & FUTEX_TID_MASK;
+        if (owner_tid != 0 && !thread_find((int64_t) owner_tid))
+            return -LINUX_ESRCH;
 
         /* Set the WAITERS bit so the owner takes the kernel-mediated unlock
          * path. Retry the CAS in a loop since the owner may release
@@ -1222,16 +1233,28 @@ static int64_t futex_lock_pi(guest_t *g, uint64_t uaddr, uint64_t timeout_gva)
                 }
 
                 /* Check if the owner thread has died while the waiter was
-                 * waiting. If so, clear the lock and retry. Use
-                 * thread_tid_alive (lock-free) instead of thread_find to avoid
-                 * lock order inversion: bucket lock(7) is held here, and
-                 * thread_find acquires thread_lock(5).
+                 * waiting. Use thread_tid_alive (lock-free) instead of
+                 * thread_find to avoid lock order inversion: bucket lock(7) is
+                 * held here, and thread_find acquires thread_lock(5).
+                 *
+                 * As in the fast path, Linux only recovers a PI lock whose
+                 * owner died if the robust-list walk marked it
+                 * FUTEX_OWNER_DIED. A robust death clears the TID field, so
+                 * test OWNER_DIED first (recover via the clear-and-retry path
+                 * below); a non-robust dead owner keeps its TID but has no
+                 * OWNER_DIED, and Linux yields -ESRCH.
                  */
                 uint32_t check = __atomic_load_n(word, __ATOMIC_SEQ_CST);
-                uint32_t check_tid = check & FUTEX_TID_MASK;
-                if (check_tid != 0 && !thread_tid_alive((int64_t) check_tid)) {
+                if (check & FUTEX_OWNER_DIED) {
                     owner_died = true;
                     break;
+                }
+                uint32_t check_tid = check & FUTEX_TID_MASK;
+                if (check_tid != 0 && !thread_tid_alive((int64_t) check_tid)) {
+                    bucket_unlink_locked(b, &waiter);
+                    pthread_mutex_unlock(&b->lock);
+                    pthread_cond_destroy(&waiter.cond);
+                    return -LINUX_ESRCH;
                 }
             }
         }
@@ -1291,20 +1314,33 @@ static int64_t futex_trylock_pi(guest_t *g, uint64_t uaddr)
  */
 static int64_t futex_unlock_pi(guest_t *g, uint64_t uaddr)
 {
+    uint32_t tid = current_thread ? (uint32_t) current_thread->guest_tid
+                                  : (uint32_t) proc_get_pid();
+
+    /* Linux futex_unlock_pi() reads the word and rejects a non-owner with
+     * -EPERM *before* it validates alignment (get_user + owner check run ahead
+     * of get_futex_key, whose -EINVAL is never reached), so releasing a lock
+     * you do not own returns -EPERM even for an unaligned uaddr. Match that
+     * ordering. The word may be unaligned here, so read it with
+     * guest_read_small (boundary-safe, and avoids the aligned-atomic-load fault
+     * an unaligned __atomic_load_n would take on the arm64 host).
+     */
+    uint32_t cur;
+    if (guest_read_small(g, uaddr, &cur, sizeof(cur)) != 0)
+        return -LINUX_EFAULT;
+    if ((cur & FUTEX_TID_MASK) != tid)
+        return -LINUX_EPERM;
+
+    /* Only the owner reaches here, and an owned PI lock is always aligned
+     * (LOCK_PI/TRYLOCK_PI reject an unaligned uaddr up front). Validate before
+     * the atomic release path below, which requires a 4-byte-aligned word.
+     */
     if (!futex_uaddr_is_aligned(uaddr))
         return -LINUX_EINVAL;
 
     uint32_t *word = (uint32_t *) guest_ptr_w(g, uaddr);
     if (!word)
         return -LINUX_EFAULT;
-
-    uint32_t tid = current_thread ? (uint32_t) current_thread->guest_tid
-                                  : (uint32_t) proc_get_pid();
-
-    /* Verify the current thread owns the lock (TID field matches) */
-    uint32_t cur = __atomic_load_n(word, __ATOMIC_SEQ_CST);
-    if ((cur & FUTEX_TID_MASK) != tid)
-        return -LINUX_EPERM;
 
     /* Atomically release: set word to 0 (clear TID + WAITERS flag). Use CAS
      * loop in case another thread is concurrently setting WAITERS.

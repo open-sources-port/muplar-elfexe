@@ -6,9 +6,14 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * Tests:
- *   1. PI futex dead-owner recovery (commit 64d21f2): child thread
- *      acquires a PI lock, exits without releasing it. Parent's
- *      FUTEX_LOCK_PI detects the dead owner and acquires the lock.
+ *   1. PI futex non-robust dead owner: a child thread acquires a PI lock
+ *      and exits without releasing it or registering a robust list, so no
+ *      FUTEX_OWNER_DIED is set. Linux does not recover such a lock -- the
+ *      parent's FUTEX_LOCK_PI returns -ESRCH -- so elfuse must too.
+ *
+ *   1b. Robust OWNER_DIED recovery: FUTEX_LOCK_PI on a word left in the
+ *      post-robust-walk state (FUTEX_OWNER_DIED set, TID cleared) must take
+ *      the lock over and return 0, not spin on the CAS(0->TID) fast path.
  *
  *   2. FUTEX_LOCK_PI + FUTEX_UNLOCK_PI round-trip: acquire and
  *      release a PI lock from the same thread.
@@ -41,6 +46,9 @@ int passes = 0, fails = 0;
 #endif
 #ifndef FUTEX_WAITERS
 #define FUTEX_WAITERS 0x80000000
+#endif
+#ifndef FUTEX_OWNER_DIED
+#define FUTEX_OWNER_DIED 0x40000000
 #endif
 
 /* Linux futex ops */
@@ -76,8 +84,8 @@ static long raw_futex_unlock_pi(uint32_t *addr)
 /* Stack for child thread (8KiB, 16-byte aligned) */
 static char child_stack_buf[8192] __attribute__((aligned(16)));
 
-/* Child: acquire PI lock, signal parent, exit WITHOUT releasing. This tests
- * elfuse's dead-owner detection in futex_lock_pi().
+/* Child: acquire PI lock, signal parent, exit WITHOUT releasing and WITHOUT a
+ * robust list. Exercises the non-robust dead-owner path in futex_lock_pi().
  */
 static void child_acquire_and_die(void)
 {
@@ -94,8 +102,9 @@ static void child_acquire_and_die(void)
     child_ready = 1;
     raw_futex_wake((int *) &child_ready, 1);
 
-    /* Exit WITHOUT calling FUTEX_UNLOCK_PI. This is the bug scenario: elfuse's
-     * futex_lock_pi must detect the current TID is dead and recover.
+    /* Exit WITHOUT calling FUTEX_UNLOCK_PI and WITHOUT a robust list, so no
+     * FUTEX_OWNER_DIED is set on pi_lock. The parent's FUTEX_LOCK_PI must then
+     * fail with -ESRCH, matching Linux's non-robust dead-owner behavior.
      */
     raw_exit(0);
 }
@@ -137,7 +146,7 @@ static void test_pi_lock_unlock(void)
 
 static void test_pi_dead_owner(void)
 {
-    TEST("PI dead-owner recovery");
+    TEST("PI non-robust dead owner returns ESRCH");
 
     /* Reset shared state */
     pi_lock = 0;
@@ -188,17 +197,57 @@ static void test_pi_dead_owner(void)
         usleep(10000); /* 10ms */
     }
 
-    /* Now try to acquire the PI lock. The child exited without releasing it, so
-     * elfuse's futex_lock_pi must detect the dead owner and let the waiter
-     * acquire.
+    /* Now try to acquire the PI lock. The child exited without releasing it and
+     * without registering a robust list, so no FUTEX_OWNER_DIED was set. Linux
+     * does NOT silently recover such a lock: FUTEX_LOCK_PI returns -ESRCH
+     * (attach_to_pi_owner sees the owner TID is dead with no OWNER_DIED mark).
+     * A guest that wants dead-owner recovery must use a robust futex list.
      */
     long r = raw_futex_lock_pi((uint32_t *) &pi_lock);
+    if (r != -3 /* -ESRCH */) {
+        printf(
+            "FAIL: LOCK_PI expected -ESRCH(-3) for non-robust dead owner, "
+            "got %ld\n",
+            r);
+        fails++;
+        return;
+    }
+    PASS();
+}
+
+/* Test: LOCK_PI recovers a robust OWNER_DIED word */
+
+static void test_pi_owner_died_recover(void)
+{
+    TEST("PI LOCK_PI recovers an OWNER_DIED word");
+
+    /* Reproduce the post-robust-walk state directly: the robust-list walk sets
+     * FUTEX_OWNER_DIED and clears the TID field on owner exit, leaving a
+     * nonzero word (OWNER_DIED set) with an empty TID. FUTEX_LOCK_PI must take
+     * over such a word -- Linux reacquires it and returns 0 -- rather than spin
+     * forever on the CAS(0->TID) fast path (which never matches OWNER_DIED) or
+     * fall through to the non-robust dead-owner -ESRCH path (TID is 0 here).
+     */
+    pi_lock = FUTEX_OWNER_DIED;
+
+    long r = raw_futex_lock_pi((uint32_t *) &pi_lock);
     if (r != 0) {
-        FAIL("LOCK_PI failed (dead-owner not recovered)");
+        printf(
+            "FAIL: LOCK_PI on OWNER_DIED word expected 0 (recovered), "
+            "got %ld\n",
+            r);
+        fails++;
         return;
     }
 
-    /* Clean up: release the lock */
+    /* We now own it; the low bits carry our TID. */
+    uint32_t tid = (uint32_t) raw_gettid();
+    uint32_t val = __atomic_load_n(&pi_lock, __ATOMIC_SEQ_CST);
+    if ((val & FUTEX_TID_MASK) != tid) {
+        FAIL("lock word doesn't contain our TID after recovery");
+        return;
+    }
+
     raw_futex_unlock_pi((uint32_t *) &pi_lock);
     PASS();
 }
@@ -315,10 +364,14 @@ static void test_futex_unaligned(void)
         return;
     }
 
+    /* UNLOCK_PI checks ownership before alignment (Linux futex_unlock_pi runs
+     * get_user + owner check ahead of get_futex_key), so an unaligned word you
+     * do not own returns -EPERM, not -EINVAL.
+     */
     r = raw_syscall6(__NR_futex, (long) unaligned,
                      FUTEX_UNLOCK_PI | FUTEX_PRIVATE, 0, 0, 0, 0);
-    if (r != -22) {
-        printf("FAIL: UNLOCK_PI expected -EINVAL(-22) got %ld\n", r);
+    if (r != -1 /* -EPERM */) {
+        printf("FAIL: UNLOCK_PI expected -EPERM(-1) got %ld\n", r);
         fails++;
         return;
     }
@@ -335,6 +388,7 @@ int main(void)
     test_pi_lock_unlock();
     test_futex_eintr();
     test_futex_unaligned();
+    test_pi_owner_died_recover();
     test_pi_dead_owner(); /* Last: uses CLONE_THREAD which may hang on x64 */
 
     SUMMARY("test-futex-pi");
