@@ -175,7 +175,15 @@ rescan:
             pthread_cond_destroy(&t->ptrace_cond);
             pthread_cond_destroy(&t->resume_cond);
         }
+        /* Bump generation across the memset so a caller still holding this
+         * slot's pointer from before reuse (e.g. a clone parent racing its
+         * own worker's startup-failure path) can detect the recycle via
+         * thread_set_host_thread's generation check instead of writing into
+         * what is now a different logical thread.
+         */
+        uint64_t next_generation = t->generation + 1;
         memset(t, 0, sizeof(*t));
+        t->generation = next_generation;
         t->sp_el1_slot = -1; /* No SP_EL1 yet; thread_alloc_sp_el1 fills this */
         t->guest_tid = tid;
         if (stack_start < stack_end) {
@@ -221,12 +229,20 @@ static void thread_ptrace_cleanup_locked(thread_entry_t *t)
     t->ptrace_cleanup_pending = false;
 }
 
-void thread_set_host_thread(thread_entry_t *t, pthread_t thr, bool joinable)
+bool thread_set_host_thread(thread_entry_t *t,
+                            pthread_t thr,
+                            bool joinable,
+                            uint64_t generation)
 {
     pthread_mutex_lock(&thread_lock);
-    t->host_thread = thr;
-    t->host_thread_needs_join = joinable;
+    bool recorded = (t->generation == generation);
+    if (recorded) {
+        t->host_thread = thr;
+        t->host_thread_needs_join = joinable;
+    }
     pthread_mutex_unlock(&thread_lock);
+
+    return recorded;
 }
 
 bool thread_claim_worker_join(thread_entry_t *t, pthread_t thr)
@@ -411,6 +427,7 @@ void thread_join_workers(void)
     struct {
         pthread_t thr;
         thread_entry_t *t;
+        uint64_t generation;
         bool claimed;
     } workers[MAX_THREADS];
     int nworkers = 0;
@@ -424,10 +441,12 @@ void thread_join_workers(void)
          * slot was never reused. Its pthread has terminated (or is in final
          * wind-down), so the join below is immediate.
          */
-        if (!t->active && !t->host_thread_needs_join)
+        if (!__atomic_load_n(&t->active, __ATOMIC_RELAXED) &&
+            !t->host_thread_needs_join)
             continue;
         workers[nworkers].thr = t->host_thread;
         workers[nworkers].t = t;
+        workers[nworkers].generation = t->generation;
         workers[nworkers].claimed = t->host_thread_needs_join;
         t->host_thread_needs_join = false;
         nworkers++;
@@ -443,15 +462,34 @@ void thread_join_workers(void)
      * is unsafe.
      */
     for (int w = 0; w < nworkers; w++) {
+        bool recycled = false;
+
         for (int i = 0; i < 20; i++) {
             if (!__atomic_load_n(&workers[w].t->active, __ATOMIC_ACQUIRE))
                 break;
+            /* The slot may have been reused for a new logical thread while we
+             * polled: thread_alloc only recycles a slot once its previous
+             * occupant is inactive, so a generation bump here proves our
+             * snapshotted worker already deactivated even though the slot now
+             * reads active == 1 again for the replacement thread. Stop
+             * polling immediately rather than tracking the wrong thread's
+             * active bit for the rest of the loop.
+             */
+            if (workers[w].t->generation != workers[w].generation) {
+                recycled = true;
+                break;
+            }
             usleep(5000);
         }
 
         if (!workers[w].claimed)
             continue;
-        if (!__atomic_load_n(&workers[w].t->active, __ATOMIC_ACQUIRE))
+        /* recycled short-circuits before the active re-check: once recycled,
+         * that bit belongs to the replacement thread and must not influence
+         * the join-vs-detach decision for our (already-terminated) handle.
+         */
+        if (recycled ||
+            !__atomic_load_n(&workers[w].t->active, __ATOMIC_ACQUIRE))
             pthread_join(workers[w].thr, NULL);
         else
             pthread_detach(workers[w].thr);
