@@ -378,6 +378,14 @@ int proc_set_child_pgid(int64_t guest_pid, int64_t pgid);
  */
 pid_t proc_guest_to_host_pid(int64_t gpid);
 
+/* Look up a host PID in the child process table, falling back to the
+ * cross-process registry so the rest of the fork family (grandchildren,
+ * siblings' descendants) resolves too. Returns the guest PID if @host_pid is
+ * a live member of this guest's fork family, or -1 otherwise (e.g. the lock
+ * holder is an unrelated host process).
+ */
+int64_t proc_host_to_guest_pid(pid_t host_pid);
+
 /* Queue a Linux guest signal in a fork-child elfuse process. target_guest_pid
  * tags the transport record so the receiver drops it if its host pid was
  * recycled onto a different guest.

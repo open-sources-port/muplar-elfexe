@@ -514,6 +514,35 @@ static void registry_parse_cb(char *rec, void *vctx)
     c->entries[idx].pgid = (int64_t) pg;
 }
 
+typedef struct {
+    pid_t target;
+    int64_t guest_pid;
+    bool found;
+} registry_find_ctx_t;
+
+/* Locate @target's guest pid without registry_parse_cb's per-record
+ * kill(2) liveness probe: that check exists to build a filtered live-
+ * membership list for group-signal delivery, but a host_pid ->guest_pid
+ * lookup is only ever done for a pid the caller just observed to be alive
+ * (e.g. it holds a conflicting file lock right now), so it is redundant
+ * here. proc_host_to_guest_pid still verifies the match via proc_pidpath
+ * to guard against the pid having been recycled.
+ */
+static void registry_find_by_host_cb(char *rec, void *vctx)
+{
+    registry_find_ctx_t *c = vctx;
+    long hp;
+    long long gp, pg;
+    if (sscanf(rec, "%ld %lld %lld", &hp, &gp, &pg) != 3)
+        return;
+    if (hp <= 0 || hp > INT_MAX || pg < 0 || pg > INT_MAX)
+        return;
+    if ((pid_t) hp != c->target)
+        return;
+    c->guest_pid = (int64_t) gp;
+    c->found = true;
+}
+
 /* Parse the whole registry from @fd (caller holds an flock) into @entries,
  * keeping one record per live host pid.
  *
@@ -803,6 +832,46 @@ int proc_get_namespace_targets(proc_signal_target_t *out,
         count++;
     }
     return count;
+}
+
+int64_t proc_host_to_guest_pid(pid_t host_pid)
+{
+    pthread_mutex_lock(&pid_lock);
+    proc_entry_t *entry = proc_find_host_entry(host_pid);
+    int64_t result = entry ? entry->guest_pid : -1;
+    pthread_mutex_unlock(&pid_lock);
+    if (result != -1)
+        return result;
+
+    char path[PATH_MAX];
+    if (!process_registry_path(path, sizeof(path)))
+        return -1;
+    int fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0)
+        return -1;
+    if (flock_retry(fd, LOCK_SH) != 0) {
+        close(fd);
+        return -1;
+    }
+    registry_find_ctx_t ctx = {.target = host_pid};
+    for_each_record(fd, registry_find_by_host_cb, &ctx);
+    flock_retry(fd, LOCK_UN);
+    close(fd);
+    if (!ctx.found)
+        return -1;
+
+    /* Guard against host pid reuse: only trust the hit if the pid still
+     * runs this elfuse binary, same check as proc_get_namespace_targets.
+     */
+    char our_path[PROC_PIDPATHINFO_MAXSIZE];
+    int our_len = proc_pidpath(getpid(), our_path, sizeof(our_path));
+    if (our_len <= 0)
+        return -1;
+    char ppath[PROC_PIDPATHINFO_MAXSIZE];
+    int plen = proc_pidpath(host_pid, ppath, sizeof(ppath));
+    if (plen != our_len || memcmp(ppath, our_path, (size_t) our_len))
+        return -1;
+    return ctx.guest_pid;
 }
 
 int proc_get_child_pids(pid_t *out, int max_pids)

@@ -626,6 +626,7 @@ run_unit_tests()
     test_check "$runner" "test-io-opt" "0 failed" "$bindir/test-io-opt"
     test_check "$runner" "test-poll" "0 failed" "$bindir/test-poll"
     test_rc "$runner" "test-flock" 0 "$bindir/test-flock"
+    test_rc "$runner" "test-ofd-lock" 0 "$bindir/test-ofd-lock"
     test_rc "$runner" "test-times" 0 "$bindir/test-times"
     test_rc "$runner" "test-syscall-smoke" 0 "$bindir/test-syscall-smoke"
     test_rc "$runner" "test-vdso" 0 "$bindir/test-vdso"
@@ -1207,8 +1208,8 @@ run_suite()
 # observed counts diverge. apple-unknown is the fallback row for SoC strings the
 # detector does not recognize yet.
 EXPECTED_BASELINES=(
-    "elfuse-aarch64|234|0"
-    "qemu-aarch64|214|0"
+    "elfuse-aarch64|235|0"
+    "qemu-aarch64|215|0"
     "elfuse-x86_64:apple-m1-m2|71|0"
     "elfuse-x86_64:apple-m3-plus|71|0"
     "elfuse-x86_64:apple-unknown|71|0"

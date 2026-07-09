@@ -15,8 +15,10 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "test-harness.h"
@@ -25,6 +27,7 @@
 #define RESERVED_BYTE (PENDING_BYTE + 1)
 #define SHARED_FIRST (PENDING_BYTE + 2)
 #define SHARED_SIZE 510
+#define CHILD_LOCK_BYTE 100
 
 static int set_lock(int fd, short type, off_t start, off_t len)
 {
@@ -92,6 +95,53 @@ int main(void)
     EXPECT_TRUE(gr == 0 && (gfl.l_type == F_UNLCK || gfl.l_type == F_RDLCK ||
                             gfl.l_type == F_WRLCK),
                 "F_GETLK returned an invalid l_type");
+
+    /* F_GETLK must report the *guest* PID of a conflicting lock, not
+     * elfuse's raw host PID -- guest code that treats l_pid as a real PID
+     * (e.g. a kill(pid, 0) liveness check) would otherwise resolve a foreign
+     * host process instead of the actual lock holder.
+     */
+    TEST("F_GETLK reports the guest PID of a conflicting child lock");
+    int pfd[2];
+    int pipe_ok = (pipe(pfd) == 0);
+    EXPECT_TRUE(pipe_ok, "pipe() failed");
+    if (pipe_ok) {
+        pid_t child = fork();
+        if (child == 0) {
+            close(pfd[0]);
+            int cfd = open(path, O_RDWR);
+            if (cfd < 0 || set_lock(cfd, F_WRLCK, CHILD_LOCK_BYTE, 1) != 0) {
+                _exit(1);
+            }
+            pid_t self = getpid();
+            ssize_t n = write(pfd[1], &self, sizeof(self));
+            if (n != (ssize_t) sizeof(self))
+                _exit(1);
+            sleep(5); /* Hold the lock until the parent has queried it. */
+            _exit(0);
+        }
+
+        close(pfd[1]);
+        pid_t child_pid = -1;
+        ssize_t n = read(pfd[0], &child_pid, sizeof(child_pid));
+        close(pfd[0]);
+
+        struct flock cfl = {
+            .l_type = F_WRLCK,
+            .l_whence = SEEK_SET,
+            .l_start = CHILD_LOCK_BYTE,
+            .l_len = 1,
+        };
+        int cr = fcntl(fd, F_GETLK, &cfl);
+        EXPECT_TRUE(n == (ssize_t) sizeof(child_pid) && cr == 0 &&
+                        cfl.l_type == F_WRLCK && cfl.l_pid == child_pid,
+                    "F_GETLK did not report the child's guest PID");
+
+        if (child > 0) {
+            kill(child, SIGKILL);
+            waitpid(child, NULL, 0);
+        }
+    }
 
     close(fd);
     unlink(path);
