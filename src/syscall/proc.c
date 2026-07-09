@@ -2065,8 +2065,16 @@ int vcpu_run_loop(hv_vcpu_t vcpu,
                      * so the next syscall epilogue does not re-flush the W^X
                      * page. cpu_tlbi_req is per-vCPU, so this only touches our
                      * own slot -- concurrent vCPUs are unaffected.
+                     *
+                     * The HVC #9 shim now consumes X8 as a post-HVC marker:
+                     * 0 means W^X succeeded and the shim should run the TLBI
+                     * retry epilogue; 2 means signal_deliver_fault installed a
+                     * handler frame and the shim must drop its saved frame.
+                     * Clear X8 here so a guest's pre-fault X8 value cannot be
+                     * misread as the frame-drop marker after a normal toggle.
                      */
                     tlbi_request_clear();
+                    hv_vcpu_set_reg(vcpu, HV_REG_X8, 0);
                     break;
                 }
 

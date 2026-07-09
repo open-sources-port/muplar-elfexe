@@ -36,7 +36,10 @@
  *                          shim restores X11 from the saved frame before
  *                          ERET so the EL0 caller never observes this hint.)
  *   #7  MRS trap          (host reads reg from ESR ISS; returns value in x0)
- *   #9  W^X toggle        (x0=FAR, x1=type: 0=exec->RX, 1=write->RW)
+ *   #9  W^X toggle        (x0=FAR, x1=type: 0=exec->RX, 1=write->RW.
+ *                          On return, X8==0 means retry after W^X TLBI;
+ *                          X8==2 means host delivered a signal frame and the
+ *                          shim must drop the saved fault frame.)
  *   #10 BRK from EL0      (SIGTRAP delivery / ptrace-stop; GPRs in frame)
  *   #11 EL0 fault         (SIGSEGV/SIGILL delivery; GPRs in frame.
  *                          On return the host sets X8 to the same TLBI
@@ -1119,6 +1122,8 @@ handle_inst_abort:
 1:  mrs x0, far_el1           /* Faulting address */
     mov x1, #0                /* Type 0 = instruction fault -> flip to RX */
     hvc #9
+    cmp x8, #2
+    b.eq exec_drop_frame
     b tlbi_restore_eret
 
 /* handle_data_abort: EC=0x24: Data abort from lower EL
@@ -1143,6 +1148,8 @@ handle_data_abort:
     mrs x0, far_el1           /* Faulting address */
     mov x1, #1                /* Type 1 = write fault -> flip to RW */
     hvc #9
+    cmp x8, #2
+    b.eq exec_drop_frame
     b tlbi_restore_eret
 
 /* handle_el0_fault: Deliver SIGSEGV/SIGILL for EL0 faults

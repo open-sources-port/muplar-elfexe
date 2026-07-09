@@ -1735,9 +1735,11 @@ static int deliver_signal_locked(hv_vcpu_t vcpu,
     /* If delivery happens while returning from the syscall HVC path, the shim
      * still has the interrupted syscall frame on its EL1 stack. Tell it to drop
      * that frame so the handler PC/SP/LR/args installed above are not
-     * overwritten before ERET. Fault/BRK delivery paths ignore this marker. The
-     * EL0-preemption path resumes straight into the handler at EL0 with no shim
-     * frame to drop, so the marker is neither needed nor consulted.
+     * overwritten before ERET. HVC #9 fault fallback uses the same marker when
+     * it materializes a SIGSEGV frame; HVC #11 and BRK delivery paths do not
+     * consume it. The EL0-preemption path resumes straight into the handler at
+     * EL0 with no shim frame to drop, so the marker is neither needed nor
+     * consulted.
      */
     if (!el0_preempt)
         hv_vcpu_set_reg(vcpu, HV_REG_X8, 2);
