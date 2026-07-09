@@ -18,6 +18,7 @@
 #include <Hypervisor/Hypervisor.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <sys/resource.h>
 #include <sys/types.h>
 
 #include "core/guest.h"
@@ -312,6 +313,15 @@ int proc_register_child(pid_t host_pid, int64_t guest_pid, int64_t pgid);
 
 /* Mark a child as exited by host PID (for CLONE_VFORK wait). */
 void proc_mark_child_exited(pid_t host_pid, int status);
+
+/* Accumulate a reaped guest child's rusage into the cutime/cstime counters
+ * that times(2) reports. Call at every host reap of a proc_table child; never
+ * for emulator helper subprocesses.
+ */
+void proc_children_cpu_add(const struct rusage *ru);
+
+/* Read the accumulated guest-children CPU time, in microseconds. */
+void proc_children_cpu_us(uint64_t *utime_us, uint64_t *stime_us);
 
 /* Collect host PIDs of active (non-exited) fork children. Writes up to max_pids
  * entries into out[].

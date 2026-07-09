@@ -126,6 +126,7 @@ SYS_clock_gettime sc_clock_gettime 0
 SYS_clock_getres sc_clock_getres 0
 SYS_clock_nanosleep sc_clock_nanosleep 1
 SYS_gettimeofday sc_gettimeofday 0
+SYS_times sc_times 0
 SYS_timerfd_create sc_timerfd_create 1
 SYS_timerfd_settime sc_timerfd_settime 1
 SYS_timerfd_gettime sc_timerfd_gettime 1

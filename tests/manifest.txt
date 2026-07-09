@@ -48,6 +48,7 @@ test-socket
 test-file-ops
 test-flock
 test-sysinfo
+test-times
 test-io-opt
 test-oom-proc
 test-syscall-smoke

@@ -121,6 +121,7 @@
 #define SYS_getresgid 150
 #define SYS_setfsuid 151
 #define SYS_setfsgid 152
+#define SYS_times 153
 #define SYS_setpgid 154
 #define SYS_getpgid 155
 #define SYS_getsid 156

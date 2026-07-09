@@ -12,6 +12,7 @@
 #include <errno.h>
 #include <stdbool.h>
 #include <time.h>
+#include <sys/resource.h>
 #include <sys/time.h>
 
 #include "utils.h"
@@ -457,6 +458,81 @@ int64_t sys_gettimeofday(guest_t *g, uint64_t tv_gva, uint64_t tz_gva)
                          ts_real.tv_sec, ts_real.tv_nsec);
 
     return 0;
+}
+
+/* Linux struct tms: four clock_t fields (long on LP64) counting USER_HZ
+ * ticks.
+ */
+typedef struct {
+    int64_t tms_utime;
+    int64_t tms_stime;
+    int64_t tms_cutime;
+    int64_t tms_cstime;
+} linux_tms_t;
+
+/* Kernel USER_HZ, the unit of clock_t values returned by times(). Must match
+ * the AT_CLKTCK auxv entry in core/stack.c: libc divides these raw tick counts
+ * by sysconf(_SC_CLK_TCK), so a mismatch silently rescales every value.
+ */
+#define LINUX_USER_HZ 100
+
+/* Shared by both the timeval-based self accounting and the raw-microsecond
+ * proc-layer accumulator below, so the two paths cannot drift out of step if
+ * LINUX_USER_HZ ever changes.
+ */
+static int64_t usec_to_clock_ticks(uint64_t usec)
+{
+    return (int64_t) (usec / (1000000ULL / LINUX_USER_HZ));
+}
+
+static int64_t timeval_to_clock_ticks(const struct timeval *tv)
+{
+    return usec_to_clock_ticks((uint64_t) tv->tv_sec * 1000000ULL +
+                               (uint64_t) tv->tv_usec);
+}
+
+int64_t sys_times(guest_t *g, uint64_t buf_gva)
+{
+    /* Linux permits a NULL buffer: only the return value (elapsed ticks) is
+     * wanted. cutime/cstime come from the proc-layer accumulator fed at each
+     * guest-child reap, not from RUSAGE_CHILDREN: the emulator also waits on
+     * helper subprocesses (rosettad translate, sysroot tooling) whose CPU
+     * would otherwise masquerade as guest child time.
+     */
+    if (buf_gva) {
+        /* getrusage(RUSAGE_SELF) aggregates the whole emulator process --
+         * every host thread plus page-table, syscall-servicing, and Rosetta
+         * translation overhead -- not just the guest task's own execution, so
+         * utime/stime over-report relative to what a real guest kernel would
+         * charge. Unavoidable given this design (there is no per-guest-thread
+         * host accounting to draw from instead).
+         */
+        struct rusage self;
+        if (getrusage(RUSAGE_SELF, &self) < 0)
+            return linux_errno();
+
+        uint64_t cutime_us, cstime_us;
+        proc_children_cpu_us(&cutime_us, &cstime_us);
+
+        linux_tms_t tms = {
+            .tms_utime = timeval_to_clock_ticks(&self.ru_utime),
+            .tms_stime = timeval_to_clock_ticks(&self.ru_stime),
+            .tms_cutime = usec_to_clock_ticks(cutime_us),
+            .tms_cstime = usec_to_clock_ticks(cstime_us),
+        };
+        if (guest_write_small(g, buf_gva, &tms, sizeof(tms)) < 0)
+            return -LINUX_EFAULT;
+    }
+
+    /* Linux returns jiffies-since-boot converted to clock_t ticks; POSIX only
+     * requires an arbitrary-but-fixed reference point, so host CLOCK_MONOTONIC
+     * satisfies callers that difference successive returns.
+     */
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) < 0)
+        return linux_errno();
+    return (int64_t) ts.tv_sec * LINUX_USER_HZ +
+           ts.tv_nsec / (NSEC_PER_SEC / LINUX_USER_HZ);
 }
 
 int64_t sys_setitimer(guest_t *g, int which, uint64_t new_gva, uint64_t old_gva)

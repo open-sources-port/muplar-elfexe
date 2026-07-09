@@ -345,6 +345,7 @@ SC_FORWARD(sc_clock_nanosleep,  sys_clock_nanosleep(g, (int) x0, (int) x1, x2, x
 SC_FORWARD(sc_gettimeofday,     sys_gettimeofday(g, x0, x1))
 SC_FORWARD(sc_setitimer,        sys_setitimer(g, (int) x0, x1, x2))
 SC_FORWARD(sc_getitimer,        sys_getitimer(g, (int) x0, x1))
+SC_FORWARD(sc_times,            sys_times(g, x0))
 
 /* Signals */
 SC_FORWARD(sc_rt_sigaction,   signal_rt_sigaction(g, (int) x0, x1, x2, x3))

@@ -81,6 +81,35 @@ static pthread_mutex_t pid_lock = PTHREAD_MUTEX_INITIALIZER; /* Lock order: 6 */
 static pthread_cond_t pid_cond =
     PTHREAD_COND_INITIALIZER; /* Signaled on child exit */
 
+/* CPU time of reaped guest children, accumulated at every host reap site and
+ * reported by times(2) as tms_cutime/tms_cstime. The emulator also waits on
+ * helper subprocesses (rosettad translate, sysroot tooling) whose CPU shows up
+ * in the host's RUSAGE_CHILDREN, so times() cannot read that aggregate; only
+ * reaps of proc_table children may land here. Relaxed atomics suffice: the
+ * counters are monotonic sums and times() tolerates reading utime/stime one
+ * reap apart.
+ */
+static _Atomic uint64_t children_utime_us;
+static _Atomic uint64_t children_stime_us;
+
+void proc_children_cpu_add(const struct rusage *ru)
+{
+    atomic_fetch_add_explicit(&children_utime_us,
+                              (uint64_t) ru->ru_utime.tv_sec * 1000000 +
+                                  (uint64_t) ru->ru_utime.tv_usec,
+                              memory_order_relaxed);
+    atomic_fetch_add_explicit(&children_stime_us,
+                              (uint64_t) ru->ru_stime.tv_sec * 1000000 +
+                                  (uint64_t) ru->ru_stime.tv_usec,
+                              memory_order_relaxed);
+}
+
+void proc_children_cpu_us(uint64_t *utime_us, uint64_t *stime_us)
+{
+    *utime_us = atomic_load_explicit(&children_utime_us, memory_order_relaxed);
+    *stime_us = atomic_load_explicit(&children_stime_us, memory_order_relaxed);
+}
+
 /* Global flag for exit_group: signals all threads to terminate. Atomic to avoid
  * undefined behavior under C11 memory model when multiple threads read/write
  * concurrently.
@@ -283,9 +312,11 @@ static int proc_reap_finished(void)
             continue;
         }
         int status;
-        pid_t ret = waitpid(proc_table[i].host_pid, &status, WNOHANG);
+        struct rusage ru;
+        pid_t ret = wait4(proc_table[i].host_pid, &status, WNOHANG, &ru);
         if (ret > 0) {
             /* Child exited; free the slot */
+            proc_children_cpu_add(&ru);
             proc_table[i].active = false;
             reaped++;
         }
@@ -1073,9 +1104,17 @@ int64_t sys_wait4(guest_t *g,
 
                 int status;
                 struct rusage ru;
-                pid_t ret = wait4(host_pid, &status, mac_options | WNOHANG,
-                                  rusage_gva ? &ru : NULL);
+                pid_t ret =
+                    wait4(host_pid, &status, mac_options | WNOHANG, &ru);
                 if (ret > 0) {
+                    /* Credit CPU only on a terminal report. mac_options may
+                     * carry WUNTRACED/WCONTINUED, and a stop/continue report
+                     * is a snapshot of a still-running child: crediting it
+                     * here would double- or triple-count the same child
+                     * across its stop, continue, and final exit reports.
+                     */
+                    if (WIFEXITED(status) || WIFSIGNALED(status))
+                        proc_children_cpu_add(&ru);
                     if (status_gva) {
                         int32_t linux_status = status;
                         if (guest_write_small(g, status_gva, &linux_status,
@@ -1156,8 +1195,7 @@ int64_t sys_wait4(guest_t *g,
             struct rusage ru;
             pid_t ret;
             if (mac_options & WNOHANG) {
-                ret = wait4(host_pid, &status, mac_options,
-                            rusage_gva ? &ru : NULL);
+                ret = wait4(host_pid, &status, mac_options, &ru);
             } else {
                 /* A bare blocking wait4 has no re-check point: a worker
                  * parked here past exit_group is invisible to
@@ -1169,8 +1207,7 @@ int64_t sys_wait4(guest_t *g,
                  * pid_cond on every host child exit.
                  */
                 for (;;) {
-                    ret = wait4(host_pid, &status, mac_options | WNOHANG,
-                                rusage_gva ? &ru : NULL);
+                    ret = wait4(host_pid, &status, mac_options | WNOHANG, &ru);
                     if (ret != 0)
                         break;
                     if (proc_exit_group_requested())
@@ -1183,6 +1220,9 @@ int64_t sys_wait4(guest_t *g,
                 }
             }
             if (ret > 0) {
+                /* Same terminal-report gate as the P_ALL branch above. */
+                if (WIFEXITED(status) || WIFSIGNALED(status))
+                    proc_children_cpu_add(&ru);
                 if (status_gva) {
                     int32_t linux_status = status;
                     if (guest_write_small(g, status_gva, &linux_status,
@@ -1306,7 +1346,18 @@ int64_t sys_waitid(guest_t *g,
             } else {
                 pid_t host_pid = proc_table[i].host_pid;
                 pthread_mutex_unlock(&pid_lock);
-                ret = waitpid(host_pid, &status, WNOHANG);
+                struct rusage ru;
+                ret = wait4(host_pid, &status, WNOHANG, &ru);
+                /* Credit only a terminal report, and only when this call
+                 * actually consumes the reap: WNOWAIT must leave the child
+                 * waitable with its CPU uncounted until the later consuming
+                 * wait, but this inner wait4() has no WNOWAIT of its own, so
+                 * it consumes the host zombie regardless of the guest's
+                 * WNOWAIT request.
+                 */
+                if (ret > 0 && !(options & LINUX_WNOWAIT) &&
+                    (WIFEXITED(status) || WIFSIGNALED(status)))
+                    proc_children_cpu_add(&ru);
                 if (ret == 0) {
                     /* This child hasn't exited yet; continue checking others
                      * (P_ALL must scan all children).

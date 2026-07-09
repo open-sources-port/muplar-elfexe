@@ -1817,14 +1817,19 @@ int64_t sys_clone(hv_vcpu_t vcpu,
         close(vfork_notify_fds[0]);
 
         if (nr <= 0) {
-            int status;
-            waitpid(child_host_pid, &status, 0);
+            int status = 0;
+            struct rusage ru;
+            if (wait4(child_host_pid, &status, 0, &ru) == child_host_pid)
+                proc_children_cpu_add(&ru);
             proc_mark_child_exited(child_host_pid, status);
         } else {
             int status;
-            pid_t waited = waitpid(child_host_pid, &status, WNOHANG);
-            if (waited == child_host_pid)
+            struct rusage ru;
+            pid_t waited = wait4(child_host_pid, &status, WNOHANG, &ru);
+            if (waited == child_host_pid) {
+                proc_children_cpu_add(&ru);
                 proc_mark_child_exited(child_host_pid, status);
+            }
         }
     }
 

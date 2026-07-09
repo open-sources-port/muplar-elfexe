@@ -25,6 +25,7 @@ int64_t sys_clock_nanosleep(guest_t *g,
                             uint64_t req_gva,
                             uint64_t rem_gva);
 int64_t sys_gettimeofday(guest_t *g, uint64_t tv_gva, uint64_t tz_gva);
+int64_t sys_times(guest_t *g, uint64_t buf_gva);
 int64_t sys_setitimer(guest_t *g,
                       int which,
                       uint64_t new_gva,
