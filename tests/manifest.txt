@@ -186,6 +186,11 @@ test-fd-lifecycle
 [section] Multithreaded fork tests
 test-mt-fork
 
+[section] Exit-group teardown reachability tests
+test-exit-group-teardown wait     # expected_rc=42
+test-exit-group-teardown stop     # expected_rc=42
+test-exit-group-teardown fork     # expected_rc=42
+
 [section] SysV shared memory tests
 test-sysv-shm
 

@@ -651,17 +651,19 @@ void guest_destroy(guest_t *g)
      * intact.
      *
      * The wake signals cover workers blocked outside hv_vcpu_run: futex waiters
-     * poll futex_interrupt_requested, and any thread parked in epoll or poll
-     * wakes off the shared pipe. Without them, host-blocked workers miss the
-     * hv_vcpus_exit kick (which only affects threads inside hv_vcpu_run) and
-     * the 100ms join cap in thread_join_workers detaches them, leaving live
-     * pthreads to crash on the imminent munmap.
+     * poll futex_interrupt_requested, any thread parked in epoll or poll wakes
+     * off the shared pipe, and thread_wake_exit_waiters broadcasts the internal
+     * condvars (fork barrier, ptrace stop/wait). Without them, host-blocked
+     * workers miss the hv_vcpus_exit kick (which only affects threads inside
+     * hv_vcpu_run) and the 100ms join cap in thread_join_workers detaches
+     * them, leaving live pthreads to crash on the imminent munmap.
      */
     if (!proc_exit_group_requested())
         proc_request_exit_group(0);
     futex_interrupt_request();
     wakeup_pipe_signal();
     thread_interrupt_all();
+    thread_wake_exit_waiters();
     thread_join_workers();
     /* Destroy all remaining worker vCPUs (thread table) before tearing down the
      * VM. This prevents hv_vm_destroy from racing with active vCPUs that may

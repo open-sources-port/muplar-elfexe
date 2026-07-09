@@ -706,6 +706,11 @@ int main(int argc, char **argv)
     futex_interrupt_request();
     wakeup_pipe_signal();
     thread_interrupt_all();
+    /* Workers parked on internal condvars (fork barrier, ptrace stop/wait)
+     * see neither the pipe nor the vCPU kick; broadcast so they re-check the
+     * exit-group flag and terminate before the join below gives up on them.
+     */
+    thread_wake_exit_waiters();
     thread_join_workers();
 
     /* Diagnostic counter dump runs before guest_destroy so the shim_data

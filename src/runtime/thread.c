@@ -22,8 +22,9 @@
 
 #include "runtime/thread.h"
 #include "debug/log.h"
-#include "core/guest.h" /* guest_t (shim_data_base/ipa_base), BLOCK_2MIB */
-#include "hvutil.h"     /* vcpu_get_gpr, vcpu_get_sysreg */
+#include "core/guest.h"   /* guest_t (shim_data_base/ipa_base), BLOCK_2MIB */
+#include "hvutil.h"       /* vcpu_get_gpr, vcpu_get_sysreg */
+#include "syscall/proc.h" /* proc_exit_group_requested */
 
 /* From syscall/signal.h, included here directly to avoid pulling in the full
  * signal header (macOS defines sa_handler as a macro that conflicts with the
@@ -474,6 +475,16 @@ void thread_join_workers(void)
     THREAD_FOR_EACH (t) {
         if (t == current_thread || t->join_abandoned)
             continue;
+        /* Never wait for the main thread (slot 0): its entry only deactivates
+         * inside guest_destroy, which runs on the main thread AFTER its own
+         * thread_join_workers. A worker waiting here (exit_group called from
+         * a worker) would burn the full cap on it, and the resulting mutual
+         * wait (worker polling main while main polls the worker) ends in
+         * pthread_detach on both sides, leaving the loser to touch guest
+         * memory after guest_destroy unmaps it.
+         */
+        if (t == &thread_table[0])
+            continue;
         /* Inactive slots are included when they still hold an unjoined handle:
          * a worker that exited on its own shortly before teardown and whose
          * slot was never reused. Its pthread has terminated (or is in final
@@ -709,12 +720,44 @@ int thread_fork_barrier_check(void)
             pthread_cond_signal(&fork_all_quiesced_cond);
     }
 
-    /* Block until fork is complete */
-    while (fork_quiesce_active)
+    /* Block until fork is complete. Bail out on exit_group: the resume
+     * broadcast comes from the forking thread, whose progress the teardown
+     * path does not control, so waiting for it would leave this park outside
+     * the bounded-wake guarantee. thread_wake_exit_waiters broadcasts
+     * fork_cond after the flag is set; the caller's run loop re-checks
+     * proc_exit_group_requested and exits.
+     */
+    while (fork_quiesce_active && !proc_exit_group_requested())
         pthread_cond_wait(&fork_cond, &thread_lock);
 
     pthread_mutex_unlock(&thread_lock);
     return 1;
+}
+
+void thread_wake_exit_waiters(void)
+{
+    pthread_mutex_lock(&thread_lock);
+
+    /* Fork barrier: siblings parked in thread_fork_barrier_check. Their wait
+     * loop re-checks proc_exit_group_requested on wake.
+     */
+    pthread_cond_broadcast(&fork_cond);
+
+    /* Ptrace parks: tracers blocked in thread_ptrace_wait (ptrace_cond) and
+     * tracees blocked in thread_ptrace_stop (resume_cond). Scan every slot
+     * with live condvars, not just active ones: a tracer may still be parked
+     * on a slot whose thread was deactivated. ptrace_conds_inited only
+     * transitions under thread_lock with ptrace_waiters == 0, so broadcasting
+     * here never touches a destroyed condvar.
+     */
+    THREAD_FOR_EACH (t) {
+        if (!t->ptrace_conds_inited)
+            continue;
+        pthread_cond_broadcast(&t->ptrace_cond);
+        pthread_cond_broadcast(&t->resume_cond);
+    }
+
+    pthread_mutex_unlock(&thread_lock);
 }
 
 /* Ptrace helpers. */
@@ -1037,8 +1080,13 @@ int thread_ptrace_stop(thread_entry_t *t, int sig)
     /* Wake the tracer (blocked in thread_ptrace_wait) */
     pthread_cond_broadcast(&t->ptrace_cond);
 
-    /* Block until tracer calls PTRACE_CONT */
-    while (t->ptrace_stopped)
+    /* Block until tracer calls PTRACE_CONT. Bail out on exit_group: only the
+     * tracer signals resume_cond, and a tracer that exits (or calls
+     * exit_group itself) will never CONT this stop. thread_wake_exit_waiters
+     * broadcasts resume_cond; returning 0 sends the caller back to its run
+     * loop, which re-checks proc_exit_group_requested.
+     */
+    while (t->ptrace_stopped && !proc_exit_group_requested())
         pthread_cond_wait(&t->resume_cond, &thread_lock);
 
     /* Apply register changes if tracer wrote via SETREGSET */
@@ -1093,6 +1141,16 @@ int64_t thread_ptrace_wait(int64_t tracer_tid,
     pthread_mutex_lock(&thread_lock);
 
     for (;;) {
+        /* exit_group teardown: the stop/exit notifications that would signal
+         * ptrace_cond stop arriving once workers are being torn down. Return 0
+         * ("no matching children") so the caller falls through and its
+         * blocking paths re-check proc_exit_group_requested.
+         */
+        if (proc_exit_group_requested()) {
+            pthread_mutex_unlock(&thread_lock);
+            return 0;
+        }
+
         bool found_any = false; /* Any waitable children at all? */
 
         THREAD_FOR_EACH (t) {

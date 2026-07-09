@@ -909,6 +909,12 @@ static int64_t sc_exit_group(guest_t *g,
     proc_request_exit_group((int) x0);
     wakeup_pipe_signal();
     thread_for_each(thread_force_exit_cb, NULL);
+    /* Workers parked on internal condvars (fork barrier, ptrace stop/wait)
+     * see neither the pipe nor the vCPU kick; broadcast so they re-check the
+     * exit-group flag and terminate before the authoritative join in main()
+     * (or guest_destroy, for the forked-child path) gives up on them.
+     */
+    thread_wake_exit_waiters();
     return SC_EXIT_SENTINEL | ((int) x0 & 0xFF);
 }
 

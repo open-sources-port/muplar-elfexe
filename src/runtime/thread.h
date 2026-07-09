@@ -323,6 +323,17 @@ void thread_destroy_all_vcpus(void);
  */
 void thread_interrupt_all(void);
 
+/* Wake workers parked on internal condvars (fork barrier, ptrace stop/wait)
+ * so exit_group teardown reaches them within a bounded time. hv_vcpus_exit
+ * only interrupts threads inside hv_vcpu_run, and the wakeup pipe / futex
+ * interrupt only cover guest syscall waits; a thread parked on fork_cond,
+ * ptrace_cond, or resume_cond would otherwise sleep past the join cap in
+ * thread_join_workers and still be live when guest memory is unmapped.
+ * Callers must set the exit-group flag (proc_request_exit_group) BEFORE
+ * calling this so woken waiters observe it when they re-check.
+ */
+void thread_wake_exit_waiters(void);
+
 /* Check if any active thread has sigbit unblocked in its signal mask. Uses
  * relaxed reads on per-thread blocked fields; false positives (stale blocked=0)
  * cause a harmless spurious interrupt; false negatives (stale blocked=1) are

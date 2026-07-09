@@ -1288,6 +1288,11 @@ static void *vm_clone_thread_run(void *arg)
          * harmless no-op.
          */
         thread_interrupt_all();
+        /* thread_interrupt_all only reaches threads inside hv_vcpu_run.
+         * Peers parked on fork_cond or another slot's ptrace_cond/resume_cond
+         * see neither the vCPU kick nor this exit, so broadcast separately.
+         */
+        thread_wake_exit_waiters();
     }
 
     hv_vcpu_destroy(vcpu);

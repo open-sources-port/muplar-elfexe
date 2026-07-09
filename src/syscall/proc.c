@@ -1107,6 +1107,16 @@ int64_t sys_wait4(guest_t *g,
                 return 0;
             }
 
+            /* exit_group teardown: stop re-arming the wait. The 100ms quantum
+             * below bounds how stale this check can be, mirroring the futex
+             * wait quanta. The errno is never guest-visible: the run loop
+             * breaks on the exit-group flag before returning to the guest.
+             */
+            if (proc_exit_group_requested()) {
+                pthread_mutex_unlock(&pid_lock);
+                return -LINUX_EINTR;
+            }
+
             /* Blocking mode: no child exited yet. Wait on condvar for a child
              * exit notification (signaled by proc_mark_child_exited). Use
              * timedwait with 100ms timeout as a safety net; the condvar handles
