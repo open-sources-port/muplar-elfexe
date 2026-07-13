@@ -353,6 +353,8 @@ SC_FORWARD(sc_rt_sigprocmask, signal_rt_sigprocmask(g, (int) x0, x1, x2, x3))
 SC_FORWARD(sc_sigaltstack,    signal_sigaltstack(g, x0, x1))
 SC_FORWARD(sc_rt_sigsuspend,  signal_rt_sigsuspend(g, x0, x1))
 SC_FORWARD(sc_rt_sigpending,  signal_rt_sigpending(g, x0, x1))
+SC_FORWARD(sc_rt_sigtimedwait,
+           signal_rt_sigtimedwait(g, x0, x1, x2, x3))
 
 /* System info */
 SC_FORWARD(sc_uname,     sys_uname(g, x0))

@@ -1332,7 +1332,189 @@ int64_t signal_rt_sigpending(guest_t *g, uint64_t set_gva, uint64_t sigsetsize)
     return 0;
 }
 
-/* sigaltstack. */
+/* rt_sigtimedwait. */
+
+/* Try to consume one signal from the set under sig_lock.
+ * Returns the signal number if one was found and dequeued, 0 otherwise.
+ * Populates *info_out with the queued siginfo metadata.
+ */
+static int sigtimedwait_try_dequeue(uint64_t mask, signal_rt_info_t *info_out)
+{
+    pthread_mutex_lock(&sig_lock);
+
+    /* Private (thread-directed) set first, then shared (process-directed),
+     * matching Linux dequeue_signal() priority.
+     */
+    signal_pending_t *tp = current_thread ? &current_thread->tpending : NULL;
+    uint64_t thread_m = tp ? (tp->pending & mask) : 0;
+    uint64_t shared_m = sig_state.shared.pending & mask;
+
+    if ((thread_m | shared_m) == 0) {
+        pthread_mutex_unlock(&sig_lock);
+        return 0;
+    }
+
+    int signum;
+    signal_pending_t *src;
+    if (thread_m) {
+        signum = bit_ctz64(thread_m) + 1;
+        src = tp;
+    } else {
+        signum = bit_ctz64(shared_m) + 1;
+        src = &sig_state.shared;
+    }
+
+    /* Dequeue: same logic as signal_deliver. */
+    if (signum >= LINUX_SIGRTMIN) {
+        signal_rt_dequeue_locked(src, signum, info_out);
+    } else {
+        *info_out = signal_standard_peek_locked(src, signum);
+        src->std_info_valid[signum - 1] = false;
+        src->pending &= ~sig_bit(signum);
+    }
+    refresh_pending_hint_locked();
+
+    pthread_mutex_unlock(&sig_lock);
+    return signum;
+}
+
+int64_t signal_rt_sigtimedwait(guest_t *g,
+                               uint64_t set_gva,
+                               uint64_t info_gva,
+                               uint64_t timeout_gva,
+                               uint64_t sigsetsize)
+{
+    if (sigsetsize != 8)
+        return -LINUX_EINVAL;
+    if (!set_gva)
+        return -LINUX_EFAULT;
+
+    uint64_t mask;
+    if (guest_read_small(g, set_gva, &mask, sizeof(mask)) < 0)
+        return -LINUX_EFAULT;
+
+    /* SIGKILL and SIGSTOP cannot be caught or waited for. Remove them from
+     * the wait mask silently, matching Linux do_sigtimedwait behavior.
+     */
+    uint64_t unmaskable = sig_bit(LINUX_SIGKILL) | sig_bit(LINUX_SIGSTOP);
+    mask &= ~unmaskable;
+
+    /* Determine deadline: NULL timeout_gva means block indefinitely.
+     * Zero timespec means poll once.
+     */
+    bool has_timeout = (timeout_gva != 0);
+    int64_t remaining_ns = 0;
+
+    if (has_timeout) {
+        linux_timespec_t lts;
+        if (guest_read_small(g, timeout_gva, &lts, sizeof(lts)) < 0)
+            return -LINUX_EFAULT;
+        /* Negative tv_sec is invalid (matches kernel hrtimer validation). */
+        if (lts.tv_sec < 0 || lts.tv_nsec < 0 || lts.tv_nsec >= 1000000000LL)
+            return -LINUX_EINVAL;
+        /* Saturate to INT64_MAX to avoid overflow. */
+        if (lts.tv_sec > (INT64_MAX / 1000000000LL) ||
+            (lts.tv_sec == (INT64_MAX / 1000000000LL) &&
+             lts.tv_nsec > (INT64_MAX % 1000000000LL))) {
+            remaining_ns = INT64_MAX;
+        } else {
+            remaining_ns = lts.tv_sec * 1000000000LL + lts.tv_nsec;
+        }
+    }
+
+    /* Poll/wait loop. */
+#define SIGWAIT_CHUNK_NS 1000000LL /* 1ms chunks */
+
+    while (1) {
+        signal_rt_info_t info;
+        int signum = sigtimedwait_try_dequeue(mask, &info);
+        if (signum > 0) {
+            /* Populate guest siginfo_t if the caller wants it. */
+            if (info_gva) {
+                linux_siginfo_t si;
+                memset(&si, 0, sizeof(si));
+                si.si_signo = signum;
+                si.si_code = info.si_code;
+                si.si_pid = info.si_pid;
+                si.si_uid = (int32_t) info.si_uid;
+                si.si_value = info.si_ptr;
+                if (guest_write_small(g, info_gva, &si, sizeof(si)) < 0)
+                    return -LINUX_EFAULT;
+            }
+            return signum;
+        }
+
+        /* For a zero timeout (poll-once), bail immediately. */
+        if (has_timeout && remaining_ns <= 0)
+            return -LINUX_EAGAIN;
+
+        /* Exit if the process is tearing down. */
+        if (proc_exit_group_requested())
+            return -LINUX_EINTR;
+
+        /* If a non-waited, guest-visible signal is pending, return -EINTR.
+         * Mirror signal_pending_interruption()'s disposition filter: SIG_IGN
+         * signals and signals whose default disposition is ignore, stop, or
+         * continue are silently discarded by signal_deliver and must NOT
+         * interrupt the wait.  Only a signal with a real handler, or a SIG_DFL
+         * TERM/CORE disposition, justifies waking the caller with -EINTR.
+         */
+        pthread_mutex_lock(&sig_lock);
+        uint64_t *blocked = thread_blocked_ptr();
+        uint64_t candidates = self_pending_locked() & ~*blocked & ~mask;
+        bool interrupt = false;
+        uint64_t bits = candidates;
+        while (bits) {
+            int idx = bit_ctz64(bits);
+            bits &= bits - 1;
+            if (!RANGE_CHECK(idx, 0, LINUX_NSIG)) {
+                interrupt = true;
+                break;
+            }
+            linux_sigaction_t *act = &sig_state.actions[idx];
+            if (act->sa_handler == LINUX_SIG_IGN)
+                continue;
+            if (act->sa_handler == LINUX_SIG_DFL) {
+                sig_disposition_t disp = signal_default_disposition(idx + 1);
+                if (disp == SIG_DISP_IGN || disp == SIG_DISP_CONT ||
+                    disp == SIG_DISP_STOP)
+                    continue;
+            }
+            interrupt = true;
+            break;
+        }
+        pthread_mutex_unlock(&sig_lock);
+        if (interrupt)
+            return -LINUX_EINTR;
+
+        /* Sleep one chunk, then recheck. */
+        int64_t sleep_ns =
+            has_timeout ? (remaining_ns < SIGWAIT_CHUNK_NS ? remaining_ns
+                                                           : SIGWAIT_CHUNK_NS)
+                        : SIGWAIT_CHUNK_NS;
+        struct timespec req = {
+            .tv_sec = sleep_ns / 1000000000LL,
+            .tv_nsec = sleep_ns % 1000000000LL,
+        };
+        struct timespec rem = {0};
+        if (nanosleep(&req, &rem) < 0) {
+            /* Host EINTR: account for time already slept. */
+            int64_t slept =
+                sleep_ns - (rem.tv_sec * 1000000000LL + rem.tv_nsec);
+            if (slept < 0)
+                slept = 0;
+            if (has_timeout)
+                remaining_ns -= slept;
+            /* Recheck immediately (will catch deliverable signal). */
+            continue;
+        }
+        if (has_timeout)
+            remaining_ns -= sleep_ns;
+    }
+
+#undef SIGWAIT_CHUNK_NS
+}
+
 
 int64_t signal_sigaltstack(guest_t *g, uint64_t ss_gva, uint64_t old_ss_gva)
 {

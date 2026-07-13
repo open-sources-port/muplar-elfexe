@@ -212,6 +212,11 @@ $(BUILD_DIR)/test-tgkill-directed: tests/test-tgkill-directed.c | $(BUILD_DIR)
 	@echo "  CROSS   $< (with -lpthread)"
 	$(Q)$(CROSS_COMPILE)gcc -D_GNU_SOURCE -static -O2 -o $@ $< -lpthread
 
+# test-sigtimedwait uses a sender pthread to verify thread-directed waits.
+$(BUILD_DIR)/test-sigtimedwait: tests/test-sigtimedwait.c | $(BUILD_DIR)
+	@echo "  CROSS   $< (with -lpthread)"
+	$(Q)$(CROSS_COMPILE)gcc -D_GNU_SOURCE -static -O2 -o $@ $< -lpthread
+
 # test-osync-requeue drives a raw FUTEX_REQUEUE against a plain-FUTEX_WAIT
 # waiter (musl unlock_requeue pattern) to guard the os_sync wake-at-source
 # degradation; needs -lpthread.

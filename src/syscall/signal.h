@@ -361,6 +361,20 @@ int64_t signal_rt_sigsuspend(guest_t *g,
 /* Handle rt_sigpending (SYS 136). */
 int64_t signal_rt_sigpending(guest_t *g, uint64_t set_gva, uint64_t sigsetsize);
 
+/* Handle rt_sigtimedwait (SYS 137).
+ * Synchronously consume a pending signal whose number is in *set*.
+ * info_gva (may be 0): if non-zero, populate the guest siginfo_t there.
+ * timeout_gva (may be 0): if zero, block indefinitely; otherwise block for
+ * at most the specified duration.  Returns the signal number on success,
+ * -EAGAIN if the timeout expired with no matching signal, or -EINTR if an
+ * unrelated signal arrived while waiting.
+ */
+int64_t signal_rt_sigtimedwait(guest_t *g,
+                               uint64_t set_gva,
+                               uint64_t info_gva,
+                               uint64_t timeout_gva,
+                               uint64_t sigsetsize);
+
 /* Handle sigaltstack (SYS 132). ss_gva is pointer to new stack_t (or 0),
  * old_ss_gva is pointer to receive current stack_t (or 0).
  */

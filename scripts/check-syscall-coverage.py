@@ -25,6 +25,7 @@ ALIASES: dict[str, set[str]] = {
     "eventfd2": {"eventfd"},
     "rt_sigaction": {"sigaction"},
     "rt_sigprocmask": {"sigprocmask"},
+    "rt_sigtimedwait": {"sigwait", "sigwaitinfo", "sigtimedwait"},
     "signalfd4": {"signalfd"},
 }
 
