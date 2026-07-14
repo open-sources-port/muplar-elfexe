@@ -778,6 +778,12 @@ run_unit_tests()
     printf "\nVirtual chown overlay\n"
     test_rc "$runner" "test-chown-overlay" 0 "$bindir/test-chown-overlay"
 
+    printf "\nfchownat AT_EMPTY_PATH\n"
+    test_rc "$runner" "test-fchownat-empty-path" 0 "$bindir/test-fchownat-empty-path"
+
+    printf "\nfchmodat2 AT_EMPTY_PATH\n"
+    test_rc "$runner" "test-fchmodat-empty-path" 0 "$bindir/test-fchmodat-empty-path"
+
     printf "\nX11 raw protocol\n"
     test_check "$runner" "test-x11" "0 failed" "$bindir/test-x11"
 }
@@ -1208,8 +1214,8 @@ run_suite()
 # observed counts diverge. apple-unknown is the fallback row for SoC strings the
 # detector does not recognize yet.
 EXPECTED_BASELINES=(
-    "elfuse-aarch64|235|0"
-    "qemu-aarch64|215|0"
+    "elfuse-aarch64|237|0"
+    "qemu-aarch64|217|0"
     "elfuse-x86_64:apple-m1-m2|71|0"
     "elfuse-x86_64:apple-m3-plus|71|0"
     "elfuse-x86_64:apple-unknown|71|0"

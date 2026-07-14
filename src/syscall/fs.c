@@ -2410,16 +2410,59 @@ int64_t sys_fchmodat(guest_t *g,
                      int flags)
 {
     char path[LINUX_PATH_MAX];
-    if (!validate_at_flags(flags, LINUX_AT_SYMLINK_NOFOLLOW))
+    if (!validate_at_flags(flags,
+                           LINUX_AT_SYMLINK_NOFOLLOW | LINUX_AT_EMPTY_PATH))
         return -LINUX_EINVAL;
+    if (guest_read_str(g, path_gva, path, sizeof(path)) < 0)
+        return -LINUX_EFAULT;
+
+    /* AT_EMPTY_PATH with an empty path chmods dirfd itself; see the identical
+     * branch in sys_fchownat above for the O_PATH/AT_FDCWD rationale. Neither
+     * sub-case below goes through path_translate_at, so the FUSE and /proc
+     * interception normally applied by reject_unsupported_fuse_path_op and
+     * stat_at_path's proc_intercept_stat has to be checked by hand here.
+     */
+    if ((flags & LINUX_AT_EMPTY_PATH) && path[0] == '\0') {
+        if (dirfd == LINUX_AT_FDCWD) {
+            char fuse_buf[LINUX_PATH_MAX];
+            int fuse_rc = fuse_resolve_at_path(LINUX_AT_FDCWD, ".", fuse_buf,
+                                               sizeof(fuse_buf));
+            if (fuse_rc < 0)
+                return linux_errno();
+            if (fuse_rc > 0)
+                return -LINUX_ENOSYS;
+            if (fchmodat(AT_FDCWD, ".", mode, translate_at_flags(flags)) < 0)
+                return linux_errno();
+            return 0;
+        }
+
+        fd_entry_t snap;
+        if (!fd_snapshot(dirfd, &snap))
+            return -LINUX_EBADF;
+        if (snap.type == FD_FUSE_DEV || snap.type == FD_FUSE_FILE ||
+            snap.type == FD_FUSE_DIR)
+            return -LINUX_ENOSYS;
+        if (snap.type == FD_PATH && snap.proc_path[0] != '\0')
+            return -LINUX_EPERM;
+
+        host_fd_ref_t ref;
+        if (host_dirfd_ref_open(dirfd, &ref) < 0)
+            return -LINUX_EBADF;
+        if (fchmod(ref.fd, mode) < 0) {
+            host_fd_ref_close(&ref);
+            return linux_errno();
+        }
+        host_fd_ref_close(&ref);
+        return 0;
+    }
+
     path_translation_t tx;
-    int64_t rc = read_translated_path(
-        g, dirfd, path_gva,
-        (flags & LINUX_AT_SYMLINK_NOFOLLOW) ? PATH_TR_NOFOLLOW : PATH_TR_NONE,
-        path, &tx);
-    if (rc < 0)
-        return rc;
-    rc = reject_unsupported_fuse_path_op(&tx);
+    if (path_translate_at(dirfd, path,
+                          (flags & LINUX_AT_SYMLINK_NOFOLLOW) ? PATH_TR_NOFOLLOW
+                                                              : PATH_TR_NONE,
+                          &tx) < 0)
+        return linux_errno();
+    int64_t rc = reject_unsupported_fuse_path_op(&tx);
     if (rc != INT64_MIN)
         return rc;
 
@@ -2495,16 +2538,81 @@ int64_t sys_fchownat(guest_t *g,
                      int flags)
 {
     char path[LINUX_PATH_MAX];
-    if (!validate_at_flags(flags, LINUX_AT_SYMLINK_NOFOLLOW))
+    if (!validate_at_flags(flags,
+                           LINUX_AT_SYMLINK_NOFOLLOW | LINUX_AT_EMPTY_PATH))
         return -LINUX_EINVAL;
+    if (guest_read_str(g, path_gva, path, sizeof(path)) < 0)
+        return -LINUX_EFAULT;
+
+    /* AT_EMPTY_PATH with an empty path chowns dirfd itself rather than a name
+     * beneath it. This is the only way to chown an O_PATH fd (plain fchown()
+     * rejects FD_PATH, matching Linux's EBADF there), so unlike the other
+     * *at() flag validation here it has to actually be handled, not just
+     * accepted. dirfd == AT_FDCWD resolves to the current directory, mirroring
+     * stat_at_path's identical AT_EMPTY_PATH branch in fs-stat.c. Neither
+     * sub-case below goes through path_translate_at, so FUSE and /proc
+     * interception has to be checked by hand, same as sys_fchmodat above.
+     */
+    if ((flags & LINUX_AT_EMPTY_PATH) && path[0] == '\0') {
+        if (dirfd == LINUX_AT_FDCWD) {
+            char fuse_buf[LINUX_PATH_MAX];
+            int fuse_rc = fuse_resolve_at_path(LINUX_AT_FDCWD, ".", fuse_buf,
+                                               sizeof(fuse_buf));
+            if (fuse_rc < 0)
+                return linux_errno();
+            if (fuse_rc > 0)
+                return -LINUX_ENOSYS;
+
+            /* Open "." once so fchown and the follow-up stat operate on the
+             * same descriptor. Resolving "." twice (fchownat then fstatat)
+             * would let a concurrent chdir() on another thread of this guest
+             * record the overlay against a different directory's dev/ino.
+             */
+            int fd = open(".", O_RDONLY);
+            if (fd < 0)
+                return linux_errno();
+            int host_rc = fchown(fd, owner, group);
+            int saved_errno = errno;
+            struct stat host_st;
+            const struct stat *st_ptr =
+                fstat(fd, &host_st) == 0 ? &host_st : NULL;
+            errno = saved_errno;
+            int64_t out = chown_result(host_rc, st_ptr, owner, group);
+            close_keep_errno(fd);
+            return out;
+        }
+
+        fd_entry_t snap;
+        if (!fd_snapshot(dirfd, &snap))
+            return -LINUX_EBADF;
+        if (snap.type == FD_FUSE_DEV || snap.type == FD_FUSE_FILE ||
+            snap.type == FD_FUSE_DIR)
+            return -LINUX_ENOSYS;
+        if (snap.type == FD_PATH && snap.proc_path[0] != '\0')
+            return -LINUX_EPERM;
+
+        host_fd_ref_t ref;
+        if (host_dirfd_ref_open(dirfd, &ref) < 0)
+            return -LINUX_EBADF;
+
+        int host_rc = fchown(ref.fd, owner, group);
+        int saved_errno = errno;
+        struct stat host_st;
+        const struct stat *st_ptr =
+            fstat(ref.fd, &host_st) == 0 ? &host_st : NULL;
+        errno = saved_errno;
+        int64_t out = chown_result(host_rc, st_ptr, owner, group);
+        host_fd_ref_close(&ref);
+        return out;
+    }
+
     path_translation_t tx;
-    int64_t rc = read_translated_path(
-        g, dirfd, path_gva,
-        (flags & LINUX_AT_SYMLINK_NOFOLLOW) ? PATH_TR_NOFOLLOW : PATH_TR_NONE,
-        path, &tx);
-    if (rc < 0)
-        return rc;
-    rc = reject_unsupported_fuse_path_op(&tx);
+    if (path_translate_at(dirfd, path,
+                          (flags & LINUX_AT_SYMLINK_NOFOLLOW) ? PATH_TR_NOFOLLOW
+                                                              : PATH_TR_NONE,
+                          &tx) < 0)
+        return linux_errno();
+    int64_t rc = reject_unsupported_fuse_path_op(&tx);
     if (rc != INT64_MIN)
         return rc;
 
