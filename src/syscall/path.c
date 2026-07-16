@@ -284,9 +284,7 @@ int path_translate_dirent_name(guest_fd_t dirfd,
     return 0;
 }
 
-static bool path_next_component(const char **pathp,
-                                const char **comp,
-                                size_t *len)
+bool path_next_component(const char **pathp, const char **comp, size_t *len)
 {
     const char *p = *pathp;
 
