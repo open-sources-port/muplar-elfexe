@@ -468,25 +468,6 @@ static const char *sidecar_lookup_token(const sidecar_index_t *index,
     return NULL;
 }
 
-static int sidecar_next_component(const char **pathp,
-                                  const char **comp,
-                                  size_t *len)
-{
-    const char *p = *pathp;
-    while (*p == '/')
-        p++;
-    if (*p == '\0') {
-        *pathp = p;
-        return 0;
-    }
-    *comp = p;
-    while (*p != '\0' && *p != '/')
-        p++;
-    *len = (size_t) (p - *comp);
-    *pathp = p;
-    return 1;
-}
-
 static int sidecar_append_component(char *out,
                                     size_t outsz,
                                     size_t *len_io,
@@ -693,7 +674,7 @@ int sidecar_translate_lookup_at(guest_fd_t dirfd,
     size_t out_len = strlen(out);
     const char *comp;
     size_t comp_len;
-    while (sidecar_next_component(&scan, &comp, &comp_len)) {
+    while (path_next_component(&scan, &comp, &comp_len)) {
         char guest_comp[NAME_MAX + 1];
         if (comp_len >= sizeof(guest_comp)) {
             close(cur_fd);
@@ -826,7 +807,7 @@ int sidecar_translate_lookup_at(guest_fd_t dirfd,
              * components translate to themselves; the caller's syscall then
              * reports ENOENT against the translated path.
              */
-            while (sidecar_next_component(&scan, &comp, &comp_len)) {
+            while (path_next_component(&scan, &comp, &comp_len)) {
                 char rest_comp[NAME_MAX + 1];
                 if (comp_len >= sizeof(rest_comp)) {
                     errno = ENAMETOOLONG;

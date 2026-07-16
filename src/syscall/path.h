@@ -32,6 +32,13 @@ typedef struct {
     char host_buf[LINUX_PATH_MAX];
 } path_translation_t;
 
+/* Advance *pathp to the next '/'-separated component, skipping empty segments
+ * from repeated slashes. Returns true with the component (not NUL-terminated)
+ * reported through comp and len, leaving *pathp at its end; returns false once
+ * only slashes or the terminating NUL remain.
+ */
+bool path_next_component(const char **pathp, const char **comp, size_t *len);
+
 bool path_might_use_open_intercept(const char *path);
 bool path_might_use_stat_intercept(const char *path);
 int path_check_intercept_access(const struct stat *st, int mode, int flags);
