@@ -194,6 +194,9 @@
 /* network batch I/O */
 #define SYS_recvmmsg 243
 #define SYS_sendmmsg 269
+/* cross-process memory */
+#define SYS_process_vm_readv 270
+#define SYS_process_vm_writev 271
 /* file advisory */
 #define SYS_fadvise64 223
 /* vectored positioned I/O */

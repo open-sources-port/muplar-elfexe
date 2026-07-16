@@ -629,6 +629,7 @@ run_unit_tests()
     test_rc "$runner" "test-ofd-lock" 0 "$bindir/test-ofd-lock"
     test_rc "$runner" "test-times" 0 "$bindir/test-times"
     test_rc "$runner" "test-syscall-smoke" 0 "$bindir/test-syscall-smoke"
+    test_rc "$runner" "test-process-vm" 0 "$bindir/test-process-vm"
     test_rc "$runner" "test-vdso" 0 "$bindir/test-vdso"
 
     printf "\nI/O subsystem\n"

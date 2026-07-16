@@ -230,6 +230,8 @@ SC_FORWARD(sc_pwritev,   sys_pwritev(g, (int) x0, x1, (int) x2, (int64_t) x3))
  */
 SC_FORWARD(sc_preadv2,   sys_preadv2(g, (int) x0, x1, (int) x2, (int64_t) x3, (int) x5))
 SC_FORWARD(sc_pwritev2,  sys_pwritev2(g, (int) x0, x1, (int) x2, (int64_t) x3, (int) x5))
+SC_FORWARD(sc_process_vm_readv, sys_process_vm_readv(g, (int64_t) x0, x1, x2, x3, x4, x5))
+SC_FORWARD(sc_process_vm_writev, sys_process_vm_writev(g, (int64_t) x0, x1, x2, x3, x4, x5))
 SC_FORWARD(sc_sendfile,  sys_sendfile(g, (int) x0, (int) x1, x2, x3))
 SC_FORWARD(sc_splice,    sys_splice(g, (int) x0, x1, (int) x2, x3, (size_t) x4, (unsigned int) x5))
 SC_FORWARD(sc_vmsplice,  sys_vmsplice(g, (int) x0, x1, (unsigned long) x2, (unsigned int) x3))

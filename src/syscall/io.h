@@ -75,6 +75,20 @@ int64_t sys_pwritev2(guest_t *g,
                      int iovcnt,
                      int64_t offset,
                      int flags);
+int64_t sys_process_vm_readv(guest_t *g,
+                             int64_t pid,
+                             uint64_t local_iov_gva,
+                             uint64_t local_iovcnt,
+                             uint64_t remote_iov_gva,
+                             uint64_t remote_iovcnt,
+                             uint64_t flags);
+int64_t sys_process_vm_writev(guest_t *g,
+                              int64_t pid,
+                              uint64_t local_iov_gva,
+                              uint64_t local_iovcnt,
+                              uint64_t remote_iov_gva,
+                              uint64_t remote_iovcnt,
+                              uint64_t flags);
 
 /* terminal I/O */
 int64_t sys_ioctl(guest_t *g, int fd, uint64_t request, uint64_t arg);

@@ -1730,6 +1730,168 @@ int64_t sys_pwritev2(guest_t *g,
     return r;
 }
 
+static int64_t process_vm_import_iov(guest_t *g,
+                                     uint64_t iov_gva,
+                                     uint64_t iovcnt,
+                                     linux_iovec_t **iov_out)
+{
+    *iov_out = NULL;
+
+    if (iovcnt > SYSCALL_IOV_MAX)
+        return -LINUX_EINVAL;
+    if (iovcnt == 0)
+        return 0;
+    if (iovcnt > SIZE_MAX / sizeof(linux_iovec_t))
+        return -LINUX_EINVAL;
+
+    size_t bytes = (size_t) iovcnt * sizeof(linux_iovec_t);
+    linux_iovec_t *iov = malloc(bytes);
+    if (!iov)
+        return -LINUX_ENOMEM;
+    if (guest_read(g, iov_gva, iov, bytes) < 0) {
+        free(iov);
+        return -LINUX_EFAULT;
+    }
+
+    uint64_t total = 0;
+    for (uint64_t i = 0; i < iovcnt; i++) {
+        if (iov[i].iov_len > (uint64_t) SSIZE_MAX ||
+            total > (uint64_t) SSIZE_MAX - iov[i].iov_len) {
+            free(iov);
+            return -LINUX_EINVAL;
+        }
+        total += iov[i].iov_len;
+    }
+
+    *iov_out = iov;
+    return 0;
+}
+
+static void process_vm_advance_iov(linux_iovec_t *iov,
+                                   uint64_t iovcnt,
+                                   uint64_t *idx,
+                                   uint64_t *off)
+{
+    while (*idx < iovcnt && *off >= iov[*idx].iov_len) {
+        *off = 0;
+        (*idx)++;
+    }
+}
+
+static int64_t process_vm_copy(guest_t *g,
+                               linux_iovec_t *local_iov,
+                               uint64_t local_iovcnt,
+                               linux_iovec_t *remote_iov,
+                               uint64_t remote_iovcnt,
+                               bool write_remote)
+{
+    uint64_t li = 0, ri = 0, lo = 0, ro = 0;
+    uint64_t copied = 0;
+
+    for (;;) {
+        process_vm_advance_iov(local_iov, local_iovcnt, &li, &lo);
+        process_vm_advance_iov(remote_iov, remote_iovcnt, &ri, &ro);
+        if (li >= local_iovcnt || ri >= remote_iovcnt)
+            return (int64_t) copied;
+
+        uint64_t local_left = local_iov[li].iov_len - lo;
+        uint64_t remote_left = remote_iov[ri].iov_len - ro;
+        uint64_t len = local_left < remote_left ? local_left : remote_left;
+        if (len == 0)
+            continue;
+
+        if (local_iov[li].iov_base > UINT64_MAX - lo ||
+            remote_iov[ri].iov_base > UINT64_MAX - ro)
+            return copied > 0 ? (int64_t) copied : -LINUX_EFAULT;
+
+        uint64_t src_gva = write_remote ? local_iov[li].iov_base + lo
+                                        : remote_iov[ri].iov_base + ro;
+        uint64_t dst_gva = write_remote ? remote_iov[ri].iov_base + ro
+                                        : local_iov[li].iov_base + lo;
+
+        uint64_t src_avail = 0, dst_avail = 0;
+        void *src = guest_ptr_bound(g, src_gva, &src_avail, MEM_PERM_R, len);
+        void *dst = guest_ptr_bound(g, dst_gva, &dst_avail, MEM_PERM_W, len);
+        if (!src || !dst)
+            return copied > 0 ? (int64_t) copied : -LINUX_EFAULT;
+
+        uint64_t chunk = len;
+        if (chunk > src_avail)
+            chunk = src_avail;
+        if (chunk > dst_avail)
+            chunk = dst_avail;
+        if (chunk == 0)
+            return copied > 0 ? (int64_t) copied : -LINUX_EFAULT;
+
+        memmove(dst, src, (size_t) chunk);
+        copied += chunk;
+        lo += chunk;
+        ro += chunk;
+    }
+}
+
+static int64_t sys_process_vm(guest_t *g,
+                              int64_t pid,
+                              uint64_t local_iov_gva,
+                              uint64_t local_iovcnt,
+                              uint64_t remote_iov_gva,
+                              uint64_t remote_iovcnt,
+                              uint64_t flags,
+                              bool write_remote)
+{
+    if (flags != 0)
+        return -LINUX_EINVAL;
+    int32_t target_pid = (int32_t) pid;
+    if (target_pid <= 0)
+        return -LINUX_ESRCH;
+    if (target_pid != (int32_t) proc_get_pid() && !thread_find(target_pid))
+        return -LINUX_ESRCH;
+    if (local_iovcnt == 0 || remote_iovcnt == 0)
+        return 0;
+
+    linux_iovec_t *local_iov = NULL;
+    linux_iovec_t *remote_iov = NULL;
+    int64_t err =
+        process_vm_import_iov(g, local_iov_gva, local_iovcnt, &local_iov);
+    if (err < 0)
+        return err;
+    err = process_vm_import_iov(g, remote_iov_gva, remote_iovcnt, &remote_iov);
+    if (err < 0) {
+        free(local_iov);
+        return err;
+    }
+
+    int64_t ret = process_vm_copy(g, local_iov, local_iovcnt, remote_iov,
+                                  remote_iovcnt, write_remote);
+    free(remote_iov);
+    free(local_iov);
+    return ret;
+}
+
+int64_t sys_process_vm_readv(guest_t *g,
+                             int64_t pid,
+                             uint64_t local_iov_gva,
+                             uint64_t local_iovcnt,
+                             uint64_t remote_iov_gva,
+                             uint64_t remote_iovcnt,
+                             uint64_t flags)
+{
+    return sys_process_vm(g, pid, local_iov_gva, local_iovcnt, remote_iov_gva,
+                          remote_iovcnt, flags, false);
+}
+
+int64_t sys_process_vm_writev(guest_t *g,
+                              int64_t pid,
+                              uint64_t local_iov_gva,
+                              uint64_t local_iovcnt,
+                              uint64_t remote_iov_gva,
+                              uint64_t remote_iovcnt,
+                              uint64_t flags)
+{
+    return sys_process_vm(g, pid, local_iov_gva, local_iovcnt, remote_iov_gva,
+                          remote_iovcnt, flags, true);
+}
+
 /* terminal I/O. */
 
 int64_t sys_ioctl(guest_t *g, int fd, uint64_t request, uint64_t arg)
