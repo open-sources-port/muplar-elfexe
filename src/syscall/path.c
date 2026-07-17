@@ -879,6 +879,10 @@ static int dirfd_guest_base_path(guest_fd_t dirfd, char *out, size_t outsz)
         return -1;
     }
     if (snap.proc_path[0] != '\0') {
+        if (snap.type != FD_DIR) {
+            errno = ENOTDIR;
+            return -1;
+        }
         size_t len = str_copy_trunc(out, snap.proc_path, outsz);
         if (len >= outsz) {
             errno = ENAMETOOLONG;

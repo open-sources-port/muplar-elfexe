@@ -381,11 +381,13 @@ static void fill_proc_statfs(linux_statfs_t *lin)
     lin->f_frsize = 4096;
 }
 
-int64_t sys_statfs(guest_t *g, uint64_t path_gva, uint64_t buf_gva)
+static int64_t sys_statfs_impl(guest_t *g,
+                               const char *path,
+                               uint64_t buf_gva,
+                               int depth)
 {
-    char path[LINUX_PATH_MAX];
-    if (guest_read_str_small(g, path_gva, path, sizeof(path)) < 0)
-        return -LINUX_EFAULT;
+    if (depth > 40)
+        return -LINUX_ELOOP;
 
     path_translation_t tx;
     if (path_translate_at(LINUX_AT_FDCWD, path, PATH_TR_NONE, &tx) < 0)
@@ -394,11 +396,37 @@ int64_t sys_statfs(guest_t *g, uint64_t path_gva, uint64_t buf_gva)
         return -LINUX_ENOSYS;
 
     if (statfs_path_is_proc(tx.intercept_path)) {
-        linux_statfs_t lin_st;
-        fill_proc_statfs(&lin_st);
-        if (guest_write_small(g, buf_gva, &lin_st, sizeof(lin_st)) < 0)
-            return -LINUX_EFAULT;
-        return 0;
+        if (proc_path_is_symlink(tx.intercept_path)) {
+            char link[LINUX_PATH_MAX];
+            int len = proc_intercept_readlink(tx.intercept_path, link,
+                                              sizeof(link) - 1);
+            if (len < 0)
+                return linux_errno();
+            link[len] = '\0';
+            return sys_statfs_impl(g, link, buf_gva, depth + 1);
+        }
+
+        struct stat mac_st;
+        int intercepted = proc_intercept_stat(tx.intercept_path, &mac_st);
+        if (intercepted == 0) {
+            linux_statfs_t lin_st;
+            fill_proc_statfs(&lin_st);
+            if (guest_write_small(g, buf_gva, &lin_st, sizeof(lin_st)) < 0)
+                return -LINUX_EFAULT;
+            return 0;
+        }
+        if (intercepted == -1)
+            return linux_errno();
+
+        /* It might be /proc itself or a host-backed file/directory under /proc
+         */
+        if (stat(tx.host_path, &mac_st) == 0) {
+            linux_statfs_t lin_st;
+            fill_proc_statfs(&lin_st);
+            if (guest_write_small(g, buf_gva, &lin_st, sizeof(lin_st)) < 0)
+                return -LINUX_EFAULT;
+            return 0;
+        }
     }
 
     struct statfs mac_st;
@@ -411,6 +439,15 @@ int64_t sys_statfs(guest_t *g, uint64_t path_gva, uint64_t buf_gva)
         return -LINUX_EFAULT;
 
     return 0;
+}
+
+int64_t sys_statfs(guest_t *g, uint64_t path_gva, uint64_t buf_gva)
+{
+    char path[LINUX_PATH_MAX];
+    if (guest_read_str_small(g, path_gva, path, sizeof(path)) < 0)
+        return -LINUX_EFAULT;
+
+    return sys_statfs_impl(g, path, buf_gva, 0);
 }
 
 int64_t sys_fstatfs(guest_t *g, int fd, uint64_t buf_gva)

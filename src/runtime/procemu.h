@@ -45,16 +45,6 @@ int proc_intercept_readlink(const char *path, char *buf, size_t bufsiz);
  */
 int proc_intercept_stat(const char *path, struct stat *mac_st);
 
-/* Intercept statfs for /proc paths that would otherwise route through
- * proc_intercept_open purely to obtain filesystem-level info, forcing
- * allocation of scratch state (e.g. /proc/self/fd's per-open directory of
- * placeholder files, one per live guest fd) that statfs() has no use for.
- * Returns 0 if the filesystem info was synthesized (mac_st filled), or -2
- * (PROC_NOT_INTERCEPTED) if the path is not intercepted (fall through to the
- * normal open/fstatfs/close path).
- */
-int proc_intercept_statfs(const char *path, struct statfs *mac_st);
-
 /* Intercept writes to synthetic proc files that need stateful behavior.
  * Returns 1 if handled (with *written_out set), 0 if not intercepted, or -1 on
  * error with errno set.

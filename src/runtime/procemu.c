@@ -3436,38 +3436,6 @@ int proc_intercept_open(const guest_t *g,
     return PROC_NOT_INTERCEPTED;
 }
 
-int proc_intercept_statfs(const char *path, struct statfs *out)
-{
-    /* /proc/<our_pid>[/...] -> /proc/self[...], same alias as
-     * proc_intercept_open/proc_intercept_stat.
-     */
-    char alias[LINUX_PATH_MAX];
-    int aliased = proc_alias_self(path, alias, sizeof(alias));
-    if (aliased < 0)
-        return -1;
-    if (aliased > 0)
-        return proc_intercept_statfs(alias, out);
-
-    /* /proc/self/fd and /proc/self/fdinfo are the only /proc nodes whose open
-     * path allocates per-call scratch state: proc_open_fd_scratch mkdtemp's a
-     * fresh directory and creates one placeholder file per live guest fd on
-     * every single open, purely so getdents has something to enumerate. A
-     * plain statfs() never enumerates the directory, so paying for that
-     * allocation just to fstatfs() the result and immediately discard it is
-     * wasted work -- and once PROC_SCRATCH_DIRS_MAX untracked opens
-     * accumulate, the atexit cleanup no longer knows about further dirs and
-     * they leak in /tmp permanently.
-     *
-     * Every scratch dir (like every other synthetic /proc node) is created
-     * under /tmp, so statfs("/tmp") reports identical filesystem info without
-     * allocating anything.
-     */
-    if (strcmp(path, "/proc/self/fd") && strcmp(path, "/proc/self/fd/") &&
-        strcmp(path, "/proc/self/fdinfo") && strcmp(path, "/proc/self/fdinfo/"))
-        return PROC_NOT_INTERCEPTED;
-
-    return statfs("/tmp", out) < 0 ? -1 : 0;
-}
 
 int proc_intercept_stat(const char *path, struct stat *st)
 {

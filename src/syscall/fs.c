@@ -127,7 +127,7 @@ static const char *proc_stateful_file_path(const char *path)
     return NULL;
 }
 
-static bool proc_path_is_symlink(const char *path)
+bool proc_path_is_symlink(const char *path)
 {
     if (!path)
         return false;

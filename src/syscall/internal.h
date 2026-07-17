@@ -461,8 +461,8 @@ int64_t host_iov_prepare_msg(guest_t *g,
                              int required_perms,
                              host_iov_buf_t *buf);
 
-/* Release any heap spillover backing a host_iov_buf_t. Idempotent. */
 void host_iov_free(host_iov_buf_t *buf);
+bool proc_path_is_symlink(const char *path);
 
 /* Read a guest path string with small-buffer optimization.
  *

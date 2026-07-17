@@ -208,28 +208,35 @@ int main(void)
     TEST("statfs /proc");
     {
         struct statfs st;
-        if (statfs("/proc", &st) < 0)
+        if (statfs("/proc", &st) < 0) {
             FAIL("statfs failed");
-        else
-            PASS();
+        } else {
+            EXPECT_TRUE(st.f_type == 0x9fa0,
+                        "statfs /proc f_type not PROC_SUPER_MAGIC");
+        }
     }
 
     TEST("statfs /proc/ (trailing slash)");
     {
         struct statfs st;
-        if (statfs("/proc/", &st) < 0)
+        if (statfs("/proc/", &st) < 0) {
             FAIL("statfs failed");
-        else
-            PASS();
+        } else {
+            EXPECT_TRUE(st.f_type == 0x9fa0,
+                        "statfs /proc/ f_type not PROC_SUPER_MAGIC");
+        }
     }
 
     TEST("statfs /proc/self/cmdline");
     {
         struct statfs st;
-        if (statfs("/proc/self/cmdline", &st) < 0)
+        if (statfs("/proc/self/cmdline", &st) < 0) {
             FAIL("statfs failed");
-        else
-            PASS();
+        } else {
+            EXPECT_TRUE(
+                st.f_type == 0x9fa0,
+                "statfs /proc/self/cmdline f_type not PROC_SUPER_MAGIC");
+        }
     }
 
     TEST("statfs matches fstatfs for /proc/self/cmdline");
@@ -245,6 +252,36 @@ int main(void)
         } else {
             EXPECT_TRUE(path_st.f_type == fd_st.f_type,
                         "statfs/fstatfs f_type mismatch");
+            EXPECT_TRUE(path_st.f_type == 0x9fa0,
+                        "statfs f_type not PROC_SUPER_MAGIC");
+        }
+        if (fd >= 0)
+            close(fd);
+    }
+
+    TEST("statfs follows /proc symlinks");
+    {
+        struct statfs exe_st, fd_st;
+        int fd = open("/proc/self/exe", O_RDONLY);
+        if (fd < 0) {
+            FAIL("open /proc/self/exe failed");
+        } else if (statfs("/proc/self/exe", &exe_st) < 0) {
+            FAIL("statfs /proc/self/exe failed");
+        } else {
+            /* /proc/self/exe points to the host binary file, which resides on a
+             * real filesystem, not procfs. */
+            EXPECT_TRUE(exe_st.f_type != 0x9fa0,
+                        "statfs /proc/self/exe returned PROC_SUPER_MAGIC");
+
+            /* Build /proc/self/fd/N path */
+            char fd_path[64];
+            snprintf(fd_path, sizeof(fd_path), "/proc/self/fd/%d", fd);
+            if (statfs(fd_path, &fd_st) < 0) {
+                FAIL("statfs /proc/self/fd/N failed");
+            } else {
+                EXPECT_TRUE(fd_st.f_type != 0x9fa0,
+                            "statfs /proc/self/fd/N returned PROC_SUPER_MAGIC");
+            }
         }
         if (fd >= 0)
             close(fd);
