@@ -573,17 +573,6 @@ static int compute_fd_sha256(int fd, uint8_t digest[ROSETTAD_DIGEST_SIZE])
     return 0;
 }
 
-static void digest_to_hex(const uint8_t digest[ROSETTAD_DIGEST_SIZE],
-                          char hex[ROSETTAD_DIGEST_HEX_LEN])
-{
-    static const char hex_chars[] = "0123456789abcdef";
-    for (int i = 0; i < ROSETTAD_DIGEST_SIZE; i++) {
-        hex[i * 2 + 0] = hex_chars[(digest[i] >> 4) & 0xf];
-        hex[i * 2 + 1] = hex_chars[digest[i] & 0xf];
-    }
-    hex[ROSETTAD_DIGEST_SIZE * 2] = '\0';
-}
-
 /* AOT cache paths */
 
 /* Build <HOME>/.cache/elfuse-rosettad[/suffix] into out. When suffix is NULL,
@@ -631,7 +620,7 @@ static int aot_cache_path_for_digest(const uint8_t digest[ROSETTAD_DIGEST_SIZE],
                                      size_t outsz)
 {
     char hex[ROSETTAD_DIGEST_HEX_LEN];
-    digest_to_hex(digest, hex);
+    bytes_to_hex(hex, digest, ROSETTAD_DIGEST_SIZE);
     char leaf[ROSETTAD_DIGEST_HEX_LEN + 32];
     int ln = snprintf(leaf, sizeof(leaf), "%s%s", hex, suffix ? suffix : "");
     if (ln < 0 || (size_t) ln >= sizeof(leaf))

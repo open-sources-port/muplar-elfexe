@@ -112,6 +112,21 @@ static inline void close_keep_errno(int fd)
     errno = saved;
 }
 
+/* Encode @len bytes of @src as lowercase hex into @dst, writing len*2 hex
+ * characters followed by a terminating NUL. @dst must hold at least len*2+1
+ * bytes. Returns the number of hex characters written (len*2).
+ */
+static inline size_t bytes_to_hex(char *dst, const uint8_t *src, size_t len)
+{
+    static const char hex_chars[] = "0123456789abcdef";
+    for (size_t i = 0; i < len; i++) {
+        dst[i * 2] = hex_chars[(src[i] >> 4) & 0xf];
+        dst[i * 2 + 1] = hex_chars[src[i] & 0xf];
+    }
+    dst[len * 2] = '\0';
+    return len * 2;
+}
+
 /* Create a private per-user scratch directory. mkdir(path, 0700), then tolerate
  * an already-existing entry only if it is a real directory, owned by the
  * current uid, with no group/other access bits. That rejects a symlink, a
