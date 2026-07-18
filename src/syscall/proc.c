@@ -1074,9 +1074,7 @@ int64_t sys_ptrace(guest_t *g,
 _Static_assert(sizeof(struct rusage) == sizeof(linux_rusage_t),
                "host and guest rusage layouts must match on LP64");
 
-static int write_rusage_to_guest(guest_t *g,
-                                 uint64_t gva,
-                                 const struct rusage *ru)
+int write_rusage_to_guest(guest_t *g, uint64_t gva, const struct rusage *ru)
 {
     linux_rusage_t lru;
     memcpy(&lru, ru, sizeof(lru));

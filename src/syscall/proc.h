@@ -323,6 +323,13 @@ void proc_children_cpu_add(const struct rusage *ru);
 /* Read the accumulated guest-children CPU time, in microseconds. */
 void proc_children_cpu_us(uint64_t *utime_us, uint64_t *stime_us);
 
+/* Write a macOS struct rusage to guest memory as linux_rusage_t. The field
+ * layout matches on LP64; ru_maxrss is converted from macOS bytes to Linux
+ * kilobytes. Returns the guest_write_small result (0 on success, negative on
+ * fault).
+ */
+int write_rusage_to_guest(guest_t *g, uint64_t gva, const struct rusage *ru);
+
 /* Collect host PIDs of active (non-exited) fork children. Writes up to max_pids
  * entries into out[].
  *

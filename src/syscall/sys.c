@@ -74,8 +74,9 @@ static linux_rlimit64_t guest_nofile_limit = {
 };
 #define RLIMIT_CACHE_SIZE ((int) (ARRAY_SIZE(cached_linux_rlimits)))
 
-_Static_assert(sizeof(struct rusage) == sizeof(linux_rusage_t),
-               "host and guest rusage layouts must match on LP64");
+/* The full-size assertion lives with write_rusage_to_guest() in proc.c; this
+ * offset check guards the fast memcpy translation done there.
+ */
 _Static_assert(offsetof(struct rusage, ru_maxrss) ==
                    offsetof(linux_rusage_t, ru_maxrss),
                "ru_maxrss offset must stay aligned for fast translation");
@@ -529,12 +530,7 @@ int64_t sys_getrusage(guest_t *g, int who, uint64_t usage_gva)
     if (getrusage(who, &mac_usage) < 0)
         return linux_errno();
 
-    linux_rusage_t lin_usage;
-    memcpy(&lin_usage, &mac_usage, sizeof(lin_usage));
-    lin_usage.ru_maxrss =
-        mac_usage.ru_maxrss / 1024; /* macOS: bytes -> Linux: KB */
-
-    if (guest_write_small(g, usage_gva, &lin_usage, sizeof(lin_usage)) < 0)
+    if (write_rusage_to_guest(g, usage_gva, &mac_usage) < 0)
         return -LINUX_EFAULT;
 
     return 0;
