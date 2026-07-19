@@ -12,7 +12,7 @@
  *   PID-01..02 process and thread IDs are unique across the fork family
  *   WAIT-01 WNOHANG does not consume a running child
  *   WAIT-02 WNOWAIT can be repeated before a consuming wait
- *   WAIT-03..05 waitid groups/auto-reap and signal termination status
+ *   WAIT-03..06 waitid groups/auto-reap, signal status, and admission races
  *   Z-01..06 zombie retention, no-zombie dispositions, and SIGCHLD timing
  *   O-01..03 orphan adoption by PID 1 and a child subreaper
  *   O-04..05 reserved for separate parent-death/job-control follow-ups
@@ -666,6 +666,100 @@ static void test_signal_wait_status(void)
             (int) info.si_pid, info.si_code, info.si_status, (int) killed_ret,
             killed_status, killed_ok);
         FAIL("guest wait status lost the signal termination cause");
+        return;
+    }
+    PASS();
+}
+
+struct concurrent_wait_result {
+    _Atomic int stop;
+    _Atomic int reaped;
+    pid_t first_pid;
+    int first_status;
+    int error;
+};
+
+static void *concurrent_waiter(void *opaque)
+{
+    struct concurrent_wait_result *result = opaque;
+    while (!atomic_load_explicit(&result->stop, memory_order_acquire)) {
+        int status = 0;
+        errno = 0;
+        pid_t pid = waitpid(-1, &status, WNOHANG);
+        if (pid > 0) {
+            int count = atomic_fetch_add_explicit(&result->reaped, 1,
+                                                  memory_order_acq_rel) +
+                        1;
+            if (count == 1) {
+                result->first_pid = pid;
+                result->first_status = status;
+            }
+            continue;
+        }
+        if (pid < 0 && errno != ECHILD && errno != EINTR) {
+            result->error = errno;
+            break;
+        }
+        usleep(100);
+    }
+    return NULL;
+}
+
+static void test_concurrent_wait_during_fork_admission(void)
+{
+    TEST("WAIT-06 concurrent wait sees admitted child once");
+
+    struct concurrent_wait_result result;
+    memset(&result, 0, sizeof(result));
+    pthread_t waiter;
+    int thread_ok =
+        pthread_create(&waiter, NULL, concurrent_waiter, &result) == 0;
+    if (thread_ok)
+        usleep(10000);
+
+    pid_t child = thread_ok ? fork() : -1;
+    if (child == 0)
+        _exit(97);
+
+    if (child > 0) {
+        for (int i = 0; i < 3000; i++) {
+            if (atomic_load_explicit(&result.reaped, memory_order_acquire) > 0)
+                break;
+            usleep(1000);
+        }
+        /* Keep the waiter active briefly after the first report: a phantom
+         * admission record would otherwise leave a second entry for this same
+         * guest PID, producing a duplicate consuming wait.
+         */
+        usleep(50000);
+    }
+
+    atomic_store_explicit(&result.stop, 1, memory_order_release);
+    if (thread_ok)
+        pthread_join(waiter, NULL);
+
+    int count = atomic_load_explicit(&result.reaped, memory_order_acquire);
+    int status_ok = count == 1 && result.first_pid == child &&
+                    WIFEXITED(result.first_status) &&
+                    WEXITSTATUS(result.first_status) == 97;
+    errno = 0;
+    int cleanup_status = 0;
+    pid_t cleanup = child > 0 ? waitpid(child, &cleanup_status, WNOHANG) : -1;
+    int cleanup_errno = errno;
+    int cleanup_ok = cleanup < 0 && cleanup_errno == ECHILD;
+
+    if (!thread_ok || child < 0 || result.error != 0 || !status_ok ||
+        !cleanup_ok) {
+        printf(
+            "[WAIT-06 child=%d thread=%d reaped=%d first=(pid=%d "
+            "status=0x%x) error=%d cleanup=%d errno=%d] ",
+            (int) child, thread_ok, count, (int) result.first_pid,
+            result.first_status, result.error, (int) cleanup, cleanup_errno);
+        if (child > 0 && cleanup == 0) {
+            kill(child, SIGKILL);
+            (void) waitpid(child, NULL, 0);
+        }
+        FAIL("fork admission created a missing or duplicate wait record");
         return;
     }
     PASS();
@@ -1475,6 +1569,7 @@ int main(void)
     test_waitid_pgid_matching();
     test_waitid_pgid_autoreap();
     test_signal_wait_status();
+    test_concurrent_wait_during_fork_admission();
     test_delayed_zombie_reap();
     test_reverse_zombie_reap();
     test_zombie_table_pressure();

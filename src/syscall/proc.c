@@ -548,8 +548,13 @@ static bool process_registry_path(char *out, size_t out_size)
  * registry protected by flock so unrelated signal/group readers stay simple.
  */
 #define LIFECYCLE_MAGIC 0x454C464CU /* "ELFL" */
-#define LIFECYCLE_VERSION 3
-#define LIFECYCLE_MAX_ENTRIES PROC_TABLE_SIZE
+#define LIFECYCLE_VERSION 4
+/* One registry record belongs to this invocation's root/self process; the
+ * remaining records match the maximum number of children any one local table
+ * can own after reparenting. This preserves the adoption-capacity invariant
+ * without reducing the advertised 1024-child table by one.
+ */
+#define LIFECYCLE_MAX_ENTRIES (PROC_TABLE_SIZE + 1)
 
 typedef struct {
     pid_t host_pid;
@@ -914,6 +919,16 @@ static void proc_register_adopted_local(const lifecycle_entry_t *source)
         pthread_mutex_unlock(&pid_lock);
         return;
     }
+    /* A direct child is visible in the lifecycle registry before its local
+     * admission transaction commits. The registry's host PID may already have
+     * been published while the local slot is still reserved, so checking only
+     * source->host_pid would leave a second race window. The reserved slot is
+     * authoritative: proc_register_child() will commit this same PID shortly.
+     */
+    if (proc_find_reserved_guest_entry(source->guest_pid)) {
+        pthread_mutex_unlock(&pid_lock);
+        return;
+    }
     if (!entry)
         entry = proc_find_free_entry();
     if (entry) {
@@ -933,10 +948,10 @@ static void proc_register_adopted_local(const lifecycle_entry_t *source)
         registered = true;
     } else {
         /* Every local entry corresponds to one entry in the registry, while
-         * the registry also contains this process itself. Keeping both caps
-         * equal therefore guarantees a free local slot for an unimported
-         * adopted child. Do not silently lose wait ownership if that invariant
-         * is ever broken by a future bookkeeping change.
+         * the registry has exactly one additional slot for this process
+         * itself. Therefore at most PROC_TABLE_SIZE registry children can
+         * belong to one adopter. Do not silently lose wait ownership if that
+         * invariant is ever broken by a future bookkeeping change.
          */
         log_error(
             "process table invariant broken while importing adopted "
@@ -959,7 +974,13 @@ static void lifecycle_import_children(void)
         int64_t self = proc_get_pid();
         for (uint32_t i = 0; i < registry->count; i++) {
             lifecycle_entry_t *entry = &registry->entries[i];
-            if (entry->guest_pid != self && entry->ppid == self)
+            /* host_pid==0 is a pre-spawn reservation, not a live or waitable
+             * child. The local reserved-slot check in
+             * proc_register_adopted_local() also closes the later window after
+             * lifecycle_publish_child() but before local admission commit.
+             */
+            if (entry->host_pid > 0 && entry->guest_pid != self &&
+                entry->ppid == self)
                 proc_register_adopted_local(entry);
         }
         free(registry);
