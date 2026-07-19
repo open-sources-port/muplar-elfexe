@@ -30,44 +30,15 @@
 
 int fork_ipc_write_all(int fd, const void *buf, size_t len)
 {
-    const uint8_t *p = buf;
-    while (len > 0) {
-        ssize_t n = write(fd, p, len);
-        if (n < 0) {
-            if (errno == EINTR)
-                continue;
-            return -1;
-        }
-
-        if (n == 0) {
-            /* Defensive: an unexpected zero return on a blocking socket would
-             * otherwise spin forever, since p and len stay at the same offset.
-             * Treat it as an IO failure so the parent and child both bail
-             * rather than wedge.
-             */
-            errno = EIO;
-            return -1;
-        }
-        p += n;
-        len -= n;
-    }
-    return 0;
+    return write_all(fd, buf, len);
 }
 
 int fork_ipc_read_all(int fd, void *buf, size_t len)
 {
-    uint8_t *p = buf;
-    while (len > 0) {
-        ssize_t n = read(fd, p, len);
-        if (n <= 0) {
-            if (n < 0 && errno == EINTR)
-                continue;
-            return -1;
-        }
-        p += n;
-        len -= n;
-    }
-    return 0;
+    /* A truncated exchange (EOF before len) is a protocol failure here, so the
+     * parent and child both bail rather than act on a partial message.
+     */
+    return read_all(fd, buf, len, true) < 0 ? -1 : 0;
 }
 
 /* macOS rejects overly large SCM_RIGHTS payloads with EINVAL. Keep each control

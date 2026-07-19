@@ -70,18 +70,7 @@ static uint8_t rsp_checksum(const char *data, size_t len)
 
 static int rsp_send_byte(int fd, char value)
 {
-    while (1) {
-        ssize_t n = write(fd, &value, 1);
-        if (n < 0) {
-            if (errno == EINTR)
-                continue;
-            return -1;
-        }
-        if (n == 1)
-            return 0;
-        errno = EIO;
-        return -1;
-    }
+    return write_all(fd, &value, 1);
 }
 
 int gdb_rsp_send(int fd, const char *data, size_t len)

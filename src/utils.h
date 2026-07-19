@@ -127,6 +127,60 @@ static inline size_t bytes_to_hex(char *dst, const uint8_t *src, size_t len)
     return len * 2;
 }
 
+/* Write exactly @len bytes to a blocking @fd, resuming across short writes and
+ * EINTR. Returns 0 once every byte is written, or -1 with errno set on error.
+ * An unexpected zero-byte return is treated as EIO rather than spun on, since
+ * the offset would otherwise never advance. A zero-length request returns 0.
+ */
+static inline int write_all(int fd, const void *buf, size_t len)
+{
+    const uint8_t *p = buf;
+    size_t sent = 0;
+    while (sent < len) {
+        ssize_t n = write(fd, p + sent, len - sent);
+        if (n > 0) {
+            sent += (size_t) n;
+            continue;
+        }
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            return -1;
+        }
+        errno = EIO;
+        return -1;
+    }
+    return 0;
+}
+
+/* Read exactly @len bytes from a blocking @fd into @buf, resuming across short
+ * reads and EINTR. On error returns -1 with errno set. On a premature EOF the
+ * result depends on @eof_is_error: when true the call returns -1, when false it
+ * returns the count of bytes read before EOF so the caller can detect a clean
+ * end of stream. Otherwise returns @len.
+ */
+static inline ssize_t read_all(int fd, void *buf, size_t len, bool eof_is_error)
+{
+    uint8_t *p = buf;
+    size_t got = 0;
+    while (got < len) {
+        ssize_t n = read(fd, p + got, len - got);
+        if (n > 0) {
+            got += (size_t) n;
+            continue;
+        }
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            return -1;
+        }
+        if (eof_is_error)
+            return -1;
+        break;
+    }
+    return (ssize_t) got;
+}
+
 /* Create a private per-user scratch directory. mkdir(path, 0700), then tolerate
  * an already-existing entry only if it is a real directory, owned by the
  * current uid, with no group/other access bits. That rejects a symlink, a

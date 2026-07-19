@@ -1012,51 +1012,9 @@ bool rosettad_wait_for_idle(unsigned int max_ms)
            -1;
 }
 
-static ssize_t rosettad_read_full(int fd, void *buf, size_t len)
-{
-    uint8_t *p = buf;
-    size_t got = 0;
-    while (got < len) {
-        ssize_t n = read(fd, p + got, len - got);
-        if (n == 0)
-            return (ssize_t) got;
-        if (n < 0) {
-            if (errno == EINTR)
-                continue;
-            return -1;
-        }
-        got += (size_t) n;
-    }
-    return (ssize_t) got;
-}
-
 static int rosettad_write_byte(int fd, uint8_t b)
 {
-    for (;;) {
-        ssize_t n = write(fd, &b, 1);
-        if (n == 1)
-            return 0;
-        if (n < 0 && errno == EINTR)
-            continue;
-        return -1;
-    }
-}
-
-static int rosettad_write_full(int fd, const void *buf, size_t len)
-{
-    const uint8_t *p = buf;
-    size_t sent = 0;
-    while (sent < len) {
-        ssize_t n = write(fd, p + sent, len - sent);
-        if (n > 0) {
-            sent += (size_t) n;
-            continue;
-        }
-        if (n < 0 && errno == EINTR)
-            continue;
-        return -1;
-    }
-    return 0;
+    return write_all(fd, &b, 1);
 }
 
 /* Send the success reply for a TRANSLATE or DIGEST command: {HIT byte, optional
@@ -1068,7 +1026,7 @@ static int rosettad_send_aot(int fd, const uint8_t *digest, int aot_fd)
 {
     if (rosettad_write_byte(fd, ROSETTAD_RESP_HIT) < 0)
         return -1;
-    if (digest && rosettad_write_full(fd, digest, ROSETTAD_DIGEST_SIZE) < 0)
+    if (digest && write_all(fd, digest, ROSETTAD_DIGEST_SIZE) < 0)
         return -1;
     if (rosettad_send_fd(fd, 0, aot_fd) < 0)
         return -1;
@@ -1149,7 +1107,7 @@ static void *rosettad_handler_thread(void *arg)
              * request.
              */
             uint8_t digest[ROSETTAD_DIGEST_SIZE];
-            if (rosettad_read_full(fd, digest, sizeof(digest)) !=
+            if (read_all(fd, digest, sizeof(digest), false) !=
                 (ssize_t) sizeof(digest))
                 goto done;
             int cached = aot_cache_lookup(digest);
