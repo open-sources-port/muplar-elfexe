@@ -34,6 +34,97 @@
 #define __NR_geteuid 175
 #define __NR_getgid 176
 #define __NR_setgroups 159
+#define __NR_sched_yield 124
+#define __NR_clock_gettime 113
+
+#define CLOCK_MONOTONIC 1
+
+#define CLONE_VM 0x00000100UL
+#define CLONE_FS 0x00000200UL
+#define CLONE_FILES 0x00000400UL
+#define CLONE_SIGHAND 0x00000800UL
+#define CLONE_THREAD 0x00010000UL
+#define CLONE_SYSVSEM 0x00040000UL
+#define CLONE_PARENT_SETTID 0x00100000UL
+#define CLONE_CHILD_CLEARTID 0x00200000UL
+#define CLONE_DETACHED 0x00400000UL
+
+typedef struct {
+    long tv_sec;
+    long tv_nsec;
+} test_timespec_t;
+
+static volatile int prio_child_tid = 0;
+static volatile int prio_child_ready = 0;
+static volatile int prio_child_release = 0;
+static int prio_dead_tid = 0;
+static char prio_child_stack[8192] __attribute__((aligned(16)));
+
+static long monotonic_ms(void)
+{
+    test_timespec_t ts = {0};
+    long rc = raw_syscall2(__NR_clock_gettime, CLOCK_MONOTONIC, (long) &ts);
+    if (rc != 0)
+        return -1;
+    return ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static void priority_child_work(void)
+{
+    prio_child_ready = 1;
+    raw_futex_wake((int *) &prio_child_ready, 1);
+
+    while (prio_child_release == 0)
+        raw_futex_wait((int *) &prio_child_release, 0);
+
+    raw_exit(0);
+}
+
+static long spawn_priority_child(void)
+{
+    prio_child_tid = 0;
+    prio_child_ready = 0;
+    prio_child_release = 0;
+
+    unsigned long flags = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND |
+                          CLONE_THREAD | CLONE_SYSVSEM | CLONE_PARENT_SETTID |
+                          CLONE_CHILD_CLEARTID | CLONE_DETACHED;
+    void *stack_top = prio_child_stack + sizeof(prio_child_stack);
+    long ret =
+        raw_clone(flags, stack_top, (int *) &prio_child_tid, /* parent_tid */
+                  0,                                         /* tls */
+                  (int *) &prio_child_tid);                  /* child_tid */
+    if (ret == 0) {
+        priority_child_work();
+        __builtin_unreachable();
+    }
+    return ret;
+}
+
+static void release_priority_child(void)
+{
+    prio_child_release = 1;
+    raw_futex_wake((int *) &prio_child_release, 1);
+    while (prio_child_tid != 0)
+        raw_futex_wait_cleartid((int *) &prio_child_tid, prio_child_tid);
+}
+
+static long wait_for_dead_priority_tid(int tid)
+{
+    long start_ms = monotonic_ms();
+    long prio = 0;
+
+    for (;;) {
+        prio = raw_syscall2(__NR_getpriority, 0, tid);
+        if (prio == -3)
+            return prio;
+        raw_syscall0(__NR_sched_yield);
+
+        long now_ms = monotonic_ms();
+        if (start_ms >= 0 && now_ms >= 0 && now_ms - start_ms > 2000)
+            return prio;
+    }
+}
 
 int main(void)
 {
@@ -282,6 +373,55 @@ int main(void)
         }
         /* Reset nice to 0 */
         raw_syscall3(__NR_setpriority, 0, 0, 0);
+    }
+
+    TEST("getpriority live thread TID");
+    {
+        long ret = spawn_priority_child();
+        if (ret < 0) {
+            FAIL("clone failed");
+        } else {
+            while (prio_child_ready == 0)
+                raw_futex_wait((int *) &prio_child_ready, 0);
+
+            long prio = raw_syscall2(__NR_getpriority, 0, prio_child_tid);
+            EXPECT_TRUE(prio == 20, "getpriority(live tid) mismatch");
+            release_priority_child();
+        }
+    }
+
+    TEST("setpriority live thread TID rejected");
+    {
+        long ret = spawn_priority_child();
+        if (ret < 0) {
+            FAIL("clone failed");
+        } else {
+            while (prio_child_ready == 0)
+                raw_futex_wait((int *) &prio_child_ready, 0);
+
+            raw_syscall3(__NR_setpriority, 0, 0, 0);
+            long baseline_prio = raw_syscall2(__NR_getpriority, 0, 0);
+            int tid = prio_child_tid;
+            long rc = raw_syscall3(__NR_setpriority, 0, tid, 5);
+            long self_prio = raw_syscall2(__NR_getpriority, 0, 0);
+            long tid_prio = raw_syscall2(__NR_getpriority, 0, tid);
+            EXPECT_TRUE(rc == -3 && self_prio == baseline_prio &&
+                            tid_prio == baseline_prio,
+                        "setpriority(live tid) changed global nice");
+            release_priority_child();
+            prio_dead_tid = tid;
+        }
+        raw_syscall3(__NR_setpriority, 0, 0, 0);
+    }
+
+    TEST("getpriority dead thread TID");
+    {
+        if (prio_dead_tid == 0) {
+            FAIL("no dead tid from setpriority test");
+        } else {
+            long dead_prio = wait_for_dead_priority_tid(prio_dead_tid);
+            EXPECT_TRUE(dead_prio == -3, "getpriority(dead tid) succeeded");
+        }
     }
 
     /* sched_setaffinity: mask with CPU 0 should succeed */

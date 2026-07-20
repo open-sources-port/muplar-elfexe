@@ -204,9 +204,13 @@ void proc_set_ids(uint32_t uid,
 /* Emulated nice value for setpriority/getpriority coherence. */
 int32_t proc_get_nice(void);
 void proc_set_nice(int32_t val);
+bool proc_pid_alive(int pid);
 
-/* setpriority/getpriority: only PRIO_PROCESS for self. setpriority clamps prio
- * to [-20, 19]. getpriority returns 20-nice (always > 0 per Linux convention).
+/* setpriority/getpriority: only PRIO_PROCESS is modeled. getpriority accepts
+ * any live task ID but reports the process-global emulated nice value.
+ * setpriority is kept self-only until elfuse tracks per-task nice state.
+ * setpriority clamps prio to [-20, 19]. getpriority returns 20-nice (always
+ * > 0 per Linux convention).
  */
 int64_t proc_sys_setpriority(int which, int who, int prio);
 int64_t proc_sys_getpriority(int which, int who);

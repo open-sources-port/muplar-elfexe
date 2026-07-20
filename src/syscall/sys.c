@@ -81,12 +81,6 @@ _Static_assert(offsetof(struct rusage, ru_maxrss) ==
                    offsetof(linux_rusage_t, ru_maxrss),
                "ru_maxrss offset must stay aligned for fast translation");
 
-/* Defined below in the scheduler-policy section; forward-declared so
- * sys_sched_getaffinity (which sits above the policy stubs) can share the same
- * per-thread TID gate.
- */
-static bool sched_pid_alive(int pid);
-
 static void groups_init_cached_linux_groups(void)
 {
     gid_t groups[64];
@@ -281,7 +275,7 @@ int64_t sys_sched_getaffinity(guest_t *g,
      */
     if (pid < 0)
         return -LINUX_EINVAL;
-    if (!sched_pid_alive(pid))
+    if (!proc_pid_alive(pid))
         return -LINUX_ESRCH;
     if (size < 8)
         return -LINUX_EINVAL;
@@ -321,8 +315,8 @@ int64_t sys_sched_getaffinity(guest_t *g,
  * elfuse models a single SCHED_OTHER thread group. Linux scheduler syscalls are
  * per-thread: the pid argument is actually a TID, and a worker calling
  * sched_getscheduler(gettid()) must reach its own thread entry, not just the
- * thread-group leader. Live TIDs are matched via thread_tid_alive(); pid 0
- * means "the calling thread" and is always accepted.
+ * thread-group leader. Live TIDs are matched via proc_pid_alive(); pid 0 means
+ * "the calling thread" and is always accepted.
  *
  * Any policy transition away from SCHED_OTHER is rejected unless the stub can
  * model it faithfully. Callers branch on the apparent policy, and silently
@@ -339,15 +333,6 @@ int64_t sys_sched_getaffinity(guest_t *g,
  * Getters that only write back leave EFAULT for the final copy_to_user step,
  * matching the kernel's order.
  */
-static bool sched_pid_alive(int pid)
-{
-    if (pid == 0)
-        return true;
-    if (pid == (int) proc_get_pid())
-        return true;
-    return thread_tid_alive((int64_t) pid) != 0;
-}
-
 /* Validate a sched_param for the named policy.
  *
  * Returns 0 if accepted by the stub, or a negative Linux errno. EPERM is
@@ -390,7 +375,7 @@ int64_t sys_sched_getscheduler(int pid)
 {
     if (pid < 0)
         return -LINUX_EINVAL;
-    if (!sched_pid_alive(pid))
+    if (!proc_pid_alive(pid))
         return -LINUX_ESRCH;
     return LINUX_SCHED_NORMAL;
 }
@@ -399,7 +384,7 @@ int64_t sys_sched_getparam(guest_t *g, int pid, uint64_t param_gva)
 {
     if (pid < 0 || param_gva == 0)
         return -LINUX_EINVAL;
-    if (!sched_pid_alive(pid))
+    if (!proc_pid_alive(pid))
         return -LINUX_ESRCH;
     linux_sched_param_t param = {0};
     if (guest_write_small(g, param_gva, &param, sizeof(param)) < 0)
@@ -417,7 +402,7 @@ int64_t sys_sched_setscheduler(guest_t *g,
     linux_sched_param_t param;
     if (guest_read_small(g, param_gva, &param, sizeof(param)) < 0)
         return -LINUX_EFAULT;
-    if (!sched_pid_alive(pid))
+    if (!proc_pid_alive(pid))
         return -LINUX_ESRCH;
     return sched_check_policy_param(policy, param.sched_priority);
 }
@@ -429,7 +414,7 @@ int64_t sys_sched_setparam(guest_t *g, int pid, uint64_t param_gva)
     linux_sched_param_t param;
     if (guest_read_small(g, param_gva, &param, sizeof(param)) < 0)
         return -LINUX_EFAULT;
-    if (!sched_pid_alive(pid))
+    if (!proc_pid_alive(pid))
         return -LINUX_ESRCH;
     /* Current policy is SCHED_OTHER, so only priority 0 is valid. Any other
      * value mirrors the kernel's EINVAL for non-RT priority changes.
@@ -475,7 +460,7 @@ int64_t sys_sched_rr_get_interval(guest_t *g, int pid, uint64_t ts_gva)
 {
     if (pid < 0)
         return -LINUX_EINVAL;
-    if (!sched_pid_alive(pid))
+    if (!proc_pid_alive(pid))
         return -LINUX_ESRCH;
     if (ts_gva == 0)
         return -LINUX_EFAULT;

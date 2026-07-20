@@ -25,6 +25,13 @@ void shim_globals_publish_pgsid(guest_t *g, int64_t pgid, int64_t sid)
     (void) sid;
 }
 
+int thread_tid_alive(int64_t tid);
+int thread_tid_alive(int64_t tid)
+{
+    (void) tid;
+    return 0;
+}
+
 int main(void)
 {
     /* Test 1: Fallback case (fakeroot disabled) */

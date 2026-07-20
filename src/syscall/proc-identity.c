@@ -13,6 +13,7 @@
 
 #include "syscall/abi.h"
 #include "core/shim-globals.h"
+#include "runtime/thread.h"
 #include "syscall/proc-identity.h"
 #include "syscall/proc.h"
 
@@ -223,10 +224,20 @@ void proc_set_nice(int32_t val)
     emu_nice = val;
 }
 
+bool proc_pid_alive(int pid)
+{
+    if (pid == 0 || pid == (int) guest_pid)
+        return true;
+    return thread_tid_alive((int64_t) pid) != 0;
+}
+
 int64_t proc_sys_setpriority(int which, int who, int prio)
 {
     if (which != 0)
         return -LINUX_EINVAL;
+    /* emu_nice is process-global. Reject non-self task IDs until nice is
+     * tracked per task rather than silently changing every thread's value.
+     */
     if (who != 0 && who != (int) guest_pid)
         return -LINUX_ESRCH;
     if (prio < -20)
@@ -241,7 +252,7 @@ int64_t proc_sys_getpriority(int which, int who)
 {
     if (which != 0)
         return -LINUX_EINVAL;
-    if (who != 0 && who != (int) guest_pid)
+    if (!proc_pid_alive(who))
         return -LINUX_ESRCH;
     return 20 - emu_nice;
 }
