@@ -1113,25 +1113,6 @@ static int sidecar_load_locked_index(int parent_dirfd,
  * Returns 0 on success, -1 with errno set on error. Handles short writes by
  * retrying until everything is committed.
  */
-static int sidecar_write_all(int fd, const char *buf, size_t len)
-{
-    size_t off = 0;
-    while (off < len) {
-        ssize_t n = write(fd, buf + off, len - off);
-        if (n < 0) {
-            if (errno == EINTR)
-                continue;
-            return -1;
-        }
-        if (n == 0) {
-            errno = EIO;
-            return -1;
-        }
-        off += (size_t) n;
-    }
-    return 0;
-}
-
 /* Serialize the index into a malloc'd buffer. *@out_len receives the byte
  * count.
  *
@@ -1222,8 +1203,7 @@ static int sidecar_write_locked_index(int parent_dirfd,
         errno = saved_errno;
         return -1;
     }
-    if (payload_len > 0 &&
-        sidecar_write_all(tmp_fd, payload, payload_len) < 0) {
+    if (payload_len > 0 && write_all(tmp_fd, payload, payload_len) < 0) {
         int saved_errno = errno;
         close(tmp_fd);
         (void) unlinkat(parent_dirfd, SIDECAR_INDEX_TMP_NAME, 0);
