@@ -2301,7 +2301,7 @@ int64_t sys_linkat(guest_t *g,
          * directory entry that resolves identically, even though it is a
          * distinct inode rather than a second link to the original.
          */
-        if ((errno != EPERM && errno != ENOTSUP) ||
+        if ((errno != EPERM && errno != ENOTSUP && errno != EINVAL) ||
             (flags & LINUX_AT_SYMLINK_FOLLOW)) {
             host_fd_ref_close(&olddir_ref);
             host_fd_ref_close(&newdir_ref);
