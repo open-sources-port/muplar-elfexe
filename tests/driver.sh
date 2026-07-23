@@ -276,13 +276,13 @@ report_case()
     esac
 }
 
-print_output_excerpt()
+print_failure_output()
 {
     local output="$1"
-    local lines="$2"
+    local prefix="$2"
 
     [ "$VERBOSE" -eq 1 ] && [ -n "$output" ] || return 0
-    printf "%s\n" "$output" | head -"$lines" | sed 's/^/    /'
+    printf '%s\n' "$output" | sed "s/^/${prefix}/"
 }
 
 total=${#filtered_idx[@]}
@@ -380,9 +380,7 @@ for i in "${filtered_idx[@]}"; do
             fail=$((fail + 1))
         else
             echo "not ok $test_num - $name # exit code $rc"
-            if [ "$VERBOSE" -eq 1 ] && [ -n "$output" ]; then
-                printf "%s\n" "$output" | head -10 | sed 's/^/  # /'
-            fi
+            print_failure_output "$output" "  # "
             fail=$((fail + 1))
         fi
     else
@@ -398,7 +396,7 @@ for i in "${filtered_idx[@]}"; do
             fail=$((fail + 1))
         else
             report_case fail "$name" " (exit $rc)"
-            print_output_excerpt "$output" 8
+            print_failure_output "$output" "    "
             fail=$((fail + 1))
         fi
     fi
