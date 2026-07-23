@@ -149,6 +149,40 @@ int main(int argc, char **argv)
     else
         PASS();
 
+    TEST("blocked guest system path does not fall back to host");
+    {
+        int fd = open("/usr/bin/env", O_RDONLY);
+        if (fd < 0 && errno == ENOENT)
+            PASS();
+        else {
+            if (fd >= 0)
+                close(fd);
+            FAIL("guest system path fell back to host");
+        }
+    }
+
+    TEST("dot-component guest system path does not fall back to host");
+    {
+        int fd = open("/tmp/../usr/bin/env", O_RDONLY);
+        if (fd < 0 && errno == ENOENT)
+            PASS();
+        else {
+            if (fd >= 0)
+                close(fd);
+            FAIL("dot-component system path fell back to host");
+        }
+    }
+
+    TEST("allowed guest network configuration falls back to host");
+    {
+        int fd = open("/etc/hosts", O_RDONLY);
+        if (fd >= 0) {
+            close(fd);
+            PASS();
+        } else
+            FAIL("allowed network config did not fall back to host");
+    }
+
     SUMMARY("test-sysroot-host-fallback");
     return fails > 0 ? 1 : 0;
 }

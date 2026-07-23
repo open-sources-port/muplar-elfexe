@@ -24,6 +24,7 @@
 #include "syscall/internal.h"
 #include "syscall/proc.h"
 #include "syscall/proc-state.h"
+#include "syscall/path.h"
 
 /* Shim blob reference (set by startup/bootstrap) */
 static const unsigned char *shim_blob_ptr = NULL;
@@ -521,6 +522,93 @@ static bool sysroot_path_exists(const char *resolved_path, bool follow_final)
  * enforced only when the path actually resolves under sysroot, to prevent
  * symlink escape from a tree the caller intended to stay inside.
  */
+static bool lexical_normalize_absolute_path(char *dest,
+                                            const char *src,
+                                            size_t dest_sz)
+{
+    if (!src || src[0] != '/' || dest_sz == 0)
+        return false;
+    dest[0] = '/';
+    dest[1] = '\0';
+    size_t dest_len = 1;
+
+    const char *scan = src;
+    const char *comp;
+    size_t len;
+    while (path_next_component(&scan, &comp, &len)) {
+        if (len == 1 && comp[0] == '.') {
+            /* Do nothing */
+        } else if (len == 2 && comp[0] == '.' && comp[1] == '.') {
+            /* Pop the last component */
+            if (dest_len > 1) {
+                while (dest_len > 1 && dest[dest_len - 1] == '/')
+                    dest[--dest_len] = '\0';
+                while (dest_len > 1 && dest[dest_len - 1] != '/')
+                    dest[--dest_len] = '\0';
+                if (dest_len > 1 && dest[dest_len - 1] == '/')
+                    dest[--dest_len] = '\0';
+                if (dest_len == 0) {
+                    dest[0] = '/';
+                    dest[1] = '\0';
+                    dest_len = 1;
+                }
+            }
+        } else {
+            /* Push the component */
+            if (dest_len > 1 && dest[dest_len - 1] != '/') {
+                if (dest_len + 1 >= dest_sz)
+                    return false;
+                dest[dest_len++] = '/';
+            }
+            if (dest_len + len >= dest_sz)
+                return false;
+            memcpy(dest + dest_len, comp, len);
+            dest_len += len;
+            dest[dest_len] = '\0';
+        }
+    }
+    if (dest_len == 0) {
+        dest[0] = '/';
+        dest[1] = '\0';
+    } else {
+        while (dest_len > 1 && dest[dest_len - 1] == '/')
+            dest[--dest_len] = '\0';
+    }
+    return true;
+}
+
+static bool is_guest_system_path(const char *path)
+{
+    if (!path || path[0] != '/')
+        return false;
+
+    /* Check prefix patterns (path/...) and exact root matches (path) */
+    static const char *const dirs[] = {
+        "/usr/", "/bin/",  "/sbin/", "/lib/",  "/lib64/",
+        "/opt/", "/boot/", "/srv/",  "/root/", "/home/",
+    };
+    for (size_t i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
+        size_t n = strlen(dirs[i]);
+        if (strncmp(path, dirs[i], n) == 0)
+            return true;
+        /* Also match the bare directory name (e.g., "/usr") */
+        if (strncmp(path, dirs[i], n - 1) == 0 && path[n - 1] == '\0')
+            return true;
+    }
+    if (strncmp(path, "/var/", 5) == 0 || !strcmp(path, "/var")) {
+        if (strncmp(path, "/var/folders/", 13) == 0 ||
+            !strcmp(path, "/var/folders"))
+            return false;
+        return true;
+    }
+    if (strncmp(path, "/etc/", 5) == 0 || !strcmp(path, "/etc")) {
+        if (!strcmp(path, "/etc/resolv.conf") || !strcmp(path, "/etc/hosts"))
+            return false;
+        return true;
+    }
+    return false;
+}
+
 static const char *proc_resolve_sysroot_path_flags(const char *path,
                                                    char *buf,
                                                    size_t bufsz,
@@ -553,6 +641,16 @@ static const char *proc_resolve_sysroot_path_flags(const char *path,
         errno = ENAMETOOLONG;
         return NULL;
     }
+
+    /* Prevent escaping guest system paths to macOS host paths, which leads
+     * to host contamination and permission failures (e.g. SIP/EPERM).
+     */
+    char norm_path[LINUX_PATH_MAX];
+    bool has_norm =
+        lexical_normalize_absolute_path(norm_path, path, sizeof(norm_path));
+    if (is_guest_system_path(has_norm ? norm_path : path))
+        return buf;
+
     return path;
 }
 
@@ -634,9 +732,17 @@ const char *proc_resolve_sysroot_create_path(const char *path,
     /* Parent doesn't exist in sysroot. Only /tmp, /var/tmp, and ccache get
      * forcefully redirected to the sysroot to avoid host case-collisions;
      * everything else falls back to the host literal.
+     * Guest system directories must also be forced to resolve to the sysroot.
      */
-    if (strncmp(path, "/tmp/", 5) && strncmp(path, "/var/tmp/", 9) &&
-        !strstr(path, "/.ccache/"))
+    char norm_path[LINUX_PATH_MAX];
+    bool has_norm =
+        lexical_normalize_absolute_path(norm_path, path, sizeof(norm_path));
+    const char *path_to_check = has_norm ? norm_path : path;
+
+    if (strncmp(path_to_check, "/tmp/", 5) &&
+        strncmp(path_to_check, "/var/tmp/", 9) &&
+        !strstr(path_to_check, "/.ccache/") &&
+        !is_guest_system_path(path_to_check))
         return path;
 
     if (!create_parents) {
