@@ -418,13 +418,10 @@ int sys_path_has_symlink(guest_fd_t dirfd, const char *path)
             continue;
 
         char name[NAME_MAX + 1];
-        if (len > NAME_MAX) {
-            errno = ENAMETOOLONG;
+        if (path_component_copy(name, sizeof(name), comp, len) < 0) {
             rc = -1;
             goto out;
         }
-        memcpy(name, comp, len);
-        name[len] = '\0';
 
         struct stat st;
         if (fstatat(current_fd, name, &st, AT_SYMLINK_NOFOLLOW) < 0) {
@@ -1217,12 +1214,8 @@ int path_openat2_crosses_mount(guest_fd_t dirfd,
         } else {
             char name[NAME_MAX + 1];
             char parent[LINUX_PATH_MAX];
-            if (len > NAME_MAX) {
-                errno = ENAMETOOLONG;
+            if (path_component_copy(name, sizeof(name), comp, len) < 0)
                 goto out;
-            }
-            memcpy(name, comp, len);
-            name[len] = '\0';
             if (str_copy_trunc(parent, current, sizeof(parent)) >=
                 sizeof(parent)) {
                 errno = ENAMETOOLONG;
@@ -1316,12 +1309,8 @@ int path_openat2_crosses_mount(guest_fd_t dirfd,
         if (host_walk && *rest != '\0' &&
             !(len == 2 && comp[0] == '.' && comp[1] == '.')) {
             char name[NAME_MAX + 1];
-            if (len > NAME_MAX) {
-                errno = ENAMETOOLONG;
+            if (path_component_copy(name, sizeof(name), comp, len) < 0)
                 goto out;
-            }
-            memcpy(name, comp, len);
-            name[len] = '\0';
             host_fd_t next_fd =
                 openat(current_fd, name, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
             if (replace_walk_fd(&current_fd, next_fd) < 0)
