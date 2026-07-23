@@ -771,6 +771,80 @@ under `/proc`, `/dev`, and a few Linux-expected compatibility files:
 Related implementation: `src/runtime/procemu.c`, `src/syscall/path.c`,
 `src/syscall/fs.c`, `src/syscall/proc-state.c`.
 
+## POSIX Shared Memory (`/dev/shm`)
+
+Linux exposes POSIX shared memory through `/dev/shm`, a tmpfs the C library
+opens by name: `shm_open("/foo", ...)` opens `/dev/shm/foo`. macOS has no
+`/dev/shm`, so `elfuse` backs it with a per-UID host directory,
+`/tmp/elfuse-shm-<uid>/<name>`. `dev_shm_resolve_path()` in
+`src/runtime/procemu.c` (exported as `proc_dev_shm_resolve`) is the single
+source of truth for that mapping and gates the name. This is a different
+mechanism from System V shared memory (`shmget`/`shmat`), which lives in
+`src/syscall/sysvipc.c`.
+
+### One Redirect, One Resolution
+
+Every path syscall resolves guest paths through `path_translate_at()` in
+`src/syscall/path.c`. For a `/dev/shm/<leaf>` path it rewrites `host_path` into
+the backing directory and records the fact in `tx->is_dev_shm`. If each syscall
+applied the redirect on its own, any that missed it would fall through to the
+sysroot while its peers used the backing directory, so `/dev/shm/foo` would
+resolve two ways for the same program:
+
+```
+/dev/shm/foo
+  open  -> /tmp/elfuse-shm-<uid>/foo   (backing dir, created)
+  chmod -> <sysroot>/dev/shm/foo       (absent -> ENOENT)
+```
+
+Resolving in `path_translate_at` instead means `chmod`, `chown`, `truncate`,
+`utimensat`, `rename`, `link`, `symlink`, `mknod`, `readlink`, `mkdir`,
+`statfs`, and the xattr calls all inherit the backing path from one place, so an
+`open` followed by any of them on the same name stays consistent.
+
+Only a non-empty flat leaf is redirected. Bare `/dev/shm` and `/dev/shm/` stay
+on the sysroot path so the synthetic-directory intercepts keep answering for
+them, and `statfs` on a shm leaf or on `/dev/shm` reports `TMPFS_MAGIC`
+synthetically rather than the host filesystem's type. Because the backing path
+is absolute, two inline helpers in `src/syscall/path.h` adapt the `*at()` calls:
+`path_translation_dirfd()` returns `AT_FDCWD` (POSIX ignores `dirfd` for an
+absolute path), and `path_translation_at_flags()` forces the nofollow flag
+described next.
+
+### The Never-Follow Invariant
+
+On Linux `/dev/shm` is an in-namespace tmpfs, so a symlink planted at a shm leaf
+resolves inside that namespace. `elfuse`'s backing store is a plain host
+directory, so the same symlink would resolve onto the host filesystem, which is
+a sandbox escape. A symlink leaf is never legitimate anyway: glibc's `shm_open`
+(`sysdeps/posix/shm_open.c`) opens objects with `O_NOFOLLOW`. So every shm
+operation acts on the leaf itself, never the target it points at. Because the
+resolver hands back an absolute host path that bypasses the sysroot, that duty
+is spread across the syscall families, one mechanism each:
+
+| Operation family | Never-follow mechanism |
+|------------------|------------------------|
+| `*at()` metadata (chmod, chown, stat, utimensat, access) | `path_translation_at_flags()` adds `AT_SYMLINK_NOFOLLOW` |
+| open for truncate/chdir | `shm_open_leaf()` opens `O_NOFOLLOW` |
+| proc open | `O_NOFOLLOW` |
+| xattr get/set/list/remove | `XATTR_NOFOLLOW` |
+| stat | `lstat`, not `stat` |
+| linkat | clears `AT_SYMLINK_FOLLOW` |
+| statfs | nofollow `lstat` existence probe, then a synthetic reply |
+
+The name gate lives with the resolver. A POSIX shm name is always a single flat
+component: glibc's `__shm_get_name` (`posix/shm-directory.c`) strips the leading
+slash and rejects an empty name or any embedded `/` with `EINVAL`.
+`dev_shm_resolve_path()` enforces the same shape, additionally rejects the `..`
+component (a flat name like `a..b` is fine), and returns `EACCES` for a
+rejected name (`ENAMETOOLONG` if the backing path overflows).
+
+Related implementation: `src/runtime/procemu.c` (`dev_shm_resolve_path`),
+`src/syscall/path.c` and `path.h` (`path_translate_at`, `is_dev_shm`,
+`path_translation_dirfd`, `path_translation_at_flags`), and the metadata
+handlers in `src/syscall/fs.c`, `fs-stat.c`, and `fs-xattr.c`. Validation:
+`tests/test-dev-shm-paths.c`.
+
 ## Dynamic Linking
 
 `elfuse` supports dynamically linked aarch64-linux ELF binaries via
