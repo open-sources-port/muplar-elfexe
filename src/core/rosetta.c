@@ -49,17 +49,6 @@
 #include "syscall/internal.h" /* fd_alloc_from, fd_publish_linux_flags, FD_REGULAR */
 #include "syscall/proc.h" /* proc_set_cmdline */
 
-/* Round a guest virtual address (or size) up to the next 2 MiB boundary. */
-static inline uint64_t align2m_up(uint64_t v)
-{
-    return (v + BLOCK_2MIB - 1) & ~(BLOCK_2MIB - 1);
-}
-
-static inline uint64_t align2m_down(uint64_t v)
-{
-    return v & ~(BLOCK_2MIB - 1);
-}
-
 /* The VZ_CAPS payload only has room for a 42-byte inline path. Publish
  * /proc/self/fd/<bin_guest_fd> there when the real host path is longer so
  * rosetta sees a valid reopenable path without truncation, while the host-side
@@ -227,8 +216,8 @@ int rosetta_prepare(guest_t *g,
      * range above that. The mapping must cover the entire span so all segments
      * resolve through a single Stage-2 region.
      */
-    uint64_t va_base = align2m_down(ri->load_min);
-    uint64_t va_end = align2m_up(ri->load_max);
+    uint64_t va_base = ALIGN_2MIB_DOWN(ri->load_min);
+    uint64_t va_end = ALIGN_2MIB_UP(ri->load_max);
     if (va_end <= va_base) {
         log_error("rosetta: empty load range");
         return -1;
@@ -258,7 +247,7 @@ int rosetta_prepare(guest_t *g,
                 (unsigned long long) g->interp_base);
             return -1;
         }
-        guest_base = (rosetta_limit - size) & ~(BLOCK_2MIB - 1);
+        guest_base = ALIGN_2MIB_DOWN(rosetta_limit - size);
         if (guest_base < g->stack_top + BLOCK_2MIB) {
             log_error(
                 "rosetta: no image gap between stack_top=0x%llx and "
@@ -296,7 +285,7 @@ int rosetta_prepare(guest_t *g,
                 (unsigned long long) guest_base);
             return -1;
         }
-        uint64_t kbuf_gpa = (guest_base - KBUF_SIZE) & ~(BLOCK_2MIB - 1);
+        uint64_t kbuf_gpa = ALIGN_2MIB_DOWN(guest_base - KBUF_SIZE);
         if (guest_init_kbuf(g, kbuf_gpa) < 0) {
             log_error("rosetta: guest_init_kbuf failed at 0x%llx",
                       (unsigned long long) kbuf_gpa);
