@@ -127,6 +127,20 @@ static inline size_t bytes_to_hex(char *dst, const uint8_t *src, size_t len)
     return len * 2;
 }
 
+/* Decode a single hex digit to its 0-15 value, or -1 if @c is not a hex digit.
+ * The inverse building block of bytes_to_hex; accepts either case.
+ */
+static inline int hex_nibble(unsigned char c)
+{
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'a' && c <= 'f')
+        return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F')
+        return c - 'A' + 10;
+    return -1;
+}
+
 /* Write exactly @len bytes to a blocking @fd, resuming across short writes and
  * EINTR. Returns 0 once every byte is written, or -1 with errno set on error.
  * An unexpected zero-byte return is treated as EIO rather than spun on, since

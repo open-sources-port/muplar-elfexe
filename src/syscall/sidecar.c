@@ -295,17 +295,6 @@ bool sidecar_path_targets_reserved_name(const char *path)
     return sidecar_name_reserved(basename);
 }
 
-static int hex_nibble(unsigned char c)
-{
-    if (c >= '0' && c <= '9')
-        return (int) (c - '0');
-    if (c >= 'a' && c <= 'f')
-        return (int) (c - 'a' + 10);
-    if (c >= 'A' && c <= 'F')
-        return (int) (c - 'A' + 10);
-    return -1;
-}
-
 static int sidecar_decode_name(const char *hex, char **out)
 {
     size_t len = strlen(hex);
