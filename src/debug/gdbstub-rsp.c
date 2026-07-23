@@ -18,17 +18,6 @@
 
 static const char hex_chars[] = "0123456789abcdef";
 
-static int hex_val(char c)
-{
-    if (c >= '0' && c <= '9')
-        return c - '0';
-    if (c >= 'a' && c <= 'f')
-        return c - 'a' + 10;
-    if (c >= 'A' && c <= 'F')
-        return c - 'A' + 10;
-    return -1;
-}
-
 int gdb_hex_encode(char *dst, const uint8_t *src, size_t len)
 {
     return (int) bytes_to_hex(dst, src, len);
@@ -37,7 +26,8 @@ int gdb_hex_encode(char *dst, const uint8_t *src, size_t len)
 int gdb_hex_decode(uint8_t *dst, const char *src, size_t len)
 {
     for (size_t i = 0; i < len; i++) {
-        int hi = hex_val(src[i * 2]), lo = hex_val(src[i * 2 + 1]);
+        int hi = hex_nibble((unsigned char) src[i * 2]),
+            lo = hex_nibble((unsigned char) src[i * 2 + 1]);
         if (hi < 0 || lo < 0)
             return -1;
         dst[i] = (uint8_t) ((hi << 4) | lo);
@@ -50,7 +40,7 @@ uint64_t gdb_parse_hex(const char **pp)
     const char *p = *pp;
     uint64_t val = 0;
     while (1) {
-        int d = hex_val(*p);
+        int d = hex_nibble((unsigned char) *p);
         if (d < 0)
             break;
         val = (val << 4) | (uint64_t) d;
@@ -209,7 +199,8 @@ int gdb_rsp_recv(gdb_rsp_ctx_t *ctx, int fd, char *buf, size_t bufsz)
                 buf[pos] = '\0';
 
                 uint8_t expected =
-                    (uint8_t) ((hex_val(ck_hi) << 4) | hex_val(ck_lo));
+                    (uint8_t) ((hex_nibble((unsigned char) ck_hi) << 4) |
+                               hex_nibble((unsigned char) ck_lo));
                 uint8_t actual = rsp_checksum(buf, pos);
                 if (expected == actual) {
                     if (!ctx->no_ack_mode)

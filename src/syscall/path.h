@@ -7,10 +7,12 @@
 
 #pragma once
 
+#include <errno.h>
 #include <fcntl.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 #include <sys/stat.h>
 
 #include "syscall/internal.h"
@@ -61,6 +63,26 @@ static inline int path_translation_at_flags(const path_translation_t *tx,
  * only slashes or the terminating NUL remain.
  */
 bool path_next_component(const char **pathp, const char **comp, size_t *len);
+
+/* Copy a counted component (not NUL-terminated, as path_next_component reports)
+ * into dst and NUL-terminate it. Returns 0, or -1 with errno set to
+ * ENAMETOOLONG when the component does not fit. dst is typically a NAME_MAX+1
+ * buffer, so this also unifies the "len > NAME_MAX" and "len >= sizeof(dst)"
+ * bound checks the callers used to spell inconsistently.
+ */
+static inline int path_component_copy(char *dst,
+                                      size_t dstsz,
+                                      const char *comp,
+                                      size_t len)
+{
+    if (len >= dstsz) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    memcpy(dst, comp, len);
+    dst[len] = '\0';
+    return 0;
+}
 
 bool path_might_use_open_intercept(const char *path);
 bool path_might_use_stat_intercept(const char *path);

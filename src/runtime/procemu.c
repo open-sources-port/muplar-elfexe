@@ -2120,8 +2120,7 @@ void proc_pty_dup_keepalive_locked(int src_master_host_fd,
     /* dup(2) clears FD_CLOEXEC; the keepalive must not survive exec into a
      * guest child that has no map back to it.
      */
-    int fdflags = fcntl(dst_slave, F_GETFD);
-    if (fdflags < 0 || fcntl(dst_slave, F_SETFD, fdflags | FD_CLOEXEC) < 0) {
+    if (fd_set_cloexec(dst_slave) < 0) {
         close(dst_slave);
         return;
     }
@@ -2246,12 +2245,8 @@ void proc_pty_restore_keepalive(int master_host_fd,
     if (master_host_fd < 0)
         goto drop;
 
-    if (slave_host_fd >= 0) {
-        int fdflags = fcntl(slave_host_fd, F_GETFD);
-        if (fdflags < 0 ||
-            fcntl(slave_host_fd, F_SETFD, fdflags | FD_CLOEXEC) < 0)
-            goto drop;
-    }
+    if (slave_host_fd >= 0 && fd_set_cloexec(slave_host_fd) < 0)
+        goto drop;
 
     /* Trust the parent's linux_pts_num verbatim instead of re-parsing
      * slave_path. The wire-format string is bounded to PTY_SLAVE_PATH_MAX - 1

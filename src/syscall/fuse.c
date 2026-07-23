@@ -1660,22 +1660,6 @@ int fuse_access_path(const char *path, int mode, int flags)
     return 0;
 }
 
-static int fuse_write_all(int fd, const void *buf, size_t len)
-{
-    const uint8_t *p = buf;
-    while (len > 0) {
-        ssize_t nw = write(fd, p, len);
-        if (nw < 0) {
-            if (errno == EINTR)
-                continue;
-            return -1;
-        }
-        p += (size_t) nw;
-        len -= (size_t) nw;
-    }
-    return 0;
-}
-
 static int fuse_materialize_open_file_locked(fuse_session_t *session,
                                              uint64_t nodeid,
                                              uint64_t fh,
@@ -1713,7 +1697,7 @@ static int fuse_materialize_open_file_locked(fuse_session_t *session,
             free(reply);
             break;
         }
-        if (fuse_write_all(tmp_fd, reply, reply_len) < 0) {
+        if (write_all(tmp_fd, reply, reply_len) < 0) {
             rc = linux_errno();
             free(reply);
             break;

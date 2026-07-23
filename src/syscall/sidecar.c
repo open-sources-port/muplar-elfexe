@@ -295,17 +295,6 @@ bool sidecar_path_targets_reserved_name(const char *path)
     return sidecar_name_reserved(basename);
 }
 
-static int hex_nibble(unsigned char c)
-{
-    if (c >= '0' && c <= '9')
-        return (int) (c - '0');
-    if (c >= 'a' && c <= 'f')
-        return (int) (c - 'a' + 10);
-    if (c >= 'A' && c <= 'F')
-        return (int) (c - 'A' + 10);
-    return -1;
-}
-
 static int sidecar_decode_name(const char *hex, char **out)
 {
     size_t len = strlen(hex);
@@ -676,13 +665,11 @@ int sidecar_translate_lookup_at(guest_fd_t dirfd,
     size_t comp_len;
     while (path_next_component(&scan, &comp, &comp_len)) {
         char guest_comp[NAME_MAX + 1];
-        if (comp_len >= sizeof(guest_comp)) {
+        if (path_component_copy(guest_comp, sizeof(guest_comp), comp,
+                                comp_len) < 0) {
             close(cur_fd);
-            errno = ENAMETOOLONG;
             return -1;
         }
-        memcpy(guest_comp, comp, comp_len);
-        guest_comp[comp_len] = '\0';
 
         if (sidecar_name_reserved(guest_comp)) {
             close(cur_fd);
@@ -809,12 +796,9 @@ int sidecar_translate_lookup_at(guest_fd_t dirfd,
              */
             while (path_next_component(&scan, &comp, &comp_len)) {
                 char rest_comp[NAME_MAX + 1];
-                if (comp_len >= sizeof(rest_comp)) {
-                    errno = ENAMETOOLONG;
+                if (path_component_copy(rest_comp, sizeof(rest_comp), comp,
+                                        comp_len) < 0)
                     return -1;
-                }
-                memcpy(rest_comp, comp, comp_len);
-                rest_comp[comp_len] = '\0';
                 if (sidecar_append_component(out, outsz, &out_len, rest_comp,
                                              absolute) < 0)
                     return -1;
@@ -1113,25 +1097,6 @@ static int sidecar_load_locked_index(int parent_dirfd,
  * Returns 0 on success, -1 with errno set on error. Handles short writes by
  * retrying until everything is committed.
  */
-static int sidecar_write_all(int fd, const char *buf, size_t len)
-{
-    size_t off = 0;
-    while (off < len) {
-        ssize_t n = write(fd, buf + off, len - off);
-        if (n < 0) {
-            if (errno == EINTR)
-                continue;
-            return -1;
-        }
-        if (n == 0) {
-            errno = EIO;
-            return -1;
-        }
-        off += (size_t) n;
-    }
-    return 0;
-}
-
 /* Serialize the index into a malloc'd buffer. *@out_len receives the byte
  * count.
  *
@@ -1222,8 +1187,7 @@ static int sidecar_write_locked_index(int parent_dirfd,
         errno = saved_errno;
         return -1;
     }
-    if (payload_len > 0 &&
-        sidecar_write_all(tmp_fd, payload, payload_len) < 0) {
+    if (payload_len > 0 && write_all(tmp_fd, payload, payload_len) < 0) {
         int saved_errno = errno;
         close(tmp_fd);
         (void) unlinkat(parent_dirfd, SIDECAR_INDEX_TMP_NAME, 0);
