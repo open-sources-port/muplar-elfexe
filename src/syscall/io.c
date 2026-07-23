@@ -2303,13 +2303,7 @@ int64_t sys_ioctl(guest_t *g, int fd, uint64_t request, uint64_t arg)
             host_fd_ref_close(&host_ref);
             return -LINUX_EFAULT;
         }
-        int flags = fcntl(host_fd, F_GETFL);
-        if (flags < 0) {
-            host_fd_ref_close(&host_ref);
-            return linux_errno();
-        }
-        flags = on ? (flags | O_NONBLOCK) : (flags & ~O_NONBLOCK);
-        int r = fcntl(host_fd, F_SETFL, flags);
+        int r = fd_update_status_flag(host_fd, O_NONBLOCK, on != 0);
         host_fd_ref_close(&host_ref);
         return r < 0 ? linux_errno() : 0;
     }
