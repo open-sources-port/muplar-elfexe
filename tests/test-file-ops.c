@@ -5,7 +5,8 @@
  * Copyright 2025 Moritz Angermann, zw3rk pte. ltd.
  * SPDX-License-Identifier: Apache-2.0
  *
- * Tests: chmod, symlink, hardlink, utimensat, statx, faccessat2, renameat2
+ * Tests: chmod, symlink, readlinkat, hardlink, utimensat, statx, faccessat2,
+ * renameat2
  */
 
 #include <errno.h>
@@ -28,6 +29,10 @@
 
 #ifndef SYS_faccessat2
 #define SYS_faccessat2 439
+#endif
+
+#ifndef SYS_readlinkat
+#define SYS_readlinkat 78
 #endif
 
 #ifndef SYS_renameat2
@@ -114,6 +119,48 @@ int main(void)
             FAIL("not a symlink");
     } else
         FAIL("symlink failed");
+
+    TEST("readlinkat absolute path");
+    {
+        char buf[256];
+        ssize_t len =
+            syscall(SYS_readlinkat, AT_FDCWD, symlink_path, buf, sizeof(buf));
+        EXPECT_TRUE(len == (ssize_t) strlen(testfile) &&
+                        !memcmp(buf, testfile, (size_t) len),
+                    "readlinkat absolute path mismatch");
+    }
+
+    TEST("readlinkat relative to dirfd");
+    {
+        char buf[256];
+        int dirfd = open("/tmp", O_RDONLY | O_DIRECTORY);
+        if (dirfd < 0) {
+            FAIL("open /tmp failed");
+        } else {
+            ssize_t len = syscall(SYS_readlinkat, dirfd, "elfuse-test-symlink",
+                                  buf, sizeof(buf));
+            close(dirfd);
+            EXPECT_TRUE(len == (ssize_t) strlen(testfile) &&
+                            !memcmp(buf, testfile, (size_t) len),
+                        "readlinkat dirfd path mismatch");
+        }
+    }
+
+    TEST("readlinkat truncates without terminator");
+    {
+        char buf[5] = {'X', 'X', 'X', 'X', 'X'};
+        ssize_t len = syscall(SYS_readlinkat, AT_FDCWD, symlink_path, buf, 4);
+        EXPECT_TRUE(len == 4 && !memcmp(buf, testfile, 4) && buf[4] == 'X',
+                    "readlinkat truncation mismatch");
+    }
+
+    TEST("readlinkat invalid dirfd");
+    {
+        char buf[1];
+        EXPECT_ERRNO(syscall(SYS_readlinkat, -1, "elfuse-test-symlink", buf,
+                             sizeof(buf)),
+                     EBADF, "expected EBADF for invalid dirfd");
+    }
 
     /* Test hardlink */
     TEST("hardlink (link)");

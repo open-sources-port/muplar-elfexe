@@ -29,8 +29,10 @@ ALIASES: dict[str, set[str]] = {
     "signalfd4": {"signalfd"},
 }
 
+# Keep only syscalls that genuinely lack a direct test reference. main() rejects
+# stale entries once a direct call or alias is added so exemptions cannot mask a
+# later test regression.
 INDIRECT_COVERAGE: dict[str, str] = {
-    "getxattr": "Covered indirectly through xattr plumbing and O_PATH rejection paths.",
     "lgetxattr": "Symlink xattr semantics are filesystem-sensitive; audit via fs-xattr code and negative-path tests.",
     "lsetxattr": "Symlink xattr semantics are filesystem-sensitive; audit via fs-xattr code and negative-path tests.",
     "listxattr": "Covered indirectly through xattr plumbing; success-path coverage is filesystem-dependent.",
@@ -42,13 +44,9 @@ INDIRECT_COVERAGE: dict[str, str] = {
     "rt_sigpending": "Signal pending state is exercised indirectly by the signal suite.",
     "ptrace": "Covered by debugger integration via tests/test-gdbstub.sh.",
     "chroot": "Exercised only by the dynamic coreutils shell suite via the chroot(8) applet; the syscall itself has no dedicated C test (requires elevated privilege).",
-    "truncate": "Only ftruncate(2) is exercised directly; path-based truncate is exercised by coreutils 'truncate' applet in shell suites.",
     "rt_sigreturn": "Kernel-only return-from-handler trampoline; invoked implicitly by every signal handler exit. No userspace callers.",
-    "exit_group": "Invoked implicitly by glibc/musl _exit() and exit(); every test process exits through this syscall.",
     "get_robust_list": "Pthread-internal: glibc may set/get a robust-list pointer transparently during thread setup; rarely called directly by application code.",
     "set_robust_list": "Pthread-internal: glibc and musl issue set_robust_list during thread bring-up via a path that the audit corpus does not call directly.",
-    "readlinkat": "Exercised indirectly through libc readlink() and the proc/openat symlink-resolution paths in test-procfs-exec; no direct readlinkat() call in C tests.",
-    "faccessat": "Exercised indirectly through libc access() and the coreutils suite (test, ls, cp); faccessat2 has no direct call-shape match either.",
 }
 
 
@@ -122,6 +120,7 @@ def has_direct_reference(name: str, c_corpus: str, other_corpus: str) -> bool:
 def main() -> int:
     c_corpus, other_corpus = load_test_corpora()
     missing: list[str] = []
+    used_indirect: dict[str, str] = {}
 
     for name in load_dispatch_names():
         if has_direct_reference(name, c_corpus, other_corpus):
@@ -132,17 +131,28 @@ def main() -> int:
         ):
             continue
         if name in INDIRECT_COVERAGE:
+            used_indirect[name] = INDIRECT_COVERAGE[name]
             continue
         missing.append(name)
 
-    if missing:
-        print("Uncovered syscalls in dispatch.tbl:", file=sys.stderr)
-        for name in missing:
-            print(f"  - {name}", file=sys.stderr)
+    stale_indirect = sorted(set(INDIRECT_COVERAGE) - set(used_indirect))
+    if missing or stale_indirect:
+        if missing:
+            print("Uncovered syscalls in dispatch.tbl:", file=sys.stderr)
+            for name in missing:
+                print(f"  - {name}", file=sys.stderr)
+        if stale_indirect:
+            print(
+                "Stale indirect-coverage exemptions (now directly covered or "
+                "absent from dispatch.tbl):",
+                file=sys.stderr,
+            )
+            for name in stale_indirect:
+                print(f"  - {name}", file=sys.stderr)
         return 1
 
     print("syscall coverage audit: PASS")
-    for name, reason in sorted(INDIRECT_COVERAGE.items()):
+    for name, reason in sorted(used_indirect.items()):
         print(f"  indirect {name}: {reason}")
     return 0
 
