@@ -2334,6 +2334,45 @@ static int fast_scalar_syscall_result(int nr, uint64_t x0, int64_t *result)
     }
 }
 
+static void escape_log_string(char *dest, const char *src, size_t dest_sz)
+{
+    size_t d = 0;
+    for (size_t s = 0; src[s] != '\0'; s++) {
+        unsigned char c = (unsigned char) src[s];
+        if (c < 32 || c >= 127) {
+            if (d + 4 >= dest_sz)
+                break;
+            switch (c) {
+            case '\n':
+                dest[d++] = '\\';
+                dest[d++] = 'n';
+                break;
+            case '\r':
+                dest[d++] = '\\';
+                dest[d++] = 'r';
+                break;
+            case '\t':
+                dest[d++] = '\\';
+                dest[d++] = 't';
+                break;
+            case '\x1b':
+                dest[d++] = '\\';
+                dest[d++] = 'e';
+                break;
+            default:
+                snprintf(&dest[d], dest_sz - d, "\\x%02x", c);
+                d += 4;
+                break;
+            }
+        } else {
+            if (d + 1 >= dest_sz)
+                break;
+            dest[d++] = src[s];
+        }
+    }
+    dest[d] = '\0';
+}
+
 int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, bool verbose)
 {
     uint64_t x0, x1, x2, x3, x4, x5, x8;
@@ -2572,12 +2611,26 @@ fast_done:
         if (verbose) {
             log_debug("  -> %lld (0x%llx)", (long long) result,
                       (unsigned long long) (uint64_t) result);
-            /* Log file paths for openat/readlinkat */
             if ((int) x8 == SYS_openat || (int) x8 == SYS_readlinkat ||
                 (int) x8 == SYS_faccessat) {
-                char pathbuf[256];
-                if (guest_read_str(g, x1, pathbuf, sizeof(pathbuf)) >= 0)
-                    log_debug("  path=\"%s\"", pathbuf);
+                char pathbuf[256], escaped_path[512];
+                if (guest_read_str(g, x1, pathbuf, sizeof(pathbuf)) >= 0) {
+                    escape_log_string(escaped_path, pathbuf,
+                                      sizeof(escaped_path));
+                    log_debug("  path=\"%s\"", escaped_path);
+                }
+            } else if ((int) x8 == SYS_symlinkat) {
+                char target[256], linkpath[256];
+                char escaped_target[512], escaped_linkpath[512];
+                if (guest_read_str(g, x0, target, sizeof(target)) >= 0 &&
+                    guest_read_str(g, x2, linkpath, sizeof(linkpath)) >= 0) {
+                    escape_log_string(escaped_target, target,
+                                      sizeof(escaped_target));
+                    escape_log_string(escaped_linkpath, linkpath,
+                                      sizeof(escaped_linkpath));
+                    log_debug("  symlink target=\"%s\" linkpath=\"%s\"",
+                              escaped_target, escaped_linkpath);
+                }
             }
         }
         /* Write result back to X0 */
