@@ -36,7 +36,8 @@
 #include "core/sysroot.h"
 
 #include "runtime/forkipc.h"
-#include "runtime/futex.h" /* futex_interrupt_request */
+#include "runtime/futex.h"   /* futex_interrupt_request */
+#include "runtime/procemu.h" /* proc_pty_release_process_slaves */
 #include "runtime/proctitle.h"
 #include "runtime/thread.h"
 
@@ -762,6 +763,14 @@ cleanup:
      * temp ELF, which the post-prepare error paths and a Rosetta guest's
      * teardown previously leaked.
      */
+    /* Give back any pty slaves this process still holds before the fd table
+     * goes away. The guest's stdio slaves are closed by the kernel, not by the
+     * guest, so they never pass through the per-fd close hook; a master in
+     * another process would otherwise wait forever for a hangup that this exit
+     * should have produced.
+     */
+    proc_pty_release_process_slaves();
+
     cleanup_main_resources(&g, guest_initialized, &sysroot_mount,
                            have_host_cwd ? host_cwd : NULL, guest_argv,
                            guest_argc, elf_path, sysroot_path);

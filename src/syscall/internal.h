@@ -160,6 +160,16 @@ int fd_to_host(int guest_fd);
  */
 bool fd_snapshot(int guest_fd, fd_entry_t *out);
 
+/* Read the generation currently published for a guest fd.
+ *
+ * Returns 0 when the slot is closed or out of range. Generations start at 1 and
+ * only ever increase, so 0 never compares equal to a live one and a slot that
+ * changed can never compare equal to an earlier reading. Use this to re-check a
+ * generation pinned earlier, not to pin one against a host fd resolved in a
+ * separate window -- see host_fd_ref_open_io_gen() for that.
+ */
+uint64_t fd_current_generation(int guest_fd);
+
 /* Snapshot an fd entry AND dup its host fd in a single fd_lock critical
  * section. Eliminates the TOCTOU window between reading the type/metadata and
  * duplicating the host fd in the dup(2) path.
@@ -406,6 +416,56 @@ static inline int64_t host_fd_ref_open_io(guest_fd_t guest_fd,
         return -LINUX_EBADF;
     if (host_fd_ref_open(guest_fd, ref) < 0)
         return -LINUX_EBADF;
+    return 0;
+}
+
+/* host_fd_ref_open_io() that also reports the fd generation the reference was
+ * resolved against.
+ *
+ * The generation is captured in the same fd_lock window as the host fd, so the
+ * two always describe one open file. Callers that later re-resolve the guest fd
+ * -- the pty hangup checks -- need exactly that pairing: a generation sampled
+ * in a separate window can already belong to a replacement file while the
+ * reference still points at the original, and the replacement's state would
+ * then be reported against the original. fd_entry_t.host_fd is only ever
+ * written together with a fresh generation, so the generation alone pins the
+ * identity of the file behind ref->fd.
+ *
+ * *out_gen is 0 on failure. Returns 0 on success, -LINUX_EBADF otherwise.
+ */
+static inline int64_t host_fd_ref_open_io_gen(guest_fd_t guest_fd,
+                                              host_fd_ref_t *ref,
+                                              uint64_t *out_gen)
+{
+    ref->fd = -1;
+    ref->owned = false;
+    *out_gen = 0;
+
+    fd_entry_t snap;
+    if (thread_is_single_active()) {
+        /* No sibling can race the slot, so a plain snapshot is already
+         * consistent with the borrowed host fd.
+         */
+        if (!fd_snapshot(guest_fd, &snap) || snap.type == FD_PATH ||
+            snap.host_fd < 0)
+            return -LINUX_EBADF;
+        ref->fd = snap.host_fd;
+        *out_gen = snap.generation;
+        return 0;
+    }
+
+    int host_fd = fd_snapshot_and_dup(guest_fd, &snap);
+    if (host_fd < 0)
+        return -LINUX_EBADF;
+    if (snap.type == FD_PATH) {
+        int saved_errno = errno;
+        close(host_fd);
+        errno = saved_errno;
+        return -LINUX_EBADF;
+    }
+    ref->fd = host_fd;
+    ref->owned = true;
+    *out_gen = snap.generation;
     return 0;
 }
 

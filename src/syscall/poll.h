@@ -41,7 +41,7 @@ int64_t sys_epoll_pwait(guest_t *g,
  * Called from the fd-table close chokepoint; caller holds fd_lock (or runs
  * single-threaded on the relaxed close path).
  */
-void epoll_note_fd_closed(int closed_fd);
+void epoll_note_fd_closed(int closed_fd, uint64_t closed_ofd_id);
 
 /* Free an epoll instance (fd_table[epfd].dir) and drop it from the live count.
  * Called from fd_cleanup_entry() for FD_EPOLL slots.

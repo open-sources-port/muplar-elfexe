@@ -119,13 +119,20 @@ int64_t sys_ppoll(guest_t *g,
     struct pollfd host_fds[256];
     host_fd_ref_t host_refs[256];
     bool need_pollnval[256] = {false};
+    /* Generation pinned per entry in the same fd_lock window as its host fd.
+     * The pty hangup checks below re-resolve the guest fd, so each needs a
+     * witness that the slot still holds the very file this poll resolved; 0
+     * marks entries with nothing pinned and never matches a live generation.
+     */
+    uint64_t guest_gen[256] = {0};
     uint32_t invalid_count = 0;
     for (uint32_t i = 0; i < nfds; i++) {
         host_refs[i] = (host_fd_ref_t) {.fd = -1, .owned = false};
         int guest_fd = guest_fds[i].fd;
         int host_fd = -1;
         if (guest_fd >= 0) {
-            if (host_fd_ref_open_io(guest_fd, &host_refs[i]) < 0) {
+            if (host_fd_ref_open_io_gen(guest_fd, &host_refs[i],
+                                        &guest_gen[i]) < 0) {
                 need_pollnval[i] = true;
                 invalid_count++;
             } else {
@@ -253,8 +260,9 @@ ppoll_retry:
         if (ret == 0) {
             bool hup_pending = false;
             for (uint32_t i = 0; i < nfds && !hup_pending; i++)
-                hup_pending = !need_pollnval[i] && guest_fds[i].fd >= 0 &&
-                              proc_pty_master_hung_up(guest_fds[i].fd);
+                hup_pending =
+                    !need_pollnval[i] && guest_fds[i].fd >= 0 &&
+                    proc_pty_master_hung_up(guest_fds[i].fd, guest_gen[i]);
             if (hup_pending)
                 break;
         }
@@ -280,7 +288,7 @@ ppoll_retry:
         for (uint32_t i = 0; i < nfds; i++) {
             if (need_pollnval[i] || guest_fds[i].fd < 0)
                 continue;
-            if (!proc_pty_master_hung_up(guest_fds[i].fd))
+            if (!proc_pty_master_hung_up(guest_fds[i].fd, guest_gen[i]))
                 continue;
             if (host_fds[i].revents == 0)
                 ret++;
@@ -759,12 +767,14 @@ typedef struct {
                           * file is gone and this stale entry must not drive
                           * kevent against the reused host fd.
                           */
-    bool active;         /* Registered in this instance */
-    bool oneshot_armed;  /* EPOLLONESHOT and event already fired,
-                          * waiting for EPOLL_CTL_MOD re-arm.
-                          * kqueue removed the event, so poll emulation prevents
-                          * reporting but allow MOD.
-                          */
+    uint64_t ofd_id; /* Open file description identity captured at ADD/MOD. */
+    bool active;     /* Registered in this instance */
+    bool oneshot_armed; /* EPOLLONESHOT and event already fired,
+                         * waiting for EPOLL_CTL_MOD re-arm.
+                         * kqueue removed the event, so poll emulation prevents
+                         * reporting but allow MOD.
+                         */
+    bool pty_master;    /* Registration is for a tracked pty master. */
 } epoll_reg_t;
 
 /* Per-epoll-instance data, stored in fd_table[epfd].dir. Each instance has its
@@ -788,8 +798,24 @@ typedef struct {
      * ready-list scans. Lock order: fd_lock -> lock (see internal.h).
      */
     pthread_mutex_t lock;
+    int active_count;
+    int pty_master_count;
     epoll_reg_t regs[FD_TABLE_SIZE];
 } epoll_instance_t;
+
+static void epoll_reg_deactivate_locked(epoll_instance_t *inst,
+                                        epoll_reg_t *reg)
+{
+    if (reg->active && inst->active_count > 0)
+        inst->active_count--;
+    if (reg->pty_master && inst->pty_master_count > 0)
+        inst->pty_master_count--;
+    reg->active = false;
+    reg->oneshot_armed = false;
+    reg->pty_master = false;
+    reg->generation = 0;
+    reg->ofd_id = 0;
+}
 
 /* Count of live epoll instances. When zero, epoll_note_fd_closed() skips its
  * scan entirely -- the overwhelmingly common case (a process with no epoll fd
@@ -928,10 +954,19 @@ int epoll_dup_fd(int src_fd,
  * drops it automatically, and clearing the software state is what makes the
  * pwait active-check honest.
  */
-void epoll_note_fd_closed(int closed_fd)
+void epoll_note_fd_closed(int closed_fd, uint64_t closed_ofd_id)
 {
     if (epoll_live_count == 0)
         return;
+    if (closed_ofd_id != 0) {
+        for (int fd = 0; fd < FD_TABLE_SIZE; fd++) {
+            if (fd == closed_fd)
+                continue;
+            if (fd_table[fd].type != FD_CLOSED &&
+                fd_table[fd].ofd_id == closed_ofd_id)
+                return;
+        }
+    }
     for (int epfd = 0; epfd < FD_TABLE_SIZE; epfd++) {
         if (fd_table[epfd].type != FD_EPOLL)
             continue;
@@ -942,10 +977,7 @@ void epoll_note_fd_closed(int closed_fd)
          * refcount is at least the table's reference and cannot be freed here.
          */
         pthread_mutex_lock(&inst->lock);
-        epoll_reg_t *reg = &inst->regs[closed_fd];
-        reg->active = false;
-        reg->oneshot_armed = false;
-        reg->generation = 0;
+        epoll_reg_deactivate_locked(inst, &inst->regs[closed_fd]);
         pthread_mutex_unlock(&inst->lock);
     }
 }
@@ -1078,6 +1110,8 @@ int64_t sys_epoll_ctl(guest_t *g, int epfd, int op, int fd, uint64_t event_gva)
         goto out;
     }
     int target_host_fd = target_snap.host_fd;
+    bool target_pty_master =
+        proc_pty_master_pts_num(target_host_fd) != UINT32_MAX;
 
     /* Serialize all regs[] access and the paired kqueue mutation against a
      * concurrent close hook or a sibling epoll_ctl on the same instance. The
@@ -1097,8 +1131,7 @@ int64_t sys_epoll_ctl(guest_t *g, int epfd, int op, int fd, uint64_t event_gva)
      */
     if ((reg->active || reg->oneshot_armed) &&
         reg->generation != target_snap.generation) {
-        reg->active = false;
-        reg->oneshot_armed = false;
+        epoll_reg_deactivate_locked(inst, reg);
     }
 
     if (op == LINUX_EPOLL_CTL_DEL) {
@@ -1126,9 +1159,7 @@ int64_t sys_epoll_ctl(guest_t *g, int epfd, int op, int fd, uint64_t event_gva)
             }
             /* Ignore errors from EV_DELETE (fd might already be closed) */
             kevent(epoll_ref.fd, changes, nchanges, NULL, 0, NULL);
-            reg->active = false;
-            /* Clear stale state for potential re-add */
-            reg->oneshot_armed = false;
+            epoll_reg_deactivate_locked(inst, reg);
         }
         ret = 0;
         goto out_locked;
@@ -1226,8 +1257,17 @@ int64_t sys_epoll_ctl(guest_t *g, int epfd, int op, int fd, uint64_t event_gva)
     reg->events = ev.events;
     reg->data = ev.data;
     reg->generation = target_snap.generation;
+    reg->ofd_id = target_snap.ofd_id;
+    if (!reg->active)
+        inst->active_count++;
+    if (target_pty_master && !reg->pty_master)
+        inst->pty_master_count++;
+    else if (!target_pty_master && reg->pty_master &&
+             inst->pty_master_count > 0)
+        inst->pty_master_count--;
     reg->active = true;
     reg->oneshot_armed = false;
+    reg->pty_master = target_pty_master;
 
     ret = 0;
 
@@ -1237,6 +1277,79 @@ out:
     host_fd_ref_close(&epoll_ref);
     epoll_instance_release(inst);
     return ret;
+}
+
+/* Collect guest fds registered in this instance whose pty master has hung up.
+ *
+ * kqueue never reports this: elfuse holds a keepalive slave open for the
+ * master's whole life, so macOS still considers the pty live and stays silent.
+ * Without this an epoll-based terminal waits forever for a hangup that cannot
+ * arrive -- foot leaves its window open after the shell exits.
+ *
+ * Two-phase on purpose. regs[] needs inst->lock, but proc_pty_master_hung_up
+ * takes fd_lock, which sorts *before* inst->lock (see internal.h). Testing
+ * under the reg lock would invert that order against epoll_note_fd_closed,
+ * which holds fd_lock and then takes inst->lock. So candidates are snapshotted
+ * under the reg lock in bounded batches and tested once it is dropped.
+ *
+ * Returns the number of guest fds written to out_gfds, capped at max.
+ * out_gens receives the registration generation each hit was tested against, so
+ * the caller can re-verify it under inst->lock before acting: a sibling can
+ * EPOLL_CTL_DEL and re-ADD the same fd number while the lock is dropped, and
+ * stamping the hangup then would attach it to the new registration's data.
+ */
+static int epoll_collect_hung_up(epoll_instance_t *inst,
+                                 int *out_gfds,
+                                 uint64_t *out_gens,
+                                 int max)
+{
+    if (max <= 0)
+        return 0;
+
+    enum { HUP_SCAN_BATCH = 64 };
+    int cand_gfds[HUP_SCAN_BATCH];
+    uint64_t cand_gens[HUP_SCAN_BATCH];
+    int n = 0;
+    int seen = 0;
+
+    for (int gfd = 0; gfd < FD_TABLE_SIZE && n < max;) {
+        int ncand = 0;
+        int active_count;
+        pthread_mutex_lock(&inst->lock);
+        if (inst->pty_master_count <= 0) {
+            pthread_mutex_unlock(&inst->lock);
+            break;
+        }
+        active_count = inst->active_count;
+        for (; gfd < FD_TABLE_SIZE && ncand < HUP_SCAN_BATCH &&
+               seen < active_count;
+             gfd++) {
+            if (!inst->regs[gfd].active)
+                continue;
+            seen++;
+            if (inst->regs[gfd].oneshot_armed || !inst->regs[gfd].pty_master)
+                continue;
+            cand_gfds[ncand] = gfd;
+            /* Carry the generation the registration pinned at ADD/MOD, so a
+             * close+reopen into the same fd number cannot be mistaken for the
+             * registered master.
+             */
+            cand_gens[ncand] = inst->regs[gfd].generation;
+            ncand++;
+        }
+        pthread_mutex_unlock(&inst->lock);
+        if (ncand == 0 && seen >= active_count)
+            break;
+
+        for (int i = 0; i < ncand && n < max; i++) {
+            if (!proc_pty_master_hung_up(cand_gfds[i], cand_gens[i]))
+                continue;
+            out_gfds[n] = cand_gfds[i];
+            out_gens[n] = cand_gens[i];
+            n++;
+        }
+    }
+    return n;
 }
 
 int64_t sys_epoll_pwait(guest_t *g,
@@ -1287,19 +1400,17 @@ int64_t sys_epoll_pwait(guest_t *g,
         ts.tv_nsec = (timeout_ms % 1000) * 1000000L;
     }
 
-epoll_retry:;
-    /* For indefinite waits, register the wakeup pipe with the kqueue so
-     * exit_group/futex/signal requests can interrupt threads blocked in
-     * kevent().
+    /* A hangup that is already pending must not wait out the caller's timeout.
+     * kqueue will never report it, so a finite epoll_wait would otherwise block
+     * to its deadline before the stamping below runs, and an indefinite one
+     * would burn a needless 200ms slice. Collect whatever else is ready without
+     * blocking and fall straight through to the stamp.
      */
-    bool added_wakeup = false;
-    if (!has_timeout && wakeup_pipe_rd >= 0) {
-        struct kevent wake_ev;
-        EV_SET(&wake_ev, wakeup_pipe_rd, EVFILT_READ, EV_ADD | EV_ONESHOT, 0, 0,
-               (void *) (uintptr_t) -1);
-        kevent(epoll_ref.fd, &wake_ev, 1, NULL, 0, NULL);
-        added_wakeup = true;
-    }
+    int hup_probe;
+    uint64_t hup_probe_gen;
+    bool hup_ready =
+        epoll_collect_hung_up(inst, &hup_probe, &hup_probe_gen, 1) > 0;
+    struct timespec zero_ts = {.tv_sec = 0, .tv_nsec = 0};
 
     /* Collect kqueue events. For indefinite waits, use a short timeout and loop
      * so exit_group can interrupt. Cap maxevents before multiply to avoid
@@ -1310,44 +1421,57 @@ epoll_retry:;
     int cap = maxevents * 2; /* Each epoll fd can produce 2 kevents */
     if (cap > 256)
         cap = 256;
-    /* Reserve one slot for the wakeup pipe event */
-    if (added_wakeup && cap < 256)
-        cap++;
     struct kevent kevents[256];
 
     struct timespec poll_ts = {.tv_sec = 0, .tv_nsec = 200000000L}; /* 200ms */
     int nready;
     do {
         nready = kevent(epoll_ref.fd, NULL, 0, kevents, cap,
-                        has_timeout ? &ts : &poll_ts);
+                        hup_ready ? &zero_ts : (has_timeout ? &ts : &poll_ts));
+        if (nready > 0) {
+        }
 
-        if (proc_exit_group_requested() || futex_interrupt_consume() ||
-            signal_pending_interruption(NULL)) {
+        /* Evaluated stepwise only to name the one that fired; the guards
+         * preserve the short-circuit order, so futex_interrupt_consume() still
+         * runs exactly when it did as a single ||-chain.
+         */
+        /* Ready events outrank an interruption. Linux ep_poll() tests
+         * ep_events_available() and jumps to send_events before it ever looks
+         * at signal_pending(), so EINTR is the answer only for a wait that
+         * produced nothing.
+         *
+         * Returning EINTR while holding a ready fd loses it for good in
+         * practice: kqueue re-reports it on the next call, but the same pending
+         * signal is still there, so the guest is handed EINTR forever and never
+         * drains the fd. foot hit exactly that -- a SIGCHLD it had a handler
+         * for but had not yet run left its Wayland socket readable and
+         * undelivered, and it spun at 100% CPU without ever drawing a window.
+         *
+         * exit_group still wins outright: the process is going away and there
+         * is nothing to deliver events to.
+         */
+        bool interrupted = proc_exit_group_requested();
+        if (!interrupted && nready <= 0)
+            interrupted =
+                futex_interrupt_consume() || signal_pending_interruption(NULL);
+        if (interrupted) {
             nready = -1;
             errno = EINTR;
             break;
         }
+
+        /* An indefinite wait re-arms on a 200ms slice; break out when a master
+         * hung up during one, since kqueue will never make that fd ready.
+         */
+        if (nready == 0 && !has_timeout) {
+            hup_ready =
+                epoll_collect_hung_up(inst, &hup_probe, &hup_probe_gen, 1) > 0;
+            if (hup_ready)
+                break;
+        }
     } while (nready == 0 && !has_timeout);
 
     int saved_errno = errno;
-
-    /* Remove wakeup pipe registration and drain if it fired */
-    if (added_wakeup) {
-        struct kevent del_ev;
-        EV_SET(&del_ev, wakeup_pipe_rd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
-        kevent(epoll_ref.fd, &del_ev, 1, NULL, 0, NULL);
-        wakeup_pipe_drain();
-        /* Filter out wakeup pipe events from results */
-        for (int i = 0; i < nready; i++) {
-            if ((uintptr_t) kevents[i].udata == (uintptr_t) -1) {
-                kevents[i] = kevents[nready - 1];
-                nready--;
-                i--;
-            }
-        }
-        if (nready == 0 && !has_timeout)
-            goto epoll_retry;
-    }
 
     /* Restore original signal mask after the blocking wait */
     if (mask_installed)
@@ -1374,6 +1498,13 @@ epoll_retry:;
 
     memset(out_index, 0xff, sizeof(out_index));
 
+    /* Gather hung-up masters before taking inst->lock: the collector takes that
+     * lock itself, and it is not recursive.
+     */
+    int hup_gfds[256];
+    uint64_t hup_gens[256];
+    int nhup = epoll_collect_hung_up(inst, hup_gfds, hup_gens, maxevents);
+
     /* Serialize the regs[] reads and the oneshot re-arm against a concurrent
      * epoll_ctl or the close hook. Held only for this bookkeeping, never across
      * the blocking kevent() above; out[] is a local snapshot, so the guest
@@ -1384,8 +1515,13 @@ epoll_retry:;
 
     for (int i = 0; i < nready && nout < maxevents; i++) {
         int gfd = (int) (uintptr_t) kevents[i].udata;
-        if (!RANGE_CHECK(gfd, 0, FD_TABLE_SIZE) || !inst->regs[gfd].active)
+        if (!RANGE_CHECK(gfd, 0, FD_TABLE_SIZE) || !inst->regs[gfd].active) {
+            struct kevent del;
+            EV_SET(&del, kevents[i].ident, kevents[i].filter, EV_DELETE, 0, 0,
+                   NULL);
+            kevent(epoll_ref.fd, &del, 1, NULL, 0, NULL);
             continue;
+        }
 
         /* EPOLLONESHOT semantics: once any event fired and was reported, the fd
          * stays disarmed until EPOLL_CTL_MOD re-arms it. With multi-filter
@@ -1413,6 +1549,39 @@ epoll_retry:;
         epoll_merge_event(&out[idx], &kevents[i], reg);
     }
 
+    /* Stamp EPOLLHUP for the masters the host cannot report on. Linux delivers
+     * EPOLLHUP whether or not the caller asked for it, so this ignores
+     * reg->events. Merging into an existing entry keeps a hangup that lands
+     * alongside queued output reported as EPOLLIN | EPOLLHUP, the way Linux
+     * does it -- the reader drains the shell's parting output before acting on
+     * the hangup. Runs before the oneshot marking below so an fd that fired
+     * this round still carries the hangup into that same report.
+     */
+    for (int i = 0; i < nhup; i++) {
+        int gfd = hup_gfds[i];
+        /* Re-check under the lock: the collector tested unlocked, so a
+         * concurrent epoll_ctl or close hook may have retired the entry since.
+         * The generation match is what rejects a DEL + re-ADD of the same fd
+         * number in that window, which would otherwise report this hangup
+         * against the new registration's epoll_data.
+         */
+        if (!inst->regs[gfd].active || inst->regs[gfd].oneshot_armed ||
+            inst->regs[gfd].generation != hup_gens[i])
+            continue;
+        int idx = out_index[gfd];
+        if (idx < 0) {
+            if (nout >= maxevents)
+                break;
+            idx = nout++;
+            out_index[gfd] = idx;
+            out_gfds[idx] = gfd;
+            out[idx].events = 0;
+            out[idx]._pad = 0;
+            out[idx].data = inst->regs[gfd].data;
+        }
+        out[idx].events |= LINUX_EPOLLHUP;
+    }
+
     /* Mark EPOLLONESHOT FDs as armed (fired but waiting for MOD re-arm). kqueue
      * already removed the event (EV_ONESHOT), so poll emulation marks the
      * registration as oneshot_armed to allow MOD but prevent further event
@@ -1430,12 +1599,13 @@ epoll_retry:;
 
     /* Write results to guest */
     if (nout > 0) {
-        if (guest_write_small(g, events_gva, out,
-                              nout * sizeof(linux_epoll_event_t)) < 0) {
-            host_fd_ref_close(&epoll_ref);
-            epoll_instance_release(inst);
-            return -LINUX_EFAULT;
-        }
+        for (int i = 0; i < nout; i++)
+            if (guest_write_small(g, events_gva, out,
+                                  nout * sizeof(linux_epoll_event_t)) < 0) {
+                host_fd_ref_close(&epoll_ref);
+                epoll_instance_release(inst);
+                return -LINUX_EFAULT;
+            }
     }
 
     host_fd_ref_close(&epoll_ref);

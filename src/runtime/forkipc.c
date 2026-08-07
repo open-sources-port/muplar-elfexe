@@ -36,6 +36,7 @@
 #include "runtime/forkipc.h"
 #include "runtime/fork-state.h"
 #include "runtime/futex.h"
+#include "runtime/procemu.h"
 
 #include "syscall/abi.h"
 #include "syscall/chown-overlay.h"
@@ -294,15 +295,34 @@ int fork_child_main(int ipc_fd,
         return 1;
     }
 
+    /* Both the fd table and the keepalives are in place, which is what this
+     * needs to recognize the slave fds inherited from the parent and put them
+     * back on the books. Without it the parent's close of its own copy makes
+     * the pty look hung up while this child still holds a live slave.
+     */
+    proc_pty_adopt_inherited_slaves();
+
     signal_state_t sig;
     if (fork_ipc_recv_process_state(ipc_fd, &g, &sig) < 0) {
         log_error("fork-child: failed to receive process state");
+        /* Give back the credit the parent added for this child before
+         * bailing: nothing here reaches the teardown that normally
+         * returns it, and a child that never runs must not leave the
+         * pty looking busy to the master the parent still holds.
+         */
+        proc_pty_release_process_slaves();
         guest_destroy(&g);
         return 1;
     }
 
     if (chown_overlay_recv(ipc_fd) < 0) {
         log_error("fork-child: failed to receive chown overlay");
+        /* Give back the credit the parent added for this child before
+         * bailing: nothing here reaches the teardown that normally
+         * returns it, and a child that never runs must not leave the
+         * pty looking busy to the master the parent still holds.
+         */
+        proc_pty_release_process_slaves();
         guest_destroy(&g);
         return 1;
     }
@@ -317,6 +337,12 @@ int fork_child_main(int ipc_fd,
             0 ||
         admission_ready != 1) {
         log_error("fork-child: parent did not commit child admission");
+        /* Give back the credit the parent added for this child before
+         * bailing: nothing here reaches the teardown that normally
+         * returns it, and a child that never runs must not leave the
+         * pty looking busy to the master the parent still holds.
+         */
+        proc_pty_release_process_slaves();
         guest_destroy(&g);
         return 1;
     }
@@ -371,6 +397,12 @@ int fork_child_main(int ipc_fd,
      * the single-threaded child at this point).
      */
     if (shim_globals_install_per_vcpu(vcpu, &g, hdr.child_pid) < 0) {
+        /* Give back the credit the parent added for this child before
+         * bailing: nothing here reaches the teardown that normally
+         * returns it, and a child that never runs must not leave the
+         * pty looking busy to the master the parent still holds.
+         */
+        proc_pty_release_process_slaves();
         guest_destroy(&g);
         return 1;
     }
@@ -498,6 +530,14 @@ int fork_child_main(int ipc_fd,
         vcpu_run_loop(vcpu, vexit, &g, verbose, timeout_sec, &wait_status);
 
     proc_process_exit(wait_status);
+
+    /* Same reason as the main-process path: this child is where a forked shell
+     * runs, and its stdio slaves are closed by the kernel rather than by the
+     * guest, so they never reach the per-fd close hook. The parent still holds
+     * the master and is waiting for exactly this hangup.
+     */
+    proc_pty_release_process_slaves();
+
     guest_destroy(&g);
     return exit_code;
 }
@@ -1910,6 +1950,18 @@ int64_t sys_clone(hv_vcpu_t vcpu,
         log_error("clone: failed to release admitted child");
         goto fail_snapshot;
     }
+
+    /* The child's inherited slave copies are live from the moment fork returns,
+     * so they go on the shared count here rather than in the child's own init,
+     * which the parent's close of its copy can beat.
+     *
+     * Deliberately after the last failure exit: every goto above unwinds a
+     * child that will never run, and a credit added before them would never be
+     * given back -- the pty would then look permanently busy and its master
+     * would stop reporting hangups for good. Still before siblings resume, so
+     * no guest code can close a slave in between.
+     */
+    proc_pty_fork_parent_note_inherited();
 
     /* The process-state payload includes the SCM_RIGHTS handoff for region
      * backing fds. Keep siblings quiesced until that send completes so a

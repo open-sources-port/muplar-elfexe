@@ -951,6 +951,11 @@ static int duplicate_guest_fd(int src_fd,
      * race and leak the slave fd. No-op when the source has no keepalive.
      */
     proc_pty_dup_keepalive_locked(src_snap.host_fd, new_host_fd);
+    /* Same reasoning for the slave side: the alias is a live reference to the
+     * pty and must be on the books before the guest fd is published, or the
+     * source's close will retire the only counted reference.
+     */
+    proc_pty_dup_guest_slave_locked(src_snap.host_fd, new_host_fd);
     proc_pty_unlock_for_dup();
 
     int new_type = (src_snap.type == FD_STDIO) ? FD_REGULAR : src_snap.type;
@@ -965,9 +970,13 @@ static int duplicate_guest_fd(int src_fd,
         if (fixed_slot)
             errno = EBADF;
         /* fd_cleanup_entry never ran on new_host_fd (no guest fd was
-         * registered), so the keepalive must be dropped explicitly here.
+         * registered), so both halves of the pty bookkeeping must be dropped
+         * explicitly here. Leaving the slave counted would keep a host fd that
+         * is about to be closed on the books, and the master would never see
+         * its last slave go.
          */
         proc_pty_close_keepalive(new_host_fd);
+        proc_pty_slave_fd_closed(new_host_fd);
         close_keep_errno(new_host_fd);
         return -1;
     }

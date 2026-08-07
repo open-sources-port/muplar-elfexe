@@ -845,9 +845,39 @@ static int64_t host_fd_ref_open_checked(int guest_fd,
     return host_fd_ref_open_io(guest_fd, ref);
 }
 
+/* True when a read on this pty master must fail with EIO.
+ *
+ * Linux fails every read variant once the master has hung up, not just
+ * read(2). Only after the queue drains: a shell that printed on its way out
+ * leaves that output behind, and Linux hands it over before reporting the
+ * hangup, so deciding on the hangup first would swallow it.
+ *
+ * Without this the host read simply blocks -- elfuse's keepalive slave keeps
+ * the pty alive from its point of view -- so a terminal that drains its master
+ * with readv() gets the POLLHUP, calls readv, and wedges there forever with its
+ * window still open.
+ */
+static bool pty_read_hangs_up(int guest_fd, uint64_t gen, int host_fd)
+{
+    if (!proc_pty_master_hung_up(guest_fd, gen))
+        return false;
+    struct pollfd drain = {.fd = host_fd, .events = POLLIN};
+    return poll(&drain, 1, 0) <= 0 || !(drain.revents & POLLIN);
+}
+
 static int64_t host_fd_ref_open_regular_io(int guest_fd, host_fd_ref_t *ref)
 {
     return host_fd_ref_open_io(guest_fd, ref);
+}
+
+/* host_fd_ref_open_regular_io() that also pins the generation the reference was
+ * resolved against, in the same fd_lock window. See host_fd_ref_open_io_gen().
+ */
+static int64_t host_fd_ref_open_regular_io_gen(int guest_fd,
+                                               host_fd_ref_t *ref,
+                                               uint64_t *out_gen)
+{
+    return host_fd_ref_open_io_gen(guest_fd, ref, out_gen);
 }
 
 static int64_t proc_try_read_intercept(int fd,
@@ -1051,8 +1081,13 @@ int64_t sys_read(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
         return urandom_read(g, fd, buf_gva, count);
     }
 
+    /* Pin the generation in the same fd_lock window as the host fd. The pty
+     * hangup check below re-resolves the guest fd, and this is the witness that
+     * the slot still holds the very file this read resolved.
+     */
     host_fd_ref_t host_ref;
-    int64_t err = host_fd_ref_open_regular_io(fd, &host_ref);
+    uint64_t read_gen;
+    int64_t err = host_fd_ref_open_regular_io_gen(fd, &host_ref, &read_gen);
     if (err < 0)
         return err;
 
@@ -1080,12 +1115,9 @@ int64_t sys_read(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
      * leaves that output queued, and Linux hands it over before reporting the
      * hangup. Deciding on the hangup first would swallow it.
      */
-    if (proc_pty_master_hung_up(fd)) {
-        struct pollfd drain = {.fd = host_ref.fd, .events = POLLIN};
-        if (poll(&drain, 1, 0) <= 0 || !(drain.revents & POLLIN)) {
-            host_fd_ref_close(&host_ref);
-            return -LINUX_EIO;
-        }
+    if (pty_read_hangs_up(fd, read_gen, host_ref.fd)) {
+        host_fd_ref_close(&host_ref);
+        return -LINUX_EIO;
     }
 
     off_t offset = lseek(host_ref.fd, 0, SEEK_CUR);
@@ -1432,7 +1464,8 @@ int64_t sys_readv(guest_t *g, int fd, uint64_t iov_gva, int iovcnt)
     }
 
     host_fd_ref_t host_ref;
-    int64_t err = host_fd_ref_open_regular_io(fd, &host_ref);
+    uint64_t readv_gen;
+    int64_t err = host_fd_ref_open_regular_io_gen(fd, &host_ref, &readv_gen);
     if (err < 0)
         return err;
 
@@ -1447,6 +1480,19 @@ int64_t sys_readv(guest_t *g, int fd, uint64_t iov_gva, int iovcnt)
         host_iov_free(&host_iov);
         host_fd_ref_close(&host_ref);
         return err < 0 ? err : 0;
+    }
+
+    /* Same hangup rule as sys_read: a terminal draining its master with readv
+     * must be told the shell is gone, or it blocks here forever.
+     *
+     * After the zero-payload branch on purpose: a vector that can consume
+     * nothing reads zero bytes on Linux whatever the pty's state, so deciding
+     * the hangup first would turn that into a spurious EIO.
+     */
+    if (pty_read_hangs_up(fd, readv_gen, host_ref.fd)) {
+        host_iov_free(&host_iov);
+        host_fd_ref_close(&host_ref);
+        return -LINUX_EIO;
     }
 
     off_t offset = lseek(host_ref.fd, 0, SEEK_CUR);
@@ -1960,7 +2006,8 @@ int64_t sys_ioctl(guest_t *g, int fd, uint64_t request, uint64_t arg)
     }
 
     host_fd_ref_t host_ref;
-    int64_t err = host_fd_ref_open_regular_io(fd, &host_ref);
+    uint64_t ioctl_gen;
+    int64_t err = host_fd_ref_open_regular_io_gen(fd, &host_ref, &ioctl_gen);
     if (err < 0)
         return err;
     int host_fd = host_ref.fd;
@@ -2316,6 +2363,13 @@ int64_t sys_ioctl(guest_t *g, int fd, uint64_t request, uint64_t arg)
             host_fd_ref_close(&host_ref);
             return -LINUX_EINVAL;
         }
+        /* Resolve the Linux pts number before opening, the same way TIOCGPTN
+         * does: the slave handed out here counts toward the master's hangup
+         * accounting, and that table is keyed by pts number. Pass the guest fd
+         * so the adopt validates against the canonical (host_fd, generation)
+         * rather than this call's host_fd_ref dup.
+         */
+        uint32_t pts_num = proc_pty_master_adopt(fd);
         char slave[64];
         if (ptsname_r(host_fd, slave, sizeof(slave)) != 0) {
             host_fd_ref_close(&host_ref);
@@ -2335,6 +2389,25 @@ int64_t sys_ioctl(guest_t *g, int fd, uint64_t request, uint64_t arg)
             close(host_slave_fd);
             return -LINUX_EMFILE;
         }
+
+        /* Record the slave against its master. Without this the master's
+         * guest_slave_seen stays false and a master whose only slave arrived
+         * this way never reports a hangup -- and TIOCGPTPEER has been the
+         * recommended way to reach the peer since Linux 4.13. Registered after
+         * fd_alloc so a failed alloc leaves nothing behind to retire.
+         *
+         * Only when the slot still holds the generation this ioctl resolved.
+         * proc_pty_master_adopt re-resolves the guest fd, so its pts_num
+         * describes the master the slot held at that moment, while ptsname_r
+         * and the open above used the host fd pinned on entry. Generations only
+         * ever increase, so an unchanged one here proves the slot never moved
+         * across either window and the two agree on one master. If it did move,
+         * pts_num belongs to a different pty and charging the slave to it would
+         * corrupt that master's accounting; dropping the record instead only
+         * forgoes a hangup report on a master the guest concurrently closed.
+         */
+        if (pts_num != UINT32_MAX && fd_current_generation(fd) == ioctl_gen)
+            proc_pty_note_guest_slave(host_slave_fd, pts_num);
 
         /* Track CLOEXEC + accmode in the guest table so exec honors them; the
          * host fd's own FD_CLOEXEC is per-descriptor and would be lost on the

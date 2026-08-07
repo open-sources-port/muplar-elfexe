@@ -122,11 +122,49 @@ void proc_pty_note_guest_slave(int slave_host_fd, uint32_t linux_pts_num);
  */
 void proc_pty_slave_fd_closed(int host_fd);
 
-/* True when the guest has closed every slave fd it held for this master, the
- * state Linux reports as a hangup: poll gives POLLHUP and read gives EIO.
- * elfuse's own keepalive slave stays open, so the host cannot answer this.
+/* Count the pty slave fds a forked child inherited from its parent.
+ *
+ * The host-fd-to-pty mapping is per-process and does not cross the fork, so
+ * without this an inherited slave is counted by nobody: the parent closes its
+ * own copy, the count reaches zero while the child's shell still holds a live
+ * slave, and the master reports a hangup as soon as the terminal starts. Call
+ * from the fork child once its fd table and keepalives are both restored.
  */
-bool proc_pty_master_hung_up(int guest_fd);
+void proc_pty_adopt_inherited_slaves(void);
+
+/* Return this process's outstanding pty slave count at teardown.
+ *
+ * A guest that exits normally never closes its stdio -- the kernel does -- so
+ * the slaves behind fds 0/1/2 never reach the per-fd close hook. Without this
+ * the shared count keeps a departed shell's slaves forever and the master never
+ * reports the hangup its terminal is waiting on. Call once from the process
+ * cleanup path; idempotent.
+ */
+void proc_pty_release_process_slaves(void);
+
+/* Count the slave fds a fork is about to duplicate into the child.
+ *
+ * Called in the parent while the guest is still inside clone, because the child
+ * cannot do it for itself in time: a parent that closes its own copy the moment
+ * fork returns -- openpty(3)-style terminal startup -- would otherwise drive
+ * the count to zero before the child's init runs, and the master would report a
+ * hangup with the shell alive.
+ */
+void proc_pty_fork_parent_note_inherited(void);
+
+/* True when the guest has closed every slave fd it held for this master, the
+ * state Linux reports as a hangup: poll gives POLLHUP, epoll gives EPOLLHUP,
+ * and read gives EIO. elfuse's own keepalive slave stays open, so the host
+ * cannot answer this.
+ *
+ * expect_generation is the fd generation the caller pinned when it resolved
+ * guest_fd. The lookup re-resolves the guest fd, so without that witness a
+ * close-and-reuse in the window would report the hangup against whatever file
+ * now occupies the slot. Pass fd_current_generation(guest_fd) captured at
+ * resolve time; a mismatch (including the 0 returned for a closed slot) reports
+ * no hangup.
+ */
+bool proc_pty_master_hung_up(int guest_fd, uint64_t expect_generation);
 
 /* Caller-locked variant of pty keepalive duplication. Brackets the host
  * fd_snapshot_and_dup and the keepalive mirror under one pty_keepalive_lock
@@ -138,6 +176,19 @@ void proc_pty_lock_for_dup(void);
 void proc_pty_unlock_for_dup(void);
 void proc_pty_dup_keepalive_locked(int src_master_host_fd,
                                    int dst_master_host_fd);
+
+/* Slave-side counterpart of proc_pty_dup_keepalive_locked: mirror a guest pty
+ * slave onto the host fd a dup just produced.
+ *
+ * open() and the TIOCGPTPEER ioctl are the two paths that register a slave;
+ * every further reference dup2 creates went uncounted. A terminal that dup2()s
+ * its slave onto stdin/stdout/stderr and closes the original then drove the
+ * count to zero with three live references left, and the master reported a
+ * hangup while the shell was still running. Caller must hold the dup bracket
+ * (proc_pty_lock_for_dup).
+ */
+void proc_pty_dup_guest_slave_locked(int src_slave_host_fd,
+                                     int dst_slave_host_fd);
 
 /* Return the captured Linux pts number for a host master fd, or UINT32_MAX when
  * no keepalive is registered. Lets sys_ioctl TIOCGPTN report the value
