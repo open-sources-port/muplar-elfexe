@@ -133,6 +133,7 @@ test-fork-synthetic-fd
 test-guard-page
 test-mmap-hint
 test-mmap-sigbus-efault
+test-brk-stack
 
 [section] mremap tests
 test-mremap
