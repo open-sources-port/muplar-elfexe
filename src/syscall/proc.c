@@ -3861,12 +3861,17 @@ static bool vcpu_handle_el0_fault(guest_t *g,
      *
      * Only EC 0x20 (instruction abort from a lower EL) and EC 0x24 (data abort
      * from a lower EL) are intentionally routed to the SIGSEGV path that
-     * follows. Every other forwarded EC lands here as SIGILL: 0x00 (undefined
-     * instruction), 0x18 (system instruction trap), 0x32/0x33 (software step),
-     * 0x3C (BRK), and any unrecognized class. If a future change adds a new
-     * lower-EL abort class (e.g. 0x21 / 0x25 for higher exception levels) that
-     * should map to SIGSEGV, the test below needs explicit widening; do NOT
-     * relax the check casually.
+     * follows. Everything else the shim forwards on HVC #11 lands here as
+     * SIGILL, and that is more than undefined instructions: src/core/shim.S
+     * dispatches 0x18 to HVC #12 and 0x3C to HVC #10 before the catch-all, so
+     * what arrives is 0x00, 0x32/0x33 (software step), and any class the shim
+     * does not recognize, which includes 0x07 (SIMD/FP access), 0x0E (illegal
+     * execution state) and the alignment classes. The message below says
+     * "non-abort" rather than naming one of them, and carries the EC.
+     *
+     * If a future change adds a new lower-EL abort class (e.g. 0x21 / 0x25 for
+     * higher exception levels) that should map to SIGSEGV, the test below needs
+     * explicit widening; do NOT relax the check casually.
      */
     if (fault_ec != 0x20 && fault_ec != 0x24) {
         signal_set_fault_info(LINUX_ILL_ILLOPC, elr_addr, esr);
@@ -3877,7 +3882,7 @@ static bool vcpu_handle_el0_fault(guest_t *g,
          * --verbose can see.
          */
         log_at(sig_ret < 0 ? LOG_WARN : LOG_DEBUG,
-               "%s: EL0 undefined insn at "
+               "%s: EL0 non-abort exception at "
                "PC=0x%llx (ESR=0x%llx EC=0x%x) "
                "-> SIGILL/ILL_ILLOPC",
                prefix, (unsigned long long) elr_addr, (unsigned long long) esr,
