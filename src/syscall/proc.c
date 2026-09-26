@@ -3861,23 +3861,32 @@ static bool vcpu_handle_el0_fault(guest_t *g,
      *
      * Only EC 0x20 (instruction abort from a lower EL) and EC 0x24 (data abort
      * from a lower EL) are intentionally routed to the SIGSEGV path that
-     * follows. Every other forwarded EC lands here as SIGILL: 0x00 (undefined
-     * instruction), 0x18 (system instruction trap), 0x32/0x33 (software step),
-     * 0x3C (BRK), and any unrecognized class. If a future change adds a new
-     * lower-EL abort class (e.g. 0x21 / 0x25 for higher exception levels) that
-     * should map to SIGSEGV, the test below needs explicit widening; do NOT
-     * relax the check casually.
+     * follows. Everything else the shim forwards on HVC #11 lands here as
+     * SIGILL, and that is more than undefined instructions: src/core/shim.S
+     * dispatches 0x18 to HVC #12 and 0x3C to HVC #10 before the catch-all, so
+     * what arrives is 0x00, 0x32/0x33 (software step), and any class the shim
+     * does not recognize, which includes 0x07 (SIMD/FP access), 0x0E (illegal
+     * execution state) and the alignment classes. The message below says
+     * "non-abort" rather than naming one of them, and carries the EC.
+     *
+     * If a future change adds a new lower-EL abort class (e.g. 0x21 / 0x25 for
+     * higher exception levels) that should map to SIGSEGV, the test below needs
+     * explicit widening; do NOT relax the check casually.
      */
     if (fault_ec != 0x20 && fault_ec != 0x24) {
-        if (verbose)
-            log_debug(
-                "%s: EL0 undefined insn at "
-                "PC=0x%llx (ESR=0x%llx EC=0x%x) "
-                "-> SIGILL/ILL_ILLOPC",
-                prefix, (unsigned long long) elr_addr, (unsigned long long) esr,
-                fault_ec);
         signal_set_fault_info(LINUX_ILL_ILLOPC, elr_addr, esr);
         int sig_ret = signal_deliver_fault(vcpu, g, LINUX_SIGILL, exit_code);
+
+        /* Warn on a terminating return, debug otherwise, on the same terms as
+         * the SIGSEGV exit below, so neither fault class is the one only
+         * --verbose can see.
+         */
+        log_at(sig_ret < 0 ? LOG_WARN : LOG_DEBUG,
+               "%s: EL0 non-abort exception at "
+               "PC=0x%llx (ESR=0x%llx EC=0x%x) "
+               "-> SIGILL/ILL_ILLOPC",
+               prefix, (unsigned long long) elr_addr, (unsigned long long) esr,
+               fault_ec);
 
         /* HVC #11 consumes X8 as the post-fault TLBI opcode. signal_deliver()
          * may leave it unchanged when no handler is materialized, or set the
@@ -4022,20 +4031,21 @@ static bool vcpu_handle_el0_fault(guest_t *g,
      * Linux.
      */
     int si_code = (fsc_type == 0x03) ? LINUX_SEGV_ACCERR : LINUX_SEGV_MAPERR;
-    if (verbose) {
-        const char *fault_type = (fault_ec == 0x20) ? "inst" : "data";
-        const char *code_name =
-            (si_code == LINUX_SEGV_MAPERR) ? "MAPERR" : "ACCERR";
-        log_debug(
-            "%s: EL0 %s fault at 0x%llx "
-            "PC=0x%llx (ESR=0x%llx FSC=0x%x) "
-            "-> SIGSEGV/%s",
-            prefix, fault_type, (unsigned long long) far_addr,
-            (unsigned long long) elr_addr, (unsigned long long) esr, fsc,
-            code_name);
-    }
     signal_set_fault_info(si_code, far_addr, esr);
     int sig_ret = signal_deliver_fault(vcpu, g, LINUX_SIGSEGV, exit_code);
+
+    /* A negative return is terminating: either the default disposition kills or
+     * the handler frame could not be installed. Keep its address and PC visible
+     * without the full syscall trace from --verbose.
+     */
+    log_at(sig_ret < 0 ? LOG_WARN : LOG_DEBUG,
+           "%s: EL0 %s fault at 0x%llx "
+           "PC=0x%llx (ESR=0x%llx FSC=0x%x) "
+           "-> SIGSEGV/%s",
+           prefix, (fault_ec == 0x20) ? "inst" : "data",
+           (unsigned long long) far_addr, (unsigned long long) elr_addr,
+           (unsigned long long) esr, fsc,
+           (si_code == LINUX_SEGV_MAPERR) ? "MAPERR" : "ACCERR");
 
     /* Clear X8 for the same reason as the SIGILL exit above. */
     hv_vcpu_set_reg(vcpu, HV_REG_X8, 0);

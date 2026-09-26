@@ -869,6 +869,7 @@ run_unit_tests()
     test_rc "$runner" "test-mmap-hint" 0 "$bindir/test-mmap-hint"
 
     test_rc "$runner" "test-mmap-sigbus-efault" 0 "$bindir/test-mmap-sigbus-efault"
+    test_check "$runner" "test-brk-stack" "0 failed" "$bindir/test-brk-stack"
 
     printf "\nLow-base ET_EXEC memory regression\n"
     test_rc "$runner" "test-lowbase-mem-200000" 0 "$bindir/test-lowbase-mem-200000"
@@ -1512,9 +1513,14 @@ run_suite()
 # Both went up by one again for test-futex-wake-pi, which regression-tests the
 # EINVAL a plain wake owes a PI waiter, and which runs in both lanes for the
 # same two reasons. 252 and 227, observed here at 286 and 264.
+#
+# And once more for test-brk-stack, the issue #320 regression: a brk grow must
+# stop at its neighbors rather than extend page tables over them. No fixture,
+# not in either skip list, so it runs in both lanes. 253 and 228, observed here
+# at 295 and 273.
 EXPECTED_BASELINES=(
-    "elfuse-aarch64|252|0"
-    "qemu-aarch64|227|0"
+    "elfuse-aarch64|253|0"
+    "qemu-aarch64|228|0"
     "elfuse-x86_64:apple-m1-m2|71|0"
     "elfuse-x86_64:apple-m3-plus|71|0"
     "elfuse-x86_64:apple-unknown|71|0"
