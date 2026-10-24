@@ -3848,6 +3848,30 @@ out_sendfile:
     return (int64_t) total;
 }
 
+/* generic_file_rw_checks (Linux fs/read_write.c), which copy_file_range runs
+ * before it looks at offsets, lengths or limits: both ends regular files, the
+ * input open for reading, and the output open for writing without O_APPEND.
+ */
+static int64_t copy_file_rw_checks(int in_hfd, int out_hfd)
+{
+    struct stat in_st, out_st;
+    if (fstat(in_hfd, &in_st) < 0 || fstat(out_hfd, &out_st) < 0)
+        return linux_errno();
+    if (S_ISDIR(in_st.st_mode) || S_ISDIR(out_st.st_mode))
+        return -LINUX_EISDIR;
+    if (!S_ISREG(in_st.st_mode) || !S_ISREG(out_st.st_mode))
+        return -LINUX_EINVAL;
+
+    int in_fl = fcntl(in_hfd, F_GETFL);
+    int out_fl = fcntl(out_hfd, F_GETFL);
+    if (in_fl < 0 || out_fl < 0)
+        return linux_errno();
+    if ((in_fl & O_ACCMODE) == O_WRONLY || (out_fl & O_ACCMODE) == O_RDONLY ||
+        (out_fl & O_APPEND))
+        return -LINUX_EBADF;
+    return 0;
+}
+
 int64_t sys_copy_file_range(guest_t *g,
                             int fd_in,
                             uint64_t off_in_gva,
@@ -3885,6 +3909,10 @@ int64_t sys_copy_file_range(guest_t *g,
             goto out_copy_file_range;
         }
     }
+
+    err = copy_file_rw_checks(in_ref.fd, out_ref.fd);
+    if (err < 0)
+        goto out_copy_file_range;
 
     /* Emulate with a pread/pwrite loop. */
     int64_t moved = copy_fd_range(&(copy_ends_t) {.in_gfd = fd_in,

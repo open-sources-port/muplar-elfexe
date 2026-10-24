@@ -8,6 +8,7 @@
  * Tests: sendfile, copy_file_range, fsync, fallocate
  */
 
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -182,6 +183,59 @@ int main(void)
                 close(out_fd);
             FAIL("open failed");
         }
+        unlink(cfr_dst);
+    }
+
+    /* copy_file_range refuses a directory, anything else not a regular file, an
+     * input not open for reading, and an output not open for writing or open
+     * O_APPEND, before it copies anything.
+     */
+    TEST("copy_file_range refuses bad ends");
+    {
+        int rd = open(src_path, O_RDONLY);
+        int wr = open(src_path, O_WRONLY);
+        int ap = open(src_path, O_WRONLY | O_APPEND);
+        int out = open(cfr_dst, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+        int dir = open(tmpdir, O_RDONLY);
+        int pfd[2] = {-1, -1};
+        int ok = rd >= 0 && wr >= 0 && ap >= 0 && out >= 0 && dir >= 0 &&
+                 pipe(pfd) == 0 && write(pfd[1], "x", 1) == 1;
+        const char *why = "setup failed";
+
+        if (ok) {
+            why = "write-only input not EBADF";
+            ok = copy_file_range(wr, NULL, out, NULL, 4, 0) == -1 &&
+                 errno == EBADF;
+        }
+        if (ok) {
+            why = "read-only output not EBADF";
+            ok = copy_file_range(rd, NULL, rd, NULL, 4, 0) == -1 &&
+                 errno == EBADF;
+        }
+        if (ok) {
+            why = "O_APPEND output not EBADF";
+            ok = copy_file_range(rd, NULL, ap, NULL, 4, 0) == -1 &&
+                 errno == EBADF;
+        }
+        if (ok) {
+            why = "pipe input not EINVAL";
+            ok = copy_file_range(pfd[0], NULL, out, NULL, 4, 0) == -1 &&
+                 errno == EINVAL;
+        }
+        if (ok) {
+            why = "directory input not EISDIR";
+            ok = copy_file_range(dir, NULL, out, NULL, 4, 0) == -1 &&
+                 errno == EISDIR;
+        }
+        if (ok)
+            PASS();
+        else
+            FAIL(why);
+
+        int fds[] = {rd, wr, ap, out, dir, pfd[0], pfd[1]};
+        for (size_t i = 0; i < sizeof(fds) / sizeof(fds[0]); i++)
+            if (fds[i] >= 0)
+                close(fds[i]);
         unlink(cfr_dst);
     }
 
