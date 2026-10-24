@@ -3784,6 +3784,35 @@ done:
     return ret;
 }
 
+/* do_sendfile and do_splice (Linux fs/read_write.c, fs/splice.c) refuse an
+ * input not open for reading with EBADF. do_sendfile then checks the input
+ * offset before it looks at the output, which is why the two ends are checked
+ * apart.
+ */
+static int64_t splice_in_check(int in_hfd)
+{
+    int fl = fcntl(in_hfd, F_GETFL);
+    return fl >= 0 && (fl & O_ACCMODE) == O_WRONLY ? -LINUX_EBADF : 0;
+}
+
+/* An output not open for writing is EBADF. After that, do_splice_direct and the
+ * pipe-to-file branch of do_splice refuse an output opened O_APPEND with
+ * EINVAL, before anything moves. A pipe output is not checked for O_APPEND.
+ */
+static int64_t splice_out_check(int out_hfd)
+{
+    int fl = fcntl(out_hfd, F_GETFL);
+    if (fl < 0)
+        return 0;
+    if ((fl & O_ACCMODE) == O_RDONLY)
+        return -LINUX_EBADF;
+
+    struct stat st;
+    if ((fl & O_APPEND) && fstat(out_hfd, &st) == 0 && !S_ISFIFO(st.st_mode))
+        return -LINUX_EINVAL;
+    return 0;
+}
+
 int64_t sys_sendfile(guest_t *g,
                      int out_fd,
                      int in_fd,
@@ -3810,11 +3839,17 @@ int64_t sys_sendfile(guest_t *g,
             err = -LINUX_EFAULT;
             goto out_sendfile;
         }
-        if (offset < 0) {
-            err = -LINUX_EINVAL;
-            goto out_sendfile;
-        }
     }
+    err = splice_in_check(in_ref.fd);
+    if (err < 0)
+        goto out_sendfile;
+    if (offset_gva != 0 && offset < 0) {
+        err = -LINUX_EINVAL;
+        goto out_sendfile;
+    }
+    err = splice_out_check(out_ref.fd);
+    if (err < 0)
+        goto out_sendfile;
 
     /* sendfile has no output offset, so out always uses write(). */
     int64_t off_out = -1;
@@ -4086,6 +4121,12 @@ int64_t sys_splice(guest_t *g,
                    size_t len,
                    unsigned int flags)
 {
+    /* The splice syscall returns 0 for a zero length before it looks at either
+     * descriptor.
+     */
+    if (len == 0)
+        return 0;
+
     (void) flags;
     host_fd_ref_t in_ref, out_ref;
     fd_block_state_t in_st, out_st;
@@ -4113,6 +4154,15 @@ int64_t sys_splice(guest_t *g,
             host_fd_ref_close(&in_ref);
             return -LINUX_EFAULT;
         }
+    }
+
+    err = splice_in_check(in_ref.fd);
+    if (err == 0)
+        err = splice_out_check(out_ref.fd);
+    if (err < 0) {
+        host_fd_ref_close(&out_ref);
+        host_fd_ref_close(&in_ref);
+        return err;
     }
 
     /* Emulate with a read/write loop over a heap buffer. splice fully drains

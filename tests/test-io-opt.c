@@ -5,7 +5,7 @@
  * Copyright 2025 Moritz Angermann, zw3rk pte. ltd.
  * SPDX-License-Identifier: Apache-2.0
  *
- * Tests: sendfile, copy_file_range, fsync, fallocate
+ * Tests: sendfile, copy_file_range, splice, fsync, fallocate
  */
 
 #include <errno.h>
@@ -293,6 +293,62 @@ int main(void)
             close(rd);
         if (out >= 0)
             close(out);
+        unlink(cfr_dst);
+    }
+
+    /* sendfile and a pipe-to-file splice refuse an O_APPEND output with EINVAL
+     * and move nothing, after the EBADF for an end opened the wrong way. A
+     * zero-length splice returns 0 before either check. sendfile checks a
+     * negative input offset before it looks at the output.
+     */
+    TEST("sendfile and splice refuse an O_APPEND output");
+    {
+        int rd = open(src_path, O_RDONLY);
+        int ap = open(cfr_dst, O_CREAT | O_WRONLY | O_APPEND | O_TRUNC, 0644);
+        int pfd[2] = {-1, -1};
+        int ok =
+            rd >= 0 && ap >= 0 && pipe(pfd) == 0 && write(pfd[1], "xy", 2) == 2;
+        const char *why = "setup failed";
+        struct stat st;
+
+        if (ok) {
+            why = "sendfile not EINVAL";
+            ok = sendfile(ap, rd, NULL, 2) == -1 && errno == EINVAL;
+        }
+        if (ok) {
+            why = "splice not EINVAL";
+            ok = splice(pfd[0], NULL, ap, NULL, 2, 0) == -1 && errno == EINVAL;
+        }
+        if (ok) {
+            why = "zero-length splice not 0";
+            ok = splice(pfd[0], NULL, ap, NULL, 0, 0) == 0;
+        }
+        if (ok) {
+            int wr = open(src_path, O_WRONLY);
+            why = "write-only input not EBADF ahead of O_APPEND";
+            ok = wr >= 0 && sendfile(ap, wr, NULL, 2) == -1 && errno == EBADF &&
+                 splice(pfd[1], NULL, ap, NULL, 2, 0) == -1 && errno == EBADF;
+            if (wr >= 0)
+                close(wr);
+        }
+        if (ok) {
+            off_t neg = -1;
+            why = "negative offset not EINVAL ahead of a read-only output";
+            ok = sendfile(rd, rd, &neg, 2) == -1 && errno == EINVAL;
+        }
+        if (ok) {
+            why = "output grew";
+            ok = fstat(ap, &st) == 0 && st.st_size == 0;
+        }
+        if (ok)
+            PASS();
+        else
+            FAIL(why);
+
+        int fds[] = {rd, ap, pfd[0], pfd[1]};
+        for (size_t i = 0; i < sizeof(fds) / sizeof(fds[0]); i++)
+            if (fds[i] >= 0)
+                close(fds[i]);
         unlink(cfr_dst);
     }
 
