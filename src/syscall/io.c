@@ -3872,6 +3872,22 @@ static int64_t copy_file_rw_checks(int in_hfd, int out_hfd)
     return 0;
 }
 
+/* generic_copy_file_checks (Linux fs/read_write.c) refuses a range whose end
+ * wraps, testing pos + count < pos as an unsigned sum, so a negative offset
+ * passed by pointer wraps too. The position is that offset when the guest
+ * passed one, else the descriptor's own.
+ */
+static bool copy_range_wraps(int host_fd,
+                             bool has_off,
+                             int64_t off,
+                             uint64_t len)
+{
+    int64_t pos = has_off ? off : lseek(host_fd, 0, SEEK_CUR);
+    if (!has_off && pos < 0)
+        return false;
+    return (uint64_t) pos + len < (uint64_t) pos;
+}
+
 int64_t sys_copy_file_range(guest_t *g,
                             int fd_in,
                             uint64_t off_in_gva,
@@ -3913,6 +3929,19 @@ int64_t sys_copy_file_range(guest_t *g,
     err = copy_file_rw_checks(in_ref.fd, out_ref.fd);
     if (err < 0)
         goto out_copy_file_range;
+    if (copy_range_wraps(in_ref.fd, off_in_gva != 0, off_in, len) ||
+        copy_range_wraps(out_ref.fd, off_out_gva != 0, off_out, len)) {
+        err = -LINUX_EOVERFLOW;
+        goto out_copy_file_range;
+    }
+
+    /* A negative offset that does not wrap reaches rw_verify_area, which
+     * refuses it. Below, a negative offset means "none given".
+     */
+    if ((off_in_gva != 0 && off_in < 0) || (off_out_gva != 0 && off_out < 0)) {
+        err = -LINUX_EINVAL;
+        goto out_copy_file_range;
+    }
 
     /* Emulate with a pread/pwrite loop. */
     int64_t moved = copy_fd_range(&(copy_ends_t) {.in_gfd = fd_in,

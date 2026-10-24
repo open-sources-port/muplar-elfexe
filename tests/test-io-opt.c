@@ -9,6 +9,7 @@
  */
 
 #include <errno.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -236,6 +237,62 @@ int main(void)
         for (size_t i = 0; i < sizeof(fds) / sizeof(fds[0]); i++)
             if (fds[i] >= 0)
                 close(fds[i]);
+        unlink(cfr_dst);
+    }
+
+    /* copy_file_range refuses a range whose end wraps as an unsigned sum, at
+     * either end, before it copies anything. A negative offset passed by
+     * pointer wraps too unless the length is short, and is then EINVAL.
+     */
+    TEST("copy_file_range refuses a wrapping range");
+    {
+        int rd = open(src_path, O_RDONLY);
+        int out = open(cfr_dst, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+        int ok = rd >= 0 && out >= 0;
+        const char *why = "setup failed";
+        loff_t one = 1, neg = -1, zero = 0;
+        struct stat st;
+
+        if (ok) {
+            why = "off_in 1, len UINT64_MAX not EOVERFLOW";
+            ok = copy_file_range(rd, &one, out, NULL, SIZE_MAX, 0) == -1 &&
+                 errno == EOVERFLOW;
+        }
+        if (ok) {
+            why = "off_out -1 not EOVERFLOW";
+            ok = copy_file_range(rd, &zero, out, &neg, 4, 0) == -1 &&
+                 errno == EOVERFLOW;
+        }
+        if (ok) {
+            why = "off_in -1 not EOVERFLOW";
+            ok = copy_file_range(rd, &neg, out, NULL, 4, 0) == -1 &&
+                 errno == EOVERFLOW;
+        }
+        if (ok) {
+            loff_t far = -4096;
+            why = "off_out -4096, len 10 not EINVAL";
+            ok = copy_file_range(rd, &zero, out, &far, 10, 0) == -1 &&
+                 errno == EINVAL;
+        }
+        if (ok) {
+            loff_t far = -4096;
+            why = "off_in -4096, len 10 not EINVAL";
+            ok = copy_file_range(rd, &far, out, NULL, 10, 0) == -1 &&
+                 errno == EINVAL;
+        }
+        if (ok) {
+            why = "output grew";
+            ok = fstat(out, &st) == 0 && st.st_size == 0;
+        }
+        if (ok)
+            PASS();
+        else
+            FAIL(why);
+
+        if (rd >= 0)
+            close(rd);
+        if (out >= 0)
+            close(out);
         unlink(cfr_dst);
     }
 
